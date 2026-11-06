@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ...speculative.cache_state import (
     rollback_speculative_cache as rollback_cache_transaction,
@@ -1148,6 +1149,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.sharding_group = None
 
     def _causal_conv1d_decode(self, conv_input: mx.array) -> mx.array:
         cached = getattr(self, "_qwen3_5_decode_conv_weight", None)
@@ -1180,6 +1182,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        if self.sharding_group is not None:
+            inputs = sum_gradients(self.sharding_group)(inputs)
         mixed_qkv = self.in_proj_qkv(inputs)
         z = self.in_proj_z(inputs)
         b, a = self._project_gates(inputs)
@@ -1248,7 +1252,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        out = self.out_proj(out.reshape(B, S, -1))
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -1480,9 +1487,114 @@ class LanguageModel(nn.Module):
         self.model = Qwen3_5Model(args)
         self._position_ids = None
         self._rope_deltas = None
+        self._sharding_group = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
+        """Shard dense Qwen3.5-family blocks, retaining the vocabulary head."""
+        group = group or mx.distributed.init()
+        size, rank = group.size(), group.rank()
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError("Invalid tensor-parallel group identity")
+        if self._sharding_group is not None:
+            raise ValueError("The language model is already sharded")
+        if size == 1:
+            return
+        if any(not isinstance(layer.mlp, Qwen3_5MLP) for layer in self.layers):
+            raise NotImplementedError("This sharder requires dense Qwen3.5 MLPs")
+        for name in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "intermediate_size",
+        ):
+            value = getattr(self.args, name)
+            if value <= 0 or value % size:
+                raise ValueError(f"{name} ({value}) must be divisible by {size}")
+        for _, module in self.named_modules():
+            if isinstance(module, nn.QQLinear):
+                raise NotImplementedError("QQLinear sharding is not supported")
+            if getattr(module, "mode", "affine") != "affine":
+                raise NotImplementedError("Sharding requires affine quantization")
+        for layer in self.layers:
+            attention = layer.linear_attn if layer.is_linear else layer.self_attn
+            output = attention.out_proj if layer.is_linear else attention.o_proj
+            for projection in (output, layer.mlp.down_proj):
+                for name in ("weight", "scales", "biases"):
+                    parameter = getattr(projection, name, None)
+                    if parameter is not None and parameter.shape[-1] % size:
+                        raise ValueError(
+                            f"Cannot split {name} input dimension across {size} ranks; "
+                            "quantization groups must fit within each shard"
+                        )
+
+        for layer in self.layers:
+            if layer.is_linear:
+                attention = layer.linear_attn
+                key_dim = attention.key_dim
+                # Native Q/K/V and convolution channels use contiguous segments.
+                shard_inplace(
+                    attention.conv1d,
+                    lambda path, weight: (0, [key_dim, 2 * key_dim]),
+                    group=group,
+                )
+                attention.conv1d.groups //= size
+                shard_inplace(
+                    attention.in_proj_qkv,
+                    "all-to-sharded",
+                    segments=[key_dim, 2 * key_dim],
+                    group=group,
+                )
+                for name in ("in_proj_z", "in_proj_b", "in_proj_a"):
+                    shard_inplace(
+                        getattr(attention, name), "all-to-sharded", group=group
+                    )
+                for name in ("dt_bias", "A_log"):
+                    setattr(
+                        attention,
+                        name,
+                        mx.contiguous(mx.split(getattr(attention, name), size)[rank]),
+                    )
+                shard_inplace(attention.out_proj, "sharded-to-all", group=group)
+                for name in (
+                    "num_k_heads",
+                    "num_v_heads",
+                    "key_dim",
+                    "value_dim",
+                    "conv_dim",
+                ):
+                    setattr(attention, name, getattr(attention, name) // size)
+                attention.sharding_group = group
+            else:
+                attention = layer.self_attn
+                for name in ("q_proj", "k_proj", "v_proj"):
+                    setattr(
+                        attention,
+                        name,
+                        shard_linear(
+                            getattr(attention, name), "all-to-sharded", group=group
+                        ),
+                    )
+                attention.o_proj = shard_linear(
+                    attention.o_proj, "sharded-to-all", group=group
+                )
+                attention.num_attention_heads //= size
+                attention.num_key_value_heads //= size
+            for name in ("gate_proj", "up_proj"):
+                setattr(
+                    layer.mlp,
+                    name,
+                    shard_linear(
+                        getattr(layer.mlp, name), "all-to-sharded", group=group
+                    ),
+                )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+        self._sharding_group = group
 
     def chunked_prefill_policy(
         self,
@@ -1722,6 +1834,10 @@ class LanguageModel(nn.Module):
         attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        if speculative_verify and getattr(self, "_sharding_group", None) is not None:
+            raise NotImplementedError(
+                "Speculative verification is not supported with Qwen3.5 tensor parallelism"
+            )
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)

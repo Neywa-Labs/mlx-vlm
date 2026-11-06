@@ -48,6 +48,9 @@ def should_offset_norm_weight(original_key, shift_norm_weights):
 
 class Model(Qwen3VLModel):
 
+    def shard(self, group=None):
+        self.language_model.shard(group)
+
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
