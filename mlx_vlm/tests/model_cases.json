@@ -2302,6 +2302,53 @@
       }
     },
     {
+      "id": "TestModels.cosmos3_edge",
+      "module": "cosmos3_edge",
+      "config": {
+        "text_config": {
+          "model_type": "cosmos3_edge_text",
+          "vocab_size": 32,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 8,
+          "rms_norm_eps": 1e-05,
+          "rope_theta": 1000.0,
+          "mrope_section": [2, 1, 1]
+        },
+        "vision_config": {
+          "model_type": "cosmos3_edge_vision",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "num_channels": 3,
+          "patch_size": 2,
+          "num_patches": 16,
+          "spatial_merge_size": 2
+        },
+        "model_type": "cosmos3_edge",
+        "projector_hidden_size": 32,
+        "image_token_id": 31,
+        "video_token_id": 30,
+        "vision_start_token_id": 29,
+        "vision_end_token_id": 28,
+        "eos_token_id": 27
+      },
+      "checks": [
+        "language",
+        "forward_cache",
+        "input_embeddings",
+        "request_positions",
+        "chunked_positions"
+      ],
+      "forward_cache": {
+        "chunk_sizes": [1, 3, 5]
+      }
+    },
+    {
       "id": "TestGetInputEmbeddings.mistral3_input_embeddings",
       "module": "mistral3",
       "config": {

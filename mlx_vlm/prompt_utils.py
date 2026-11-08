@@ -52,6 +52,7 @@ MODEL_CONFIG = {
     "mimo_v2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "cosmos3_edge": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava_onevision2": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -370,6 +371,7 @@ class MessageFormatter:
             "nemotronh_nano_omni_reasoning_v3",
             "lfm3_vl",
             "lfm3_omni",
+            "cosmos3_edge",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
