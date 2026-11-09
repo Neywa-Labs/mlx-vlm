@@ -1,7 +1,5 @@
 """Share affine weights across verification positions using native QMV arithmetic."""
 
-# Copyright © 2023 Apple Inc.
-
 from functools import lru_cache
 
 import mlx.core as mx
@@ -10,7 +8,7 @@ import mlx.nn as nn
 
 @lru_cache(maxsize=1)
 def _kernel():
-    # The reduction follows MLX's qmv_wide_impl (Copyright Apple Inc.). As in
+    # The reduction follows MLX's qmv_wide_impl. As in
     # Mistral Large 4's verifier, vector tiles revisit the same output rows.
     return mx.fast.metal_kernel(
         name="affine_batch_qmv",
