@@ -1,5 +1,3 @@
-from functools import lru_cache
-
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -11,13 +9,6 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from .config import ModelConfig
-
-
-@lru_cache(maxsize=1)
-def _supports_bf16_prefill():
-    return mx.metal.is_available() and mx.device_info().get(
-        "architecture", ""
-    ).startswith("applegpu_g17")
 
 
 class Attention(nn.Module):
@@ -117,37 +108,7 @@ class MLP(nn.Module):
         if self.clamp_threshold:
             gate = mx.minimum(gate, self.clamp_threshold)
             up = mx.clip(up, -self.clamp_threshold, self.clamp_threshold)
-        return self._project_down(nn.silu(gate) * up)
-
-    def _project_down(self, x):
-        proj = self.down_proj
-        if (
-            not self.training
-            and x.ndim == 3
-            and x.shape[1] > 1
-            and x.shape[0] * x.shape[1] >= 1024
-            and x.dtype == mx.bfloat16
-            and type(proj) is nn.QuantizedLinear
-            and proj.mode == "affine"
-            and proj.bits == 4
-            and proj.group_size == 64
-            and proj.scales.dtype == mx.bfloat16
-            and mx.default_device() == mx.gpu
-            and _supports_bf16_prefill()
-        ):
-            # Delay each dense weight until its activation is ready, rather
-            # than materializing every layer's weight ahead of the forward.
-            weight = mx.dequantize(
-                mx.depends(proj.weight, x),
-                proj.scales,
-                proj.biases,
-                group_size=proj.group_size,
-                bits=proj.bits,
-                mode=proj.mode,
-            )
-            out = x @ weight.T
-            return out + proj.bias if "bias" in proj else out
-        return proj(x)
+        return self.down_proj(nn.silu(gate) * up)
 
 
 class DecoderLayer(nn.Module):

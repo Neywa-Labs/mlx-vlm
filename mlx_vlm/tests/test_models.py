@@ -1550,105 +1550,6 @@ def test_ricursive_ffn_clips_only_the_upper_gate_bound(ricursive_case):
     np.testing.assert_allclose(np.array(mlp(x))[0, 0], expected, atol=1e-6)
 
 
-@pytest.mark.parametrize(
-    "batch,length,options,fast",
-    [
-        (1, 1024, {}, True),
-        (4, 256, {}, True),
-        (1, 1023, {}, False),
-        (1024, 1, {}, False),
-        (1, 1024, {"dtype": mx.float32}, False),
-        (1, 1024, {"quantize": False}, False),
-        (1, 1024, {"bits": 8}, False),
-        (1, 1024, {"group_size": 32}, False),
-        (1, 1024, {"mode": "mxfp4", "group_size": 32}, False),
-        (1, 1024, {"training": True}, False),
-        (1, 1024, {"supported": False}, False),
-        (1, 1024, {"device": mx.cpu}, False),
-    ],
-    ids=[
-        "prefill",
-        "batched-prefill",
-        "short-prefill",
-        "batched-decode",
-        "float32",
-        "unquantized",
-        "8-bit",
-        "group-32",
-        "mxfp4",
-        "training",
-        "older-gpu",
-        "cpu",
-    ],
-)
-def test_ricursive_prefill_down_projection(
-    ricursive_case, monkeypatch, batch, length, options, fast
-):
-    module, values = ricursive_case
-    mlp = module.language.MLP(
-        build_config(module, dict(values, hidden_size=64, intermediate_size=128))
-    )
-    mlp.down_proj = nn.Linear(128, 64, bias=True)
-    dtype = options.get("dtype", mx.bfloat16)
-    mlp.set_dtype(dtype)
-    if options.get("quantize", True):
-        mlp.down_proj = nn.QuantizedLinear.from_linear(
-            mlp.down_proj,
-            group_size=options.get("group_size", 64),
-            bits=options.get("bits", 4),
-            mode=options.get("mode", "affine"),
-        )
-    mlp.train(options.get("training", False))
-    x = mx.random.normal((batch, length, 128)).astype(dtype)
-    proj = mlp.down_proj
-    if fast:
-        weight = mx.dequantize(
-            proj.weight,
-            proj.scales,
-            proj.biases,
-            group_size=proj.group_size,
-            bits=proj.bits,
-            mode=proj.mode,
-        )
-        expected = x @ weight.T + proj.bias
-    else:
-        expected = proj(x)
-    mx.eval(expected)
-    parameters = {k: v.shape for k, v in tree_flatten(mlp.parameters())}
-    monkeypatch.setattr(
-        module.language,
-        "_supports_bf16_prefill",
-        lambda: options.get("supported", True),
-    )
-    monkeypatch.setattr(mx, "default_device", lambda: options.get("device", mx.gpu))
-    with patch.object(mx, "dequantize", wraps=mx.dequantize) as dequantize:
-        actual = mlp._project_down(x)
-        mx.eval(actual)
-        assert dequantize.call_count == int(fast)
-    np.testing.assert_array_equal(
-        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
-    )
-    assert {k: v.shape for k, v in tree_flatten(mlp.parameters())} == parameters
-
-
-@pytest.mark.parametrize(
-    "available,architecture,expected",
-    [(True, "applegpu_g17s", True), (True, "applegpu_g16s", False), (False, "", False)],
-)
-def test_ricursive_prefill_device_support(
-    ricursive_case, monkeypatch, available, architecture, expected
-):
-    module, _ = ricursive_case
-    check = module.language._supports_bf16_prefill
-    check.cache_clear()
-    monkeypatch.setattr(mx.metal, "is_available", lambda: available)
-    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": architecture})
-    try:
-        assert check() is expected
-    finally:
-        check.cache_clear()
-
-
 @pytest.mark.parametrize("tie_embeddings", [False, True])
 def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     tmp_path, ricursive_case, tie_embeddings
@@ -1656,7 +1557,6 @@ def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     from mlx_vlm.quant_utils import quantize_model
     from mlx_vlm.utils import save_weights
 
-    mx.random.seed(0)
     module, values = ricursive_case
     config = build_config(module, dict(values, tie_word_embeddings=tie_embeddings))
     model = module.Model(config)
@@ -1679,13 +1579,10 @@ def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     np.testing.assert_allclose(
         np.array(loaded(ids).logits), np.array(expected), atol=1e-6
     )
-    # Slicing before the output projection can select GEMV instead of GEMM,
-    # with slightly different float32 accumulation order.
     np.testing.assert_allclose(
         np.array(loaded.language_model(ids, logits_to_keep=1).logits),
         np.array(expected[:, -1:]),
         atol=1e-6,
-        rtol=1e-5,
     )
     with pytest.raises(ValueError, match="nonnegative"):
         loaded.language_model(ids, logits_to_keep=-1)
