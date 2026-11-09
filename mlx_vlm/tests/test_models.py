@@ -1656,6 +1656,7 @@ def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     from mlx_vlm.quant_utils import quantize_model
     from mlx_vlm.utils import save_weights
 
+    mx.random.seed(0)
     module, values = ricursive_case
     config = build_config(module, dict(values, tie_word_embeddings=tie_embeddings))
     model = module.Model(config)
@@ -1678,10 +1679,13 @@ def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     np.testing.assert_allclose(
         np.array(loaded(ids).logits), np.array(expected), atol=1e-6
     )
+    # Slicing before the output projection can select GEMV instead of GEMM,
+    # with slightly different float32 accumulation order.
     np.testing.assert_allclose(
         np.array(loaded.language_model(ids, logits_to_keep=1).logits),
         np.array(expected[:, -1:]),
         atol=1e-6,
+        rtol=1e-5,
     )
     with pytest.raises(ValueError, match="nonnegative"):
         loaded.language_model(ids, logits_to_keep=-1)
