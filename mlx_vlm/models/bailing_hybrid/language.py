@@ -17,11 +17,15 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..kimi_k3.language import ShortConv1d
-from ..linear import linear
+from ..linear import DECODE_BLOCK_SIZE, linear, native_batch_linear, tokenwise
 from ..mla import MultiLinear
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
+
+
+def project(module, x, verify):
+    return linear(module, x) if verify else module(x)
 
 
 @partial(mx.compile, shapeless=True)
@@ -37,14 +41,24 @@ class MLP(nn.Module):
     def __init__(self, args, intermediate_size, limit=None):
         super().__init__()
         self.limit = limit
+        self.sharding_group = None
         self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
 
-    def __call__(self, x):
-        return self.down_proj(
-            clipped_swiglu(self.up_proj(x), self.gate_proj(x), self.limit)
+    def __call__(self, x, verify=False):
+        out = project(
+            self.down_proj,
+            clipped_swiglu(
+                project(self.up_proj, x, verify),
+                project(self.gate_proj, x, verify),
+                self.limit,
+            ),
+            verify,
         )
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out
 
 
 class Gate(nn.Module):
@@ -103,14 +117,14 @@ class SparseMoE(nn.Module):
             else None
         )
 
-    def __call__(self, x):
+    def __call__(self, x, verify=False):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
-        indices, scores = self.gate(x)
+        indices, scores = tokenwise(self.gate, x) if verify else self.gate(x)
         experts = self.switch_mlp(x, indices)
         out = (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
         if self.shared_experts is not None:
-            out = out + self.shared_experts(x)
+            out = out + self.shared_experts(x, verify=verify)
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
         return out
@@ -119,6 +133,7 @@ class SparseMoE(nn.Module):
 class KimiDeltaAttention(nn.Module):
     def __init__(self, args):
         super().__init__()
+        self.output_group = None
         self.args = args
         self.num_heads = args.num_attention_heads
         self.head_dim = args.head_dim
@@ -158,20 +173,27 @@ class KimiDeltaAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(projection_size, args.hidden_size, bias=False)
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, verify=False):
         B, T, _ = x.shape
         lengths = cache.lengths if cache is not None else None
         qkv = []
         for i, name in enumerate(("q", "k", "v")):
             conv = getattr(self, f"{name}_conv1d")
-            projected = getattr(self, f"{name}_proj")(x)
+            projected = project(getattr(self, f"{name}_proj"), x, verify)
             previous = cache[i] if cache is not None else None
-            y, state = conv(
-                projected,
-                previous,
-                mask,
-                lengths,
-            )
+            if verify and T > 1:
+                state, steps = previous, []
+                for t in range(T):
+                    y, state = conv(
+                        mx.contiguous(projected[:, t : t + 1]),
+                        state,
+                        None if mask is None else mask[:, t : t + 1],
+                        None if lengths is None else lengths - t,
+                    )
+                    steps.append(y)
+                y = mx.concatenate(steps, axis=1)
+            else:
+                y, state = conv(projected, previous, mask, lengths)
             if cache is not None:
                 if cache.is_speculating:
                     width = conv.kernel_size - 1
@@ -189,13 +211,17 @@ class KimiDeltaAttention(nn.Module):
         scale = self.head_dim**-0.5
         q = scale**2 * mx.fast.rms_norm(q, None, 1e-6 / self.head_dim)
         k = scale * mx.fast.rms_norm(k, None, 1e-6 / self.head_dim)
-        a = self.f_proj(x) if self.args.no_kda_lora else self.f_b_proj(self.f_a_proj(x))
+        a = (
+            project(self.f_proj, x, verify)
+            if self.args.no_kda_lora
+            else project(self.f_b_proj, project(self.f_a_proj, x, verify), verify)
+        )
         out, state = gated_delta_update(
             q,
             k,
             v,
             a.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32),
-            self.b_proj(x).astype(mx.float32),
+            project(self.b_proj, x, verify).astype(mx.float32),
             self.A_log[:, None],
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             cache=cache,
@@ -207,15 +233,21 @@ class KimiDeltaAttention(nn.Module):
         if cache is not None:
             cache.advance(T)
         gate = (
-            self.g_proj(x) if self.args.no_kda_lora else self.g_b_proj(self.g_a_proj(x))
+            project(self.g_proj, x, verify)
+            if self.args.no_kda_lora
+            else project(self.g_b_proj, project(self.g_a_proj, x, verify), verify)
         )
         gate = mx.sigmoid(gate.astype(mx.float32)).astype(x.dtype)
-        return self.o_proj(self.o_norm(out).reshape(B, T, -1) * gate)
+        out = project(self.o_proj, self.o_norm(out).reshape(B, T, -1) * gate, verify)
+        if self.output_group is not None:
+            out = mx.distributed.all_sum(out, group=self.output_group)
+        return out
 
 
 class MultiLatentAttention(nn.Module):
     def __init__(self, args):
         super().__init__()
+        self.output_group = None
         self.args = args
         self.num_heads = args.num_attention_heads
         self.q_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
@@ -274,21 +306,59 @@ class MultiLatentAttention(nn.Module):
                     1 + 0.1 * args.rope_scaling["mscale_all_dim"] * math.log(factor)
                 ) ** 2
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, verify=False):
         args = self.args
         B, T, _ = x.shape
         q = (
-            self.q_proj(x)
+            project(self.q_proj, x, verify)
             if args.q_lora_rank is None
-            else self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            else project(
+                self.q_b_proj,
+                self.q_a_layernorm(project(self.q_a_proj, x, verify)),
+                verify,
+            )
         )
         q = q.reshape(B, T, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-        q_nope, q_pe = mx.split(q, [args.qk_nope_head_dim], axis=-1)
         latent, k_pe = mx.split(
-            self.kv_a_proj_with_mqa(x), [args.kv_lora_rank], axis=-1
+            project(self.kv_a_proj_with_mqa, x, verify), [args.kv_lora_rank], axis=-1
         )
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe[:, None]
+        if verify and T > 1:
+            # As in Mistral Large 4, project the block together while each query
+            # sees exactly the cache prefix of an ordinary decode step.
+            prefix = cache.state[0].shape[-2] if cache.state[0] is not None else 0
+            outputs = []
+            for t in range(T):
+                step_mask = (
+                    None if mask is None else mask[..., t : t + 1, : prefix + t + 1]
+                )
+                outputs.append(
+                    self.attend(
+                        mx.contiguous(q[:, :, t : t + 1]),
+                        mx.contiguous(latent[:, :, t : t + 1]),
+                        mx.contiguous(k_pe[:, :, t : t + 1]),
+                        step_mask,
+                        cache,
+                    )
+                )
+            out = mx.concatenate(outputs, axis=2)
+        else:
+            out = self.attend(q, latent, k_pe, mask, cache)
+        out = out.transpose(0, 2, 1, 3)
+        if self.g_proj is not None:
+            gate = mx.sigmoid(
+                project(self.g_proj, x, verify).astype(mx.float32)
+            ).astype(x.dtype)
+            out = out * gate.reshape(B, T, self.num_heads, -1)
+        out = project(self.dense, out.reshape(B, T, -1), verify)
+        if self.output_group is not None:
+            out = mx.distributed.all_sum(out, group=self.output_group)
+        return out
+
+    def attend(self, q, latent, k_pe, mask, cache):
+        T = q.shape[2]
+        q_nope, q_pe = mx.split(q, [self.args.qk_nope_head_dim], axis=-1)
         offset = cache.offset if cache is not None else 0
         q_pe, k_pe = self.rope(q_pe, offset=offset), self.rope(k_pe, offset=offset)
         if cache is not None:
@@ -308,11 +378,7 @@ class MultiLatentAttention(nn.Module):
         )
         if T == 1:
             out = self.unembed_out(out)
-        out = out.transpose(0, 2, 1, 3)
-        if self.g_proj is not None:
-            gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(x.dtype)
-            out = out * gate.reshape(B, T, self.num_heads, -1)
-        return self.dense(out.reshape(B, T, -1))
+        return out
 
 
 class DecoderLayer(nn.Module):
@@ -332,9 +398,9 @@ class DecoderLayer(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-    def __call__(self, x, mask=None, cache=None):
-        h = x + self.attention(self.input_layernorm(x), mask, cache)
-        return h + self.mlp(self.post_attention_layernorm(h))
+    def __call__(self, x, mask=None, cache=None, verify=False):
+        h = x + self.attention(self.input_layernorm(x), mask, cache, verify=verify)
+        return h + self.mlp(self.post_attention_layernorm(h), verify=verify)
 
 
 class TextModel(nn.Module):
@@ -352,25 +418,36 @@ class TextModel(nn.Module):
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         h = self.word_embeddings(inputs) if inputs_embeds is None else inputs_embeds
         cache = cache if cache is not None else [None] * len(self.layers)
-        # Keep the decode arithmetic during verification: expanded MLA and
-        # block convolutions otherwise round differently from single-token BF16.
-        if h.shape[1] > 1 and any(getattr(c, "is_speculating", False) for c in cache):
+        verify = any(getattr(c, "is_speculating", False) for c in cache)
+        if verify and h.shape[1] > DECODE_BLOCK_SIZE:
             return mx.concatenate(
-                [self(None, cache, h[:, i : i + 1]) for i in range(h.shape[1])], axis=1
+                [
+                    self(None, cache, h[:, i : i + DECODE_BLOCK_SIZE])
+                    for i in range(0, h.shape[1], DECODE_BLOCK_SIZE)
+                ],
+                axis=1,
             )
         masks = {}
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             if layer.is_linear not in masks:
                 masks[layer.is_linear] = (
                     create_ssm_mask(h, c)
                     if layer.is_linear
                     else create_attention_mask(h, c, return_array=True)
                 )
-            h = layer(h, masks[layer.is_linear], c)
-            if self.sharding_group is not None and not self.training:
-                # Bound the graph around recurrent state and collectives:
-                # evaluating the full prefill graph can stall Metal/JACCL.
-                mx.eval(h, c.state if c is not None else [])
+            h = layer(h, masks[layer.is_linear], c, verify=verify)
+            if (
+                self.sharding_group is not None
+                and not self.training
+                and mx.default_device() == mx.gpu
+            ):
+                if not verify and h.shape[1] > DECODE_BLOCK_SIZE:
+                    # Large prefill graphs can stall Metal/JACCL.
+                    mx.eval(h, c.state if c is not None else [])
+                elif (i + 1) % 4 == 0:
+                    # Overlap short-block graph construction and execution, as
+                    # in the Mistral Large 4 verifier.
+                    mx.async_eval(h)
         return self.norm(h)
 
 
@@ -402,7 +479,8 @@ def shard_decoder_layer(layer, group):
                 shard_linear(getattr(attn, name), "all-to-sharded", group=group),
             )
         attn.b_proj = shard_linear(attn.b_proj, "all-to-sharded", group=group)
-        attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+        shard_inplace(attn.o_proj, "sharded-to-all", group=group)
+        attn.output_group = group
         attn.A_log = attn.A_log[start:end]
         attn.dt_bias = attn.dt_bias[start * dim : end * dim]
     else:
@@ -412,7 +490,12 @@ def shard_decoder_layer(layer, group):
         )
         if attn.g_proj is not None:
             attn.g_proj = shard_linear(attn.g_proj, "all-to-sharded", group=group)
-        attn.dense = shard_linear(attn.dense, "sharded-to-all", group=group)
+        if "bias" in attn.dense:
+            # The wrapper adds bias after the reduction, once on each rank.
+            attn.dense = shard_linear(attn.dense, "sharded-to-all", group=group)
+        else:
+            shard_inplace(attn.dense, "sharded-to-all", group=group)
+            attn.output_group = group
         attn.embed_q.apply(lambda w: mx.contiguous(w[start:end]))
         attn.unembed_out.apply(lambda w: mx.contiguous(w[start:end]))
     attn.num_heads = heads
@@ -429,16 +512,14 @@ def shard_decoder_layer(layer, group):
             ):
                 shard_inplace(getattr(mlp, name), mode, group=group)
     else:
-        for name, mode in (
-            ("gate_proj", "all-to-sharded"),
-            ("up_proj", "all-to-sharded"),
-            ("down_proj", "sharded-to-all"),
-        ):
+        for name in ("gate_proj", "up_proj"):
             setattr(
                 layer.mlp,
                 name,
-                shard_linear(getattr(layer.mlp, name), mode, group=group),
+                shard_linear(getattr(layer.mlp, name), "all-to-sharded", group=group),
             )
+        shard_inplace(layer.mlp.down_proj, "sharded-to-all", group=group)
+        layer.mlp.sharding_group = group
 
 
 class LanguageModel(nn.Module):
@@ -465,13 +546,24 @@ class LanguageModel(nn.Module):
             logits=logits, hidden_states=[h] if return_hidden else None
         )
 
-    def logits_from_hidden(self, h):
+    def logits_from_hidden(self, h, *, verify=False):
         head = (
             self.model.word_embeddings.as_linear
             if self.args.tie_word_embeddings
             else self.lm_head
         )
-        return linear(head, h)
+        return native_batch_linear(head, h) if verify else linear(head, h)
+
+    def speculative_logits_from_hidden(self, h):
+        return self.logits_from_hidden(h, verify=True)
+
+    def speculative_verify_hidden(self, inputs, cache):
+        from ...speculative.common import verify_forward
+
+        output, transaction = verify_forward(
+            self, inputs, cache, skip_logits=True, return_hidden=True
+        )
+        return output.hidden_states[-1], {}, transaction
 
     def shard(self, group=None):
         group = group or mx.distributed.init()
@@ -479,6 +571,8 @@ class LanguageModel(nn.Module):
             raise ValueError("Attention heads must be divisible by the group size")
         for layer in self.layers:
             shard_decoder_layer(layer, group)
+            # Release each full checkpoint layer before materializing the next.
+            mx.eval(layer.parameters())
         self.model.sharding_group = group if group.size() > 1 else None
 
     @property

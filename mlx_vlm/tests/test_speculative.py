@@ -1469,10 +1469,14 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", ["qwen", "glm", "deepseek", "ling"])
+@parametrize(
+    "family,length",
+    [("qwen", 4), ("glm", 4), ("deepseek", 4), ("ling", 4), ("ling", 9)],
+)
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_verify_commit_matches_decode(family, batch, dtype):
+@parametrize("quantized", [False, True])
+def test_verify_commit_matches_decode(family, batch, dtype, quantized, length):
     mx.random.seed(2127)
     model, _ = language(family, inference=True)
     model.load_weights(
@@ -1481,6 +1485,20 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             for key, value in tree_flatten(model.parameters())
         ]
     )
+    if quantized:
+        predicate = getattr(model, "quant_predicate", None) or (
+            lambda path, module: True
+        )
+        nn.quantize(
+            model,
+            bits=4,
+            group_size=32,
+            class_predicate=lambda path, module: (
+                hasattr(module, "to_quantized")
+                and module.weight.shape[-1] % 32 == 0
+                and predicate(path, module)
+            ),
+        )
     model.eval()
     reference, actual = [_make_cache(model, [0] * batch) for _ in range(2)]
     prefix = mx.broadcast_to((mx.arange(19)[None] % 30) + 1, (batch, 19))
@@ -1505,12 +1523,12 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             assert mx.array_equal(actual, expected).item()
 
     # Each model owns its verifier; compare blocks with one-token verifier calls.
-    for retained in (1, 4, 3):
-        tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
+    for retained in (1, length, length - 1):
+        tokens = mx.broadcast_to(mx.arange(4, 4 + length)[None], (batch, length))
         oracle = deepcopy(reference)
         accepted = None
         hidden_steps, logit_steps = [], []
-        for i in range(4):
+        for i in range(length):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
@@ -1648,6 +1666,28 @@ def test_affine_switch_projection_parity(bits, dtype, projection):
         )
     assert actual is not None
     equal(actual, expected)
+
+
+@parametrize("width,intermediate", [(512, 64), (4096, 640)])
+@parametrize("batch", [1, 4])
+@parametrize("length", [2, 4])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_switch_glu_block_matches_decode(width, intermediate, batch, length, dtype):
+    mx.random.seed(2527)
+    mlp = SwitchGLU(width, intermediate, 8)
+    mlp.set_dtype(dtype)
+    nn.quantize(mlp, bits=4, group_size=64)
+    mlp.eval()
+    inputs = mx.random.normal((batch, length, width)).astype(dtype)
+    indices = mx.broadcast_to(mx.arange(8), (batch, length, 8))
+    expected = mx.concatenate(
+        [
+            mlp(mx.contiguous(inputs[:, i : i + 1]), indices[:, i : i + 1])
+            for i in range(length)
+        ],
+        axis=1,
+    )
+    equal(mlp(inputs, indices), expected)
 
 
 @parametrize("bits", [4, 5, 8])
