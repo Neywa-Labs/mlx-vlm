@@ -1659,6 +1659,56 @@ def test_ricursive_ragged_cache_transactions(window, prefix):
         equal([batch.extract(i).state for i in range(2)], before)
 
 
+@parametrize("batch", [1, 2])
+@parametrize(
+    "window,prefix", [(3, 0), (8, 0), (8, 6), (8, 9), (1024, 1022), (1024, 1024)]
+)
+@parametrize("length", [3, 8])
+def test_ricursive_block_cache_views_are_causal(batch, window, prefix, length):
+    arch = module("models.ricursive.cache")
+    base = module("models.cache")
+    padding = [0] if batch == 1 else [0, 2]
+    cache = (
+        arch.RotatingKVCache(window)
+        if batch == 1
+        else arch.BatchRotatingKVCache(window, padding)
+    )
+    reference = base.BatchRotatingKVCache(window, padding)
+    mx.random.seed(137)
+    if prefix:
+        k = mx.random.normal((batch, 2, prefix, 8))
+        v = mx.random.normal(k.shape)
+        cache.update_and_fetch(k, v)
+        reference.update_and_fetch(k, v)
+    k = mx.random.normal((batch, 2, length, 8))
+    v = mx.random.normal(k.shape)
+    transaction = start_speculative_cache([cache], length)
+    keys, values, masks = cache.fetch_verification_block(k, v)
+    for t in range(length):
+        mask = reference.make_mask(1)
+        expected = reference.update_and_fetch(k[:, :, t : t + 1], v[:, :, t : t + 1])
+        width = expected[0].shape[2]
+        equal(masks[:, t, :, :, :width], mask)
+        if width < masks.shape[-1]:
+            assert not mx.any(masks[:, t, :, :, width:]).item()
+        for actual, wanted in zip((keys, values), expected):
+            equal(
+                mx.where(mask.transpose(0, 1, 3, 2), actual[:, t, :, :width], 0),
+                mx.where(mask.transpose(0, 1, 3, 2), wanted, 0),
+            )
+    transaction.commit([length] * batch)
+    assert (
+        cache.offset == prefix + length
+        if batch == 1
+        else cache.offset.tolist() == reference.offset.tolist()
+    )
+    if cache.is_trimmable():
+        assert cache.trim(1) == reference.trim(1) == 1
+        actual = cache.update_and_fetch(k[:, :, -1:], v[:, :, -1:])
+        expected = reference.update_and_fetch(k[:, :, -1:], v[:, :, -1:])
+        equal(actual, expected)
+
+
 @parametrize("padding", [0, 2])
 def test_ricursive_ragged_verification_matches_independent_requests(padding):
     mx.random.seed(127)

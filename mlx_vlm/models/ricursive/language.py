@@ -64,11 +64,10 @@ class Attention(nn.Module):
                 self.head_dim, traditional=False, base=config.rope_theta
             )
 
-    def __call__(self, x, mask=None, cache=None, value_residual=None):
+    def __call__(
+        self, x, mask=None, cache=None, value_residual=None, verification=False
+    ):
         batch, length, _ = x.shape
-        decode_block = (
-            cache is not None and not self.training and 1 < length <= DECODE_BLOCK_SIZE
-        )
         value_states = x
         if value_residual is not None:
             blend = mx.sigmoid(self.value_res_lambda[0]).astype(x.dtype)
@@ -90,36 +89,7 @@ class Attention(nn.Module):
             v.transpose(0, 2, 1, 3) for v in (queries, keys, values)
         )
 
-        out = (
-            self._attention_block(queries, keys, values, cache)
-            if decode_block
-            else None
-        )
-        if decode_block and out is None:
-            # Keep one-token RoPE, attention, and physical cache order while
-            # sharing projection work across the verification block.
-            outputs = []
-            for index in range(length):
-                token = x[:, index : index + 1]
-                token_mask = create_attention_mask(
-                    token, cache, window_size=self.sliding_window
-                )
-                q, k, v = (
-                    mx.contiguous(tensor[:, :, index : index + 1])
-                    for tensor in (queries, keys, values)
-                )
-                if self.is_sliding:
-                    q = self.rope(q, offset=cache.offset)
-                    k = self.rope(k, offset=cache.offset)
-                k, v = cache.update_and_fetch(k, v)
-                outputs.append(
-                    scaled_dot_product_attention(
-                        q, k, v, cache=cache, scale=self.scale, mask=token_mask
-                    )
-                )
-            out = mx.concatenate(outputs, axis=2)
-        elif not decode_block:
-            out = self._attention(queries, keys, values, mask, cache)
+        out = self._attention(queries, keys, values, mask, cache, verification)
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         if hasattr(self, "g_proj"):
             gate = _linear(self.g_proj, x)
@@ -128,38 +98,30 @@ class Attention(nn.Module):
             out = out * mx.sigmoid(gate).astype(out.dtype)
         return _linear(self.o_proj, out)
 
-    def _attention_block(self, queries, keys, values, cache):
-        fetch = getattr(cache, "fetch_verification_block", None)
-        if fetch is None:
-            return None
-        if self.is_sliding:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-        views = fetch(keys, values)
-        if views is None:
-            return None
-        keys, values, mask = views
-        batch, heads, length, dim = queries.shape
-        queries = queries.transpose(0, 2, 1, 3).reshape(batch * length, heads, 1, dim)
-        keys = keys.reshape(batch * length, *keys.shape[2:])
-        values = values.reshape(batch * length, *values.shape[2:])
-        mask = mask.reshape(batch * length, 1, 1, mask.shape[-1])
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
-        return output.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
-
-    def _attention(self, queries, keys, values, mask, cache):
+    def _attention(self, queries, keys, values, mask, cache, verification):
         if self.is_sliding:
             offset = cache.offset if cache is not None else 0
             queries = self.rope(queries, offset=offset)
             keys = self.rope(keys, offset=offset)
-        if cache is not None:
+        fetch_block = getattr(cache, "fetch_verification_block", None)
+        block = callable(fetch_block) and verification and queries.shape[2] > 1
+        if block:
+            keys, values, mask = fetch_block(keys, values)
+            batch, heads, length, dim = queries.shape
+            queries = queries.transpose(0, 2, 1, 3).reshape(
+                batch * length, heads, 1, dim
+            )
+            keys = keys.reshape(batch * length, *keys.shape[2:])
+            values = values.reshape(batch * length, *values.shape[2:])
+            mask = mask.reshape(batch * length, 1, 1, mask.shape[-1])
+        elif cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
-
-        return scaled_dot_product_attention(
+        output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+        if block:
+            output = output.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
+        return output
 
 
 class MLP(nn.Module):
@@ -200,8 +162,12 @@ class DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(self, x, mask=None, cache=None, value_residual=None):
-        attn = self.self_attn(self.input_layernorm(x), mask, cache, value_residual)
+    def __call__(
+        self, x, mask=None, cache=None, value_residual=None, verification=False
+    ):
+        attn = self.self_attn(
+            self.input_layernorm(x), mask, cache, value_residual, verification
+        )
         x = x + self.post_attention_layernorm(attn)
         return x + self.post_feedforward_layernorm(
             self.mlp(self.pre_feedforward_layernorm(x))
@@ -223,6 +189,7 @@ class RicursiveModel(nn.Module):
         inputs_embeds=None,
         capture_layer_ids=None,
         hidden_sink=None,
+        verification=False,
     ):
         capture = set(capture_layer_ids or [])
         if len(capture) != len(capture_layer_ids or []) or any(
@@ -241,7 +208,7 @@ class RicursiveModel(nn.Module):
         for index, (layer, c) in enumerate(zip(self.layers, cache)):
             window = self.config.sliding_window if layer.self_attn.is_sliding else None
             mask = create_attention_mask(h, c, window_size=window)
-            h = layer(h, mask, c, value_residual)
+            h = layer(h, mask, c, value_residual, verification)
             if index in capture:
                 captured[index] = h
         if hidden_sink is not None:
@@ -276,12 +243,23 @@ class LanguageModel(nn.Module):
             from ...speculative.common import verify_forward
 
             output, transaction = verify_forward(
-                self, inputs, cache, capture_layer_ids=capture_layer_ids
+                self,
+                inputs,
+                cache,
+                capture_layer_ids=capture_layer_ids,
+                verification=True,
             )
             output.gdn_states = transaction
             return output
         hidden_sink = [] if capture_layer_ids is not None else None
-        out = self.model(inputs, cache, inputs_embeds, capture_layer_ids, hidden_sink)
+        out = self.model(
+            inputs,
+            cache,
+            inputs_embeds,
+            capture_layer_ids,
+            hidden_sink,
+            kwargs.pop("verification", False),
+        )
         projection = (
             self.model.embed_tokens.as_linear
             if self.config.tie_word_embeddings

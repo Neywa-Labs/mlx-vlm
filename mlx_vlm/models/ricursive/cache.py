@@ -5,6 +5,17 @@ import mlx.core as mx
 from .. import cache as base
 
 
+def _append_block(cache, keys, values, mask):
+    length = keys.shape[2]
+    keys, values = cache.update_and_fetch(keys, values)
+    shape = (keys.shape[0], length, *keys.shape[1:])
+    return (
+        mx.broadcast_to(keys[:, None], shape),
+        mx.broadcast_to(values[:, None], shape),
+        mask.transpose(0, 2, 1, 3)[:, :, :, None],
+    )
+
+
 def _pad_single(cache, left_padding):
     if len(left_padding) != 1:
         raise ValueError("A populated cache must contain one request to batch")
@@ -19,6 +30,14 @@ def _pad_single(cache, left_padding):
 
 
 class KVCache(base.KVCache):
+    def fetch_verification_block(self, keys, values):
+        length = keys.shape[2]
+        mask = (
+            mx.arange(self.offset + length) <= self.offset + mx.arange(length)[:, None]
+        )
+        mask = mx.broadcast_to(mask, (keys.shape[0], 1, *mask.shape))
+        return _append_block(self, keys, values, mask)
+
     def to_batch(self, left_padding):
         if self.empty():
             return BatchKVCache(left_padding)
@@ -65,6 +84,9 @@ class BatchKVCache(base.BatchKVCache):
             (columns <= rows[..., None]) & (columns >= self.left_padding[:, None, None])
         )[:, None]
 
+    def fetch_verification_block(self, keys, values):
+        return _append_block(self, keys, values, self.make_mask(keys.shape[2]))
+
     def trim_right(self, padding):
         self.offset -= mx.array(padding, mx.int32)
         self._ragged = True
@@ -103,7 +125,98 @@ class BatchKVCache(base.BatchKVCache):
         self._right_padding = None
 
 
-class RotatingKVCache(base.RotatingKVCache):
+class _RingTransactions:
+    @property
+    def is_speculating(self):
+        return getattr(self, "_speculation", None) is not None
+
+    def start_speculation(self, length):
+        if self.is_speculating:
+            raise RuntimeError("A cache transaction is already active")
+        self._generation = getattr(self, "_generation", 0) + 1
+        self._speculation = None
+        original = {
+            name: mx.array(value) if isinstance(value, mx.array) else value
+            for name, value in self.__dict__.items()
+        }
+        self._speculation = dict(
+            original=original, updates=[], length=length, generation=self._generation
+        )
+        return self._generation
+
+    def validate_speculation(self, lengths, generation=None):
+        transaction = self._speculation
+        if transaction is None or generation != transaction["generation"]:
+            raise RuntimeError("Stale cache transaction")
+        if len(lengths) not in (1, self.batch_size) or any(
+            n < 0 or n > transaction["length"] for n in lengths
+        ):
+            raise ValueError("Invalid per-row accepted lengths")
+        return transaction
+
+    def abort_speculation(self, generation=None):
+        if not self.is_speculating:
+            return
+        transaction = self.validate_speculation([0] * self.batch_size, generation)
+        self.__dict__.update(transaction["original"])
+
+    def commit_speculation(self, lengths, generation=None):
+        transaction = self.validate_speculation(lengths, generation)
+        lengths = list(lengths) * self.batch_size if len(lengths) == 1 else lengths
+        if all(n == transaction["length"] for n in lengths):
+            self._speculation = None
+            return
+        updates = transaction["updates"]
+        self.__dict__.update(transaction["original"])
+        if not updates or not max(lengths):
+            return
+        k, v = (mx.concatenate(parts, axis=2) for parts in zip(*updates))
+        retained = max(lengths)
+        self._append_verified(k[..., :retained, :], v[..., :retained, :], lengths)
+
+
+class RotatingKVCache(_RingTransactions, base.RotatingKVCache):
+    @property
+    def batch_size(self):
+        return 1 if self.keys is None else self.keys.shape[0]
+
+    def update_and_fetch(self, keys, values):
+        if self.is_speculating:
+            self._speculation["updates"].append((keys, values))
+        return super().update_and_fetch(keys, values)
+
+    def _batch_view(self, batch_size):
+        cache = BatchRotatingKVCache(self.max_size, [0] * batch_size)
+        cache.keys, cache.values = self.keys, self.values
+        cache.offset = mx.full((batch_size,), self.offset, mx.int32)
+        cache._offset, cache._idx = self.offset, self._idx
+        cache.rotated = self.offset > self.max_size
+        return cache
+
+    def _adopt(self, cache, length):
+        self.keys, self.values = cache.keys, cache.values
+        self.offset += length
+        self._idx = (min(self._idx, self.max_size) + length) % self.max_size
+
+    def fetch_verification_block(self, keys, values):
+        if self.is_speculating:
+            self._speculation["updates"].append((keys, values))
+        cache = self._batch_view(keys.shape[0])
+        result = cache.fetch_verification_block(keys, values)
+        self._adopt(cache, keys.shape[2])
+        return result
+
+    def validate_speculation(self, lengths, generation=None):
+        transaction = super().validate_speculation(lengths, generation)
+        if len(set(lengths)) > 1:
+            raise ValueError("Use a batched cache for independent accepted lengths")
+        return transaction
+
+    def _append_verified(self, keys, values, lengths):
+        cache = self._batch_view(keys.shape[0])
+        cache._write(keys, values, mx.array(lengths, mx.int32))
+        self._adopt(cache, lengths[0])
+
     def to_batch(self, left_padding):
         if self.empty():
             return BatchRotatingKVCache(self.max_size, left_padding)
@@ -117,7 +230,7 @@ class RotatingKVCache(base.RotatingKVCache):
         return self.merge(rows)
 
 
-class BatchRotatingKVCache(base.BatchRotatingKVCache):
+class BatchRotatingKVCache(_RingTransactions, base.BatchRotatingKVCache):
     """Independent ring cursors and transactional writes for each request."""
 
     def __init__(self, max_size, left_padding):
@@ -189,39 +302,61 @@ class BatchRotatingKVCache(base.BatchRotatingKVCache):
                 for old, new in zip(context, (keys, values))
             )
         self._write(keys, values, mx.full(self.offset.shape, length, mx.int32))
-        return result if length > 1 else (self.keys, self.values)
+        if length > 1:
+            return result
+        width = min(self._offset, self.max_size)
+        return self.keys[..., :width, :], self.values[..., :width, :]
+
+    def _append_verified(self, keys, values, lengths):
+        self._write(keys, values, mx.array(lengths, mx.int32))
+
+    def trim(self, n):
+        if self._row_idx is None:
+            return super().trim(n)
+        n = min(n, self._offset)
+        self._offset -= n
+        self._idx = (self._idx - n) % self.max_size
+        self.offset -= n
+        self._row_idx = (self._row_idx - n) % self.max_size
+        return n
 
     def fetch_verification_block(self, keys, values):
-        """Present each query's ring view in one batch, retaining physical order."""
+        """Gather causal ring views and append the complete block once."""
         length = keys.shape[2]
-        if (
-            self._offset < self.max_size
-            or length > self.max_size
-            or self._lengths is not None
-        ):
-            return None
+        if self.keys is None:
+            self.keys = mx.zeros(
+                (*keys.shape[:2], self.max_size, keys.shape[-1]), keys.dtype
+            )
+            self.values = mx.zeros_like(self.keys)
         self._ring()
-        positions = (self._row_idx[:, None] + mx.arange(length)) % self.max_size
-        age = (positions[:, :, None] - mx.arange(self.max_size)) % self.max_size
-        mask = (
-            age
-            < mx.minimum(self.offset[:, None] + mx.arange(length) + 1, self.max_size)[
-                :, :, None
-            ]
+        width = min(self._offset + length, self.max_size)
+        queries = mx.arange(length)[:, None]
+        tokens = mx.maximum(queries - self.max_size + 1, 0) + mx.arange(
+            min(length, self.max_size)
         )
-        indices = positions[:, None, None, :, None]
-        causal = (mx.arange(length)[None, :] <= mx.arange(length)[:, None])[
-            None, :, None, :, None
-        ]
+        positions = (self._row_idx[:, None, None] + tokens) % self.max_size
+        indices = positions[:, :, None, :, None]
+        causal = (tokens <= queries)[None, :, None, :, None]
         views = []
         for old, new in ((self.keys, keys), (self.values, values)):
-            original = mx.take_along_axis(old, positions[:, None, :, None], axis=2)
-            updates = mx.where(causal, new[:, None], original[:, None])
+            incoming = mx.take_along_axis(
+                new[:, None], tokens[None, :, None, :, None], axis=3
+            )
+            previous = mx.take_along_axis(old[:, None], indices, axis=3)
             expanded = mx.broadcast_to(
                 old[:, None], (old.shape[0], length, *old.shape[1:])
             )
-            views.append(mx.put_along_axis(expanded, indices, updates, axis=3))
-        if self._speculation is not None:
+            view = mx.put_along_axis(
+                expanded, indices, mx.where(causal, incoming, previous), axis=3
+            )
+            views.append(view[..., :width, :])
+        age = (
+            self._row_idx[:, None, None] + queries[None] - mx.arange(width)
+        ) % self.max_size
+        mask = age < mx.minimum(
+            self.offset[:, None, None] + queries[None] + 1, self.max_size
+        )
+        if self.is_speculating:
             self._speculation["updates"].append((keys, values))
         self._write(keys, values, mx.full(self.offset.shape, length, mx.int32))
         return *views, mask[:, :, None, None, :]
@@ -231,67 +366,14 @@ class BatchRotatingKVCache(base.BatchRotatingKVCache):
             return super().make_mask(N, window_size, return_array)
         window = window_size or self.max_size
         if N == 1:
-            age = (self._row_idx[:, None] - mx.arange(self.max_size)) % self.max_size
+            width = min(self._offset + N, self.max_size)
+            age = (self._row_idx[:, None] - mx.arange(width)) % self.max_size
             return (age < mx.minimum(self.offset + 1, window)[:, None])[:, None, None]
         rows = self.max_size + mx.arange(N)
         columns = mx.arange(self.max_size + N)
         return ((columns <= rows[:, None]) & (columns > rows[:, None] - window))[
             None, None
         ] & (columns >= (self.max_size - self.offset)[:, None, None, None])
-
-    @property
-    def is_speculating(self):
-        return self._speculation is not None
-
-    def start_speculation(self, length):
-        if self._speculation is not None:
-            raise RuntimeError("A cache transaction is already active")
-        self._generation += 1
-        original = {
-            name: mx.array(value) if isinstance(value, mx.array) else value
-            for name, value in self.__dict__.items()
-        }
-        self._speculation = dict(
-            original=original, updates=[], length=length, generation=self._generation
-        )
-        return self._generation
-
-    def validate_speculation(self, lengths, generation=None):
-        transaction = self._speculation
-        if transaction is None or generation != transaction["generation"]:
-            raise RuntimeError("Stale cache transaction")
-        if len(lengths) not in (1, self.batch_size) or any(
-            n < 0 or n > transaction["length"] for n in lengths
-        ):
-            raise ValueError("Invalid per-row accepted lengths")
-        return transaction
-
-    def abort_speculation(self, generation=None):
-        if self._speculation is None:
-            return
-        transaction = self.validate_speculation([0] * self.batch_size, generation)
-        self.__dict__.update(transaction["original"])
-
-    def commit_speculation(self, lengths, generation=None):
-        transaction = self.validate_speculation(lengths, generation)
-        lengths = list(lengths) * self.batch_size if len(lengths) == 1 else lengths
-        if all(n == transaction["length"] for n in lengths):
-            self._speculation = None
-            return
-        updates = transaction["updates"]
-        self.__dict__.update(transaction["original"])
-        if not updates or not max(lengths):
-            return
-        if len(set(lengths)) == 1:
-            remaining = lengths[0]
-            for k, v in updates:
-                n = min(remaining, k.shape[2])
-                for t in range(n):
-                    self.update_and_fetch(k[..., t : t + 1, :], v[..., t : t + 1, :])
-                remaining -= n
-        else:
-            k, v = (mx.concatenate(parts, axis=2) for parts in zip(*updates))
-            self._write(k, v, mx.array(lengths, mx.int32))
 
     def filter(self, indices):
         super().filter(indices)

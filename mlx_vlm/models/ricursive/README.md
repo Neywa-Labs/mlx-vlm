@@ -64,7 +64,9 @@ weights across draft positions while preserving native small-batch reductions.
 Full-attention caches retain per-request append positions, and sliding caches
 retain per-request ring cursors. Transactions discard rejected writes without
 moving accepted keys, so each request can accept a different draft length.
-Sliding verification groups the per-position ring views into one attention call.
+Full and sliding verification group all block queries into one attention call
+per layer. Cache updates and rollback operate on complete blocks, including
+empty, partially filled, and wrapped sliding windows.
 The drafter shares dense projections across requests and keeps independent
 attention caches. Chunked prefill retains all hidden features needed by the drafter.
 The default adaptive runtime block contains three to five tokens, including
@@ -112,12 +114,15 @@ The official BF16 drafter was loaded strictly from revision
 After the batching changes, all 8 speculative benchmark runs (2,048 generated
 tokens) matched their normal-decoding references token for token. A separate
 full-model batch-shrink test matched all 160 tokens across 32- and 128-token
-requests and confirmed active drafting at both batch sizes 2 and 1.
+requests and confirmed active drafting at both batch sizes 2 and 1. Two additional
+64-token runs starting at context lengths 1,022 and 8,190 matched normal decoding
+while crossing attention dispatch boundaries.
 
 The shared model, processor, speculative, generation, and cache suites passed
-3,238 tests, with 2 skips and 126 passing subtests. Tests cover native affine
+3,262 tests, with 2 skips and 126 passing subtests. Tests cover native affine
 projection parity, independent acceptance, sliding-window rollback and rollover,
-cache serialization, padded prefixes, filtering, and extension.
+cache serialization, padded prefixes, filtering, extension, and causal block
+views before and after sliding-window rollover.
 
 Apple M5 Max (128 GiB), MLX 0.32.4, affine 4-bit target (group size 64), BF16 official
 drafter, activations, and KV caches. Medians of two runs, 128 generated tokens per
@@ -129,17 +134,17 @@ decode speed after the first token; peak memory is maximum MLX allocation in dec
 
 | Batch | Context | Normal tok/s | DFlash2 tok/s | Speedup | Peak GB (normal / DFlash2) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 2,048 | 12.05 | 16.35 | 1.36x | 38.25 / 46.51 |
-| 1 | 8,192 | 11.75 | 14.23 | 1.21x | 39.01 / 47.61 |
-| 2 | 2,048 | 23.62 | 27.25 | 1.15x | 39.04 / 47.41 |
-| 4 | 2,048 | 30.16 | 25.34 | 0.84x | 39.90 / 48.69 |
+| 1 | 2,048 | 12.51 | 16.98 | 1.36x | 38.25 / 46.51 |
+| 1 | 8,192 | 11.88 | 14.45 | 1.22x | 39.01 / 47.59 |
+| 2 | 2,048 | 24.58 | 27.24 | 1.11x | 39.04 / 47.41 |
+| 4 | 2,048 | 32.18 | 24.98 | 0.78x | 39.90 / 48.69 |
 
 DFlash2 improves single-request and batch-2 decode throughput in this workload.
 Batch 4 remains slower than normal decoding; speculative decoding stays active
 when a drafter is supplied, with independent acceptance for each request.
-Including prefill, median request time is 24.65 / 23.26 seconds at
-batch 2 and 47.96 / 51.79 seconds at batch 4 (normal / DFlash2).
+Including prefill, median request time is 23.90 / 22.78 seconds at
+batch 2 and 46.72 / 53.97 seconds at batch 4 (normal / DFlash2).
 At 8,192 context tokens, the corresponding single-request times are
-45.26 / 43.20 seconds. Decode throughput alone does not describe end-to-end latency.
+45.28 / 43.54 seconds. Decode throughput alone does not describe end-to-end latency.
 These are greedy inference parity checks and configuration-specific measurements,
 not a quantization-quality evaluation or validation of the advertised maximum context length.
