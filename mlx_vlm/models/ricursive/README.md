@@ -83,9 +83,8 @@ python -m pytest -q mlx_vlm/tests/test_models.py \
   mlx_vlm/tests/test_processors.py mlx_vlm/tests/test_speculative.py -k ricursive
 ```
 
-These cover sliding-window rollover with single-token and chunked decoding,
-embedding inputs, value residuals, FFN clipping, repeated weight sanitization,
-tied embeddings, quantized checkpoint reload, and tokenizer/stop-token loading.
+These cover model and embedding forwards, sliding-window rollover, speculative
+verification and rollback, drafter loading, and tokenizer routing.
 Float32 logits were also compared against the pinned upstream PyTorch model
 with nonuniform norm weights, nonzero residual coefficients, and enabled or
 disabled gating/value residuals. Maximum error was below `7e-7` with MLX TF32
@@ -120,7 +119,7 @@ requests and confirmed active drafting at both batch sizes 2 and 1. Two addition
 while crossing attention dispatch boundaries.
 
 The shared model, processor, speculative, generation, and cache suites passed
-3,231 tests, with 2 skips and 126 passing subtests. Tests cover native affine
+3,222 tests, with 2 skips and 126 passing subtests. Tests cover native affine
 projection parity, independent acceptance, sliding-window rollback and rollover,
 cache serialization, padded prefixes, filtering, extension, and batched request
 suspension and resumption. Verification parity covers empty, partial, and wrapped caches.
