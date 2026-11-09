@@ -1567,10 +1567,121 @@ def test_ricursive_dflash_projection_matches_native(bits, batch, length):
     equal(module("models.ricursive.language")._linear(layer, inputs), expected)
 
 
+@parametrize("batch", [2, 4])
+@parametrize("padded", [False, True])
+@parametrize("sampling", ["greedy", "sampled", "positioned"])
+def test_ricursive_dflash_batch_fallback_and_resume(
+    batch, padded, sampling, monkeypatch
+):
+    mx.random.seed(107)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    draft = dflash_drafter("ricursive-dflash2")
+    draft.eval()
+    prompt = mx.arange(batch * 5).reshape(batch, 5) % 31
+    padding = [i % 3 for i in range(batch)] if padded else [0] * batch
+    reference, cache = [_make_cache(model, padding) for _ in range(2)]
+    bonus = greedy(model(prompt, cache=reference).logits[:, -1])
+    output = model(prompt, cache=cache, capture_layer_ids=draft.config.target_layer_ids)
+    sampler = (
+        NS(sample_target=lambda logits, **kwargs: greedy(logits))
+        if sampling == "positioned"
+        else greedy
+    )
+    session = module("speculative.dflash").DFlashBatch(
+        model,
+        draft,
+        cache,
+        mx.concatenate(output.hidden_states, axis=-1),
+        bonus,
+        4,
+        sampler,
+        mx.int32,
+        sampling == "greedy",
+    )
+    draft_method = "draft_block_greedy" if sampling == "greedy" else "draft_block"
+    original = getattr(draft, draft_method)
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(args[1].shape[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(draft, draft_method, record)
+    for _ in range(4):
+        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
+        assert session.step([12] * batch, [1] * batch) == [[v] for v in bonus.tolist()]
+    assert calls == []
+    assert not draft.draft_lens
+    assert [h.shape[1] for h in session.hidden] == [9 - p for p in padding]
+    assert all(c.offset == 0 for row in session.draft_caches for c in row)
+
+    # A continuation can be detached and re-admitted without losing pending context.
+    detached = session.snapshot(batch - 1)
+    session.filter(list(range(batch - 1)))
+    session.extend(detached)
+    session.filter([batch - 1])
+    for c in reference:
+        c.filter(mx.array([batch - 1], mx.int32))
+    bonus = bonus[-1:]
+    actual = session.step([8], [5])[0]
+    expected = []
+    for _ in actual:
+        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
+        expected.append(bonus.item())
+    assert actual == expected
+    assert calls == [9 - padding[-1]]
+    assert draft.draft_lens
+
+
+def test_ricursive_dflash_legacy_batch_fallback_and_resume(monkeypatch):
+    mx.random.seed(109)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    draft = dflash_drafter("ricursive-dflash2")
+    draft.eval()
+    prompt = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]])
+    reference, cache = [_make_cache(model, [0, 0]) for _ in range(2)]
+    bonus = greedy(model(prompt, cache=reference).logits[:, -1])
+    output = model(prompt, cache=cache, capture_layer_ids=draft.config.target_layer_ids)
+    original = draft.draft_block_greedy
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(args[1].shape[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(draft, "draft_block_greedy", record)
+    rounds = module("speculative.dflash")._dflash_rounds_batch(
+        model,
+        draft,
+        cache,
+        mx.concatenate(output.hidden_states, axis=-1),
+        first_bonus=bonus,
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        stop_check=lambda row, token: row == 0,
+    )
+    first, _ = next(rounds)
+    bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
+    assert first == bonus.tolist()
+    assert calls == []
+    for c in reference:
+        c.filter(mx.array([1], mx.int32))
+    bonus = bonus[1:]
+    for tokens, _ in rounds:
+        assert tokens[0] is None
+        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
+        assert tokens[1] == bonus.item()
+    assert calls[0] == 5
+
+
 def test_ricursive_dflash_batch_acceptance_keeps_cache_positions_aligned(monkeypatch):
     mx.random.seed(89)
     target = dflash_target("ricursive-dflash2")
     model = target.language_model
+    model.dflash_batch_size_limit = None
     drafter = dflash_drafter("ricursive-dflash2")
     cache = _make_cache(model, [0, 0])
     output = model(

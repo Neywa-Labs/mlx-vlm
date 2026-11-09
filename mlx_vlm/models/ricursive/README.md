@@ -60,8 +60,13 @@ convolutions and the candidate-path selector use the shared DFlash2 implementati
 
 Verification uses the normal target layers, decode-equivalent short-block
 projections, and shared cache transactions. Rejected tokens are rolled back in
-both full-attention and rotating caches. Batched generation uses uniform
-acceptance to preserve the attention arithmetic of normal batched decoding.
+both full-attention and rotating caches. With multiple active requests, Ripple
+uses ordinary target decoding: exact batched verification costs more than the
+accepted tokens save. When one request remains, DFlash2 resumes with its full
+pending context. The drafter remains resident for this transition. Explicitly
+setting `model.language_model.dflash_batch_size_limit = None` enables batched
+speculation for experiments; it uses uniform acceptance to preserve the attention
+arithmetic of normal batched decoding.
 Chunked prefill retains all hidden features needed by the drafter.
 The default adaptive runtime block contains three to five tokens, including
 the target anchor; `--draft-block-size` can override the ceiling up to the
@@ -104,28 +109,38 @@ benchmark or validation of the advertised maximum context length.
 
 The official BF16 drafter was loaded strictly from revision
 `35609b3be3dd08a822b3ba1257c1ea5dd6f87632`. Arithmetic, Python generation, and a
-2,331-token retrieval prompt matched the same 4-bit target without speculation. All 10
-speculative benchmark runs (2,304 generated tokens) also matched their normal-decoding
-references token for token.
+2,331-token retrieval prompt matched the same 4-bit target without speculation.
+All 10 forced/automatic runs in the batch-policy benchmark (3,328 generated tokens)
+matched their normal-decoding references token for token. A full-model test with
+32- and 128-token requests also matched all 160 tokens: the shared batch used
+ordinary decoding, then the survivor resumed DFlash2 with its pending context.
 
-Apple M5 Max (128 GiB), MLX 0.32.4, affine 4-bit target (group size 64), BF16 official
-drafter and KV caches. Medians of two runs, 128 generated tokens per request, greedy
-sampling, 2,048-token shared prefill budget, adaptive 3–5-token draft blocks.
-Equal-length synthetic prompts; EOS stopping and prefix caching disabled. Each setting
-uses normal/speculative/speculative/normal order in one process, with the drafter
-unloaded for normal runs. Speeds are aggregate decode throughput after the first token;
-peak memory is MLX allocation in decimal GB.
+Apple M5 Max (128 GiB), MLX 0.32.4, affine 4-bit target (group size 64), BF16
+official drafter, activations, and KV caches. Medians of two runs with 2,048 prompt
+tokens and 128 generated tokens per request. Greedy sampling, a 2,048-token shared
+prefill budget, and adaptive 3–5-token draft blocks. Equal-length synthetic prompts;
+EOS stopping, prefix caching, and logprobs disabled. Each batch setting uses
+normal/forced/automatic/automatic/forced/normal order in one process; batch 1 omits
+the forced runs because it uses the same speculative path. The drafter is unloaded
+for normal runs. Throughput is aggregate decode tokens per second after the first
+token; peak memory is MLX allocation in decimal GB.
 
-| Batch | Context | Normal tok/s | DFlash2 tok/s | Speedup | Peak GB (normal / DFlash2) |
+| Batch | Normal tok/s | Forced DFlash2 tok/s | Automatic tok/s | Gain over forced | Peak GB (normal / automatic) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 512 | 12.37 | 19.77 | 1.60x | 37.22 / 45.42 |
-| 1 | 2,048 | 12.35 | 16.92 | 1.37x | 38.25 / 46.51 |
-| 1 | 8,192 | 11.98 | 14.51 | 1.21x | 39.01 / 47.59 |
-| 2 | 2,048 | 22.21 | 13.77 | 0.62x | 39.04 / 47.41 |
-| 4 | 2,048 | 30.18 | 14.79 | 0.49x | 39.90 / 48.48 |
+| 1 | 12.05 | — | 16.48 | same path | 38.25 / 46.51 |
+| 2 | 22.72 | 13.99 | 22.75 | 1.63x | 39.04 / 47.41 |
+| 4 | 29.45 | 14.51 | 29.02 | 2.00x | 39.90 / 48.48 |
 
-DFlash2 improves single-request decode throughput in this workload, but batched decoding
-is slower. At 8,192 tokens of context, total time for 128 output tokens was 44.16 s
-normally and 42.42 s with DFlash2. Prefill dominates these long requests, so decode
-throughput alone does not describe end-to-end latency. Use ordinary generation for these
-batch workloads.
+The automatic path uses ordinary target decoding for multiple active requests and
+DFlash2 for a single request. It retains pending context so speculation can resume
+when the batch shrinks. The drafter stays resident; peak memory at batches 2 and 4
+is unchanged from forced speculation. Total request time, including prefill, falls
+from 32.26 to 25.65 seconds at batch 2 and from 67.32 to 49.98 seconds at batch 4.
+These measurements validate greedy token parity and throughput, not quantization
+quality or maximum-context behavior.
+
+An earlier two-run single-request context sweep measured 12.37 → 19.77 tok/s at
+512 prompt tokens and 11.98 → 14.51 tok/s at 8,192 prompt tokens. Those use the same
+unchanged single-request speculative path but were measured in a separate session.
+At 8,192 tokens, total time was 44.16 seconds normally and 42.42 seconds with DFlash2;
+prefill limits the end-to-end benefit for long prompts.

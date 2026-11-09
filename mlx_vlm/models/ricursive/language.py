@@ -227,6 +227,9 @@ class LanguageModel(nn.Module):
     # Ragged cache compaction changes BF16 attention reduction order. Keep
     # batch rows aligned so verification matches ordinary batched decoding.
     requires_uniform_batch_acceptance = True
+    # Multi-row verification repeats the native batch projection per draft
+    # position. Ordinary decoding is faster; resume drafting for a lone row.
+    dflash_batch_size_limit = 1
 
     def __init__(self, config: ModelConfig):
         super().__init__()
