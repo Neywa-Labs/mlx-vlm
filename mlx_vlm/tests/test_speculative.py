@@ -4,6 +4,7 @@ import importlib
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from itertools import product
 from math import prod
 from pathlib import Path
@@ -1182,6 +1183,12 @@ def language(family, *, inference=False, **overrides):
 
 
 def dflash_target(family):
+    if family == "ricursive-dflash2":
+        arch = module("models.ricursive")
+        target = arch.Model(build_config(arch, model_case("ricursive")["config"]))
+        target.set_dtype(mx.bfloat16)
+        target.eval()
+        return target
     if family in ("dflash2", "dspark-qwen"):
         model, _ = language("qwen")
         model.set_dtype(mx.bfloat16)
@@ -1228,11 +1235,15 @@ def dflash_drafter(family):
     arch, name = get_model_and_args(config)
     expected = (
         "dflash2"
-        if family == "dflash2"
+        if family in ("dflash2", "ricursive-dflash2")
         else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
     )
     assert name == expected
-    return arch.Model(arch.ModelConfig.from_dict(config))
+    drafter = arch.Model(arch.ModelConfig.from_dict(config))
+    if family == "ricursive-dflash2":
+        drafter.set_dtype(mx.bfloat16)
+        drafter.eval()
+    return drafter
 
 
 def mtp_drafter(family, config):
@@ -1391,7 +1402,15 @@ def generated(target, drafter=None, *, seed=41, temperature=0, prefill_step_size
 
 
 @parametrize(
-    "family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-lfm2-moe", "dspark-qwen"]
+    "family",
+    [
+        "dflash2",
+        "ricursive-dflash2",
+        "glimmer",
+        "dspark-lfm2",
+        "dspark-lfm2-moe",
+        "dspark-qwen",
+    ],
 )
 @parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
 def test_generation_and_request_reset(family, temperature, seed):
@@ -1408,6 +1427,178 @@ def test_generation_and_request_reset(family, temperature, seed):
         assert 999 not in drafter.accept_lens + drafter.draft_lens
         drafter.accept_lens.append(999)
         drafter.draft_lens.append(999)
+
+
+def test_ricursive_dflash_capture_order_and_shared_weights():
+    mx.random.seed(53)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    drafter = dflash_drafter("ricursive-dflash2")
+    drafter.bind(target)
+    assert drafter.embed_tokens is model.model.embed_tokens
+    assert drafter.lm_head is model.lm_head
+    # The released drafter shares the raw embedding table, before target scaling.
+    assert drafter.embed_scale == 1.0
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    actual = model(ids, capture_layer_ids=[4, 0, 2], logits_to_keep=1)
+    hidden = model.model.embed_tokens(ids) * model.config.embed_scale
+    residual, captured = hidden, {}
+    for index, layer in enumerate(model.model.layers):
+        mask = module("models.base").create_attention_mask(
+            hidden, window_size=layer.self_attn.sliding_window
+        )
+        hidden = layer(hidden, mask, value_residual=residual)
+        captured[index] = hidden
+    equal(actual.hidden_states, [captured[index] for index in [4, 0, 2]])
+    equal(actual.logits, model.lm_head(model.model.norm(hidden)[:, -1:]))
+    assert all(value.shape == (1, 9, 64) for value in actual.hidden_states)
+    for invalid in ([0, 0], [-1], [5], [True]):
+        with pytest.raises(ValueError, match="capture_layer_ids"):
+            model(ids, capture_layer_ids=invalid)
+
+
+@parametrize("layer_index", [0, 1])
+def test_ricursive_dflash_no_rope_and_four_tap_convolution(layer_index):
+    drafter = dflash_drafter("ricursive-dflash2")
+    layer = drafter.layers[layer_index]
+    calls = []
+
+    def rope(x, offset=0):
+        calls.append(offset)
+        return drafter.rope(x, offset=offset)
+
+    assert drafter.config.no_rope_layers == [1]
+    assert layer.attention_conv.base_kernel.shape == (2, 4, 64)
+    output = layer(
+        mx.ones((1, 3, 64), dtype=mx.bfloat16),
+        mx.ones((1, 6, 64), dtype=mx.bfloat16),
+        rope,
+        KVCache(),
+    )
+    assert mx.isfinite(output).all().item()
+    assert len(calls) == (3 if layer_index == 0 else 0)
+    for invalid in ([0, 0], [-1], [2], [True]):
+        config = dflash_config("ricursive-dflash2")
+        config["no_rope_layers"] = invalid
+        with pytest.raises(ValueError, match="no_rope_layers"):
+            module("speculative.drafters.dflash2").ModelConfig.from_dict(config)
+
+
+@parametrize("quantized_weights", [False, True])
+@parametrize("batch", [1, 2])
+@parametrize("prefix,length", [(0, 3), (7, 10)])
+def test_ricursive_dflash_verification_and_rotating_rollback(
+    quantized_weights, batch, prefix, length
+):
+    mx.random.seed(73)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    if quantized_weights:
+        # Exercise the fused affine kernel as well as native batch fallback.
+        model = type(model)(
+            replace(model.config, hidden_size=512, intermediate_size=1024, head_dim=128)
+        )
+        model.set_dtype(mx.bfloat16)
+        nn.quantize(model, group_size=64, bits=4)
+        model.eval()
+    caches = [
+        model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
+        for _ in range(2)
+    ]
+    prompt = mx.random.randint(0, 128, (batch, prefix))
+    if prefix:
+        for cache in caches:
+            mx.eval(model(prompt, cache=cache).logits)
+    for accepted in (0, length // 2, length - 1):
+        block = mx.random.randint(0, 128, (batch, length))
+        serial_cache = deepcopy(caches[0])
+        serial = [
+            model(
+                block[:, index : index + 1],
+                cache=serial_cache,
+                capture_layer_ids=[0, 2, 4],
+            )
+            for index in range(length)
+        ]
+        actual = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate([part.logits for part in serial], axis=1))
+        equal(
+            actual.hidden_states,
+            [
+                mx.concatenate(parts, axis=1)
+                for parts in zip(*(part.hidden_states for part in serial))
+            ],
+        )
+        model.rollback_speculative_cache(caches[1], actual.gdn_states, accepted, length)
+        assert not actual.gdn_states.active
+        for index in range(accepted + 1):
+            mx.eval(model(block[:, index : index + 1], cache=caches[0]).logits)
+        probe = mx.random.randint(0, 128, (batch, 1))
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+        for reference, restored in zip(*caches):
+            equal(mx.array(reference.offset), mx.array(restored.offset))
+        aborted = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        mx.eval(aborted.logits)
+        aborted.gdn_states.abort()
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+
+
+@parametrize("bits", [4, 8])
+@parametrize("batch", [1, 2])
+@parametrize("length", [3, 8])
+def test_ricursive_dflash_projection_matches_native(bits, batch, length):
+    mx.random.seed(83)
+    layer = nn.Linear(512, 1024, bias=False)
+    layer.set_dtype(mx.bfloat16)
+    layer = layer.to_quantized(group_size=64, bits=bits)
+    layer.eval()
+    inputs = mx.random.normal((batch, length, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [layer(mx.contiguous(inputs[:, i : i + 1])) for i in range(length)], axis=1
+    )
+    equal(module("models.ricursive.language")._linear(layer, inputs), expected)
+
+
+def test_ricursive_dflash_batch_acceptance_keeps_cache_positions_aligned(monkeypatch):
+    mx.random.seed(89)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    drafter = dflash_drafter("ricursive-dflash2")
+    cache = _make_cache(model, [0, 0])
+    output = model(
+        mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]),
+        cache=cache,
+        capture_layer_ids=drafter.config.target_layer_ids,
+    )
+    dflash = module("speculative.dflash")
+    session = dflash.DFlashBatch(
+        model,
+        drafter,
+        cache,
+        mx.concatenate(output.hidden_states, axis=-1),
+        greedy(output.logits[:, -1]),
+        4,
+        greedy,
+        mx.int32,
+        True,
+    )
+    monkeypatch.setattr(
+        dflash,
+        "_speculative_walk_batch",
+        lambda *args: ([0, 1], [[11], [12, 13]]),
+    )
+    assert session.step([8, 8], [1, 1]) == [[11], [12]]
+    assert drafter.accept_lens == [0, 0]
+    for entry in cache:
+        assert entry.offset.tolist() == [6, 6]
 
 
 @parametrize(
@@ -2006,7 +2197,9 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     assert (key + ".biases" in written) == (quant == "affine")
 
 
-@parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
+@parametrize(
+    "family", ["dflash2", "ricursive-dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"]
+)
 def test_checkpoint_routing_and_validation(tmp_path, family):
     settings = dflash_config(family)
     (tmp_path / "config.json").write_text(json.dumps(settings))

@@ -26,6 +26,7 @@ class DFlash2Config(DFlashConfig):
     selector_rank: int = 0
     selector_top_k: int = 0
     is_causal: bool = False
+    no_rope_layers: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -102,6 +103,13 @@ class DFlash2Config(DFlashConfig):
             )
         if self.is_causal:
             raise ValueError("DFlash2 causal draft blocks are not currently supported.")
+        if len(set(self.no_rope_layers)) != len(self.no_rope_layers) or any(
+            type(index) is not int or not 0 <= index < self.num_hidden_layers
+            for index in self.no_rope_layers
+        ):
+            raise ValueError(
+                "DFlash2 no_rope_layers must be unique valid layer indices."
+            )
 
     @classmethod
     def from_dict(cls, params: dict) -> "DFlash2Config":

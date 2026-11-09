@@ -8,6 +8,10 @@ from ..qwen3_dflash.dflash import DFlashDecoderLayer, DFlashDraftModel
 from .config import DFlash2Config
 
 
+def _no_rope(x, offset=0):
+    return x
+
+
 def _grouped_dynamic_convolve(
     hidden: mx.array,
     dynamic: mx.array,
@@ -65,6 +69,7 @@ class GroupedDynamicCausalConv(nn.Module):
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     def __init__(self, config: DFlash2Config, layer_idx: int):
         super().__init__(config, layer_idx)
+        self.use_rope = layer_idx not in config.no_rope_layers
         self.attention_conv = GroupedDynamicCausalConv(
             config.hidden_size, config.conv_kernel_size, config.conv_group_size
         )
@@ -73,6 +78,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         )
 
     def __call__(self, x, x_ctx, rope, cache, projected_context=None):
+        if not self.use_rope:
+            rope = _no_rope
         residual = x
         x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
         x = residual + self.attention_conv.finish(

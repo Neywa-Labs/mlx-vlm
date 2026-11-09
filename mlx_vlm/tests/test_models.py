@@ -1560,6 +1560,7 @@ def test_ricursive_checkpoint_load_quantization_and_sanitize_roundtrip(
     module, values = ricursive_case
     config = build_config(module, dict(values, tie_word_embeddings=tie_embeddings))
     model = module.Model(config)
+    model.eval()
     upstream = {
         k.removeprefix("language_model."): v
         for k, v in tree_flatten(model.parameters())

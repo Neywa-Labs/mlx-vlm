@@ -37,13 +37,43 @@ The original tokenizer and chat template are used directly. Native loading
 does not require executing the checkpoint's Python code. The checkpoint's
 `<|im_end|>` and `<|endoftext|>` stop tokens are both honored.
 
+## Speculative decoding
+
+The official
+[Ripple DFlash2 drafter](https://huggingface.co/ricursiveAI/Ripple-65B-Preview-DFlash2)
+works with the same target checkpoint through the standard generation and server
+interfaces:
+
+```bash
+python -m mlx_vlm.generate \
+  --model Ripple-65B-Preview-4bit \
+  --draft-model ricursiveAI/Ripple-65B-Preview-DFlash2 \
+  --prompt "Write a Python function that merges overlapping intervals." \
+  --max-tokens 512 --temperature 0
+```
+
+The separate BF16 drafter adds approximately 8.08 GB of weights and shares the
+target's unscaled token embedding and output head. It consumes the outputs of
+target layers 1, 20, 39, 58, and 77. Its first four layers use sliding-window RoPE
+attention; its final layer uses global attention without RoPE. Four-tap dynamic
+convolutions and the candidate-path selector use the shared DFlash2 implementation.
+
+Verification uses the normal target layers, decode-equivalent short-block
+projections, and shared cache transactions. Rejected tokens are rolled back in
+both full-attention and rotating caches. Batched generation uses uniform
+acceptance to preserve the attention arithmetic of normal batched decoding.
+Chunked prefill retains all hidden features needed by the drafter.
+The default adaptive runtime block contains three to five tokens, including
+the target anchor; `--draft-block-size` can override the ceiling up to the
+checkpoint's trained block size of 16. Speed depends on acceptance and batch size.
+
 ## Validation
 
 Run the small-model architecture and checkpoint tests with:
 
 ```bash
 python -m pytest -q mlx_vlm/tests/test_models.py \
-  mlx_vlm/tests/test_processors.py -k ricursive
+  mlx_vlm/tests/test_processors.py mlx_vlm/tests/test_speculative.py -k ricursive
 ```
 
 These cover sliding-window rollover with single-token and chunked decoding,
@@ -69,3 +99,33 @@ the maximum logit difference to `2.33e-4` for 256-token chunks and `8.40e-5` for
 511-token chunks. These results are consistent with BF16 rounding rather than a
 cache-position error. They are smoke and cache checks, not a quantization-quality
 benchmark or validation of the advertised maximum context length.
+
+### DFlash2 validation and performance
+
+The official BF16 drafter was loaded strictly from revision
+`35609b3be3dd08a822b3ba1257c1ea5dd6f87632`. Arithmetic, Python generation, and a
+2,331-token retrieval prompt matched the same 4-bit target without speculation. All 10
+speculative benchmark runs (2,304 generated tokens) also matched their normal-decoding
+references token for token.
+
+Apple M5 Max (128 GiB), MLX 0.32.4, affine 4-bit target (group size 64), BF16 official
+drafter and KV caches. Medians of two runs, 128 generated tokens per request, greedy
+sampling, 2,048-token shared prefill budget, adaptive 3–5-token draft blocks.
+Equal-length synthetic prompts; EOS stopping and prefix caching disabled. Each setting
+uses normal/speculative/speculative/normal order in one process, with the drafter
+unloaded for normal runs. Speeds are aggregate decode throughput after the first token;
+peak memory is MLX allocation in decimal GB.
+
+| Batch | Context | Normal tok/s | DFlash2 tok/s | Speedup | Peak GB (normal / DFlash2) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 512 | 12.37 | 19.77 | 1.60x | 37.22 / 45.42 |
+| 1 | 2,048 | 12.35 | 16.92 | 1.37x | 38.25 / 46.51 |
+| 1 | 8,192 | 11.98 | 14.51 | 1.21x | 39.01 / 47.59 |
+| 2 | 2,048 | 22.21 | 13.77 | 0.62x | 39.04 / 47.41 |
+| 4 | 2,048 | 30.18 | 14.79 | 0.49x | 39.90 / 48.48 |
+
+DFlash2 improves single-request decode throughput in this workload, but batched decoding
+is slower. At 8,192 tokens of context, total time for 128 output tokens was 44.16 s
+normally and 42.42 s with DFlash2. Prefill dominates these long requests, so decode
+throughput alone does not describe end-to-end latency. Use ordinary generation for these
+batch workloads.
