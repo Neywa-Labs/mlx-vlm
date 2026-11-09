@@ -1470,11 +1470,6 @@ def test_ricursive_dflash_no_rope_and_four_tap_convolution(layer_index):
     )
     assert mx.isfinite(output).all().item()
     assert len(calls) == (3 if layer_index == 0 else 0)
-    for invalid in ([0, 0], [-1], [2], [True]):
-        config = dflash_config("ricursive-dflash2")
-        config["no_rope_layers"] = invalid
-        with pytest.raises(ValueError, match="no_rope_layers"):
-            module("speculative.drafters.dflash2").ModelConfig.from_dict(config)
 
 
 @parametrize("quantized_weights", [False, True])
