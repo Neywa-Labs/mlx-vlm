@@ -37,6 +37,14 @@ The original tokenizer and chat template are used directly. Native loading
 does not require executing the checkpoint's Python code. The checkpoint's
 `<|im_end|>` and `<|endoftext|>` stop tokens are both honored.
 
+On Apple M5 GPUs, large prefill chunks use a temporary BF16 weight for the FFN
+down projection when running inference with BF16 activations and 4-bit affine
+weights (group size 64). This applies to chunks with at least 1,024 total tokens
+across the batch and more than one token per sequence. Dequantization depends on
+the current layer's activation, keeping temporary weights from accumulating
+across layers. Single-token decoding and other configurations use the original
+quantized projection. This changes BF16 rounding and is not bit-exact.
+
 ## Validation
 
 Run the small-model architecture and checkpoint tests with:
@@ -48,7 +56,8 @@ python -m pytest -q mlx_vlm/tests/test_models.py \
 
 These cover sliding-window rollover with single-token and chunked decoding,
 embedding inputs, value residuals, FFN clipping, repeated weight sanitization,
-tied embeddings, quantized checkpoint reload, and tokenizer/stop-token loading.
+tied embeddings, quantized checkpoint reload, tokenizer/stop-token loading, and
+prefill down-projection dispatch and fallback behavior.
 Float32 logits were also compared against the pinned upstream PyTorch model
 with nonuniform norm weights, nonzero residual coefficients, and enabled or
 disabled gating/value residuals. Maximum error was below `7e-7` with MLX TF32
@@ -69,3 +78,21 @@ the maximum logit difference to `2.33e-4` for 256-token chunks and `8.40e-5` for
 511-token chunks. These results are consistent with BF16 rounding rather than a
 cache-position error. They are smoke and cache checks, not a quantization-quality
 benchmark or validation of the advertised maximum context length.
+
+The M5 prefill down-projection path was compared against the original quantized
+projection on the full 4-bit model at 1K, 2K, and 8K context (batch 1), and 2K
+context (batch 8). Top-token predictions agreed at 186/187 sampled prefill
+positions and 87/88 teacher-forced decode positions. The largest case-average
+KL divergence was 0.00226. Retrieval, arithmetic, and Python-generation checks
+returned the same final answers; reasoning text can differ. Both generated
+Python functions passed 125 input cases. These are numerical and functional
+smoke checks, not evidence of unchanged accuracy across all tasks.
+
+A paired M5 Max / MLX 0.32.4 benchmark measured 512 through 32,768 context tokens
+at batch 1, and batches 2, 4, and 8 at 2,048 tokens per request. With two runs per
+variant, 128 output tokens per request, fresh BF16 caches, and a shared 2,048-token
+prefill budget, the enabled configurations gained 6.3–9.1% in prompt throughput.
+Decode throughput was effectively unchanged. Peak MLX allocation increased by
+0.67–0.84 GB in these benchmarks, reaching 42.36 GB at batch 8. A separate direct
+1,024-token forward check increased peak allocation by 1.13 GB. The 512-token
+benchmark uses the original projection and serves as a timing-variation control.
