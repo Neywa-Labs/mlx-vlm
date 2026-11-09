@@ -120,10 +120,10 @@ requests and confirmed active drafting at both batch sizes 2 and 1. Two addition
 while crossing attention dispatch boundaries.
 
 The shared model, processor, speculative, generation, and cache suites passed
-3,266 tests, with 2 skips and 126 passing subtests. Tests cover native affine
+3,231 tests, with 2 skips and 126 passing subtests. Tests cover native affine
 projection parity, independent acceptance, sliding-window rollback and rollover,
-cache serialization, padded prefixes, filtering, extension, and causal block
-views before and after sliding-window rollover.
+cache serialization, padded prefixes, filtering, extension, and batched request
+suspension and resumption. Verification parity covers empty, partial, and wrapped caches.
 
 The dedicated verifier additionally matched all 1,024 saved normal-decoding
 reference tokens at batch sizes 1, 2, and 4 (2K context), and batch 1 at 8K.
@@ -136,9 +136,6 @@ separating verifier dispatch.
 Paired full-generation medians were 17.27 / 14.49 tok/s (before / after),
 with ranges of 13.83–20.71 / 14.32–14.66 tok/s. This variability limits
 conclusions about end-to-end performance. Both retained 47.41 GB peak allocation.
-Tests also verify that speculation never reenters the normal model or attention
-forward, and that a projection failure in a later block restores the entire
-cache transaction.
 
 The context/batch timing table below records the reference implementation at
 [`ef77fb3b`](https://github.com/Neywa-Labs/mlx-vlm/commit/ef77fb3bcb2172e805ffa9b136fe1709d3cfbd3c).

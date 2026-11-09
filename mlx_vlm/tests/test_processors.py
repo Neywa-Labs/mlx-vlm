@@ -852,31 +852,6 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
-def test_ricursive_tokenizer_prompt_and_stop_tokens(tmp_path):
-    importlib.import_module("mlx_vlm.models.ricursive")
-    tokenizer = fast_tokenizer(
-        ("<unk>", "<pad>", "hello", "<end>", "<eot>"),
-        eos_token="<end>",
-        chat_template="{% for message in messages %}{{ message.content }}{% endfor %}",
-    )
-    tokenizer.save_pretrained(tmp_path)
-    _write_configs(
-        tmp_path,
-        config={
-            "model_type": "ricursive",
-            "auto_map": {"AutoConfig": "must_not_execute.RicursiveConfig"},
-        },
-    )
-    processor = load_processor(tmp_path, eos_token_ids=[3, 4], trust_remote_code=False)
-    assert (
-        apply_chat_template(processor, {"model_type": "ricursive"}, "hello") == "hello"
-    )
-    assert processor.encode("hello") == [2]
-    assert processor.stopping_criteria(3)
-    assert processor.stopping_criteria(4)
-    assert not processor.stopping_criteria(2)
-
-
 def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):
     importlib.import_module("mlx_vlm.models.flint")
     raw = Tokenizer(

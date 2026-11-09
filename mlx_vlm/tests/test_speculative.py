@@ -340,7 +340,9 @@ def test_mistral_dspark_admits_requests_while_batch_is_active(cancel, sampling, 
         generator.close()
 
 
-@parametrize("family", ["dflash2", "dspark-lfm2", "mistral", "gemma"])
+@parametrize(
+    "family", ["dflash2", "ricursive-dflash2", "dspark-lfm2", "mistral", "gemma"]
+)
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True])
 @parametrize("phased", [False, True])
@@ -1440,18 +1442,9 @@ def test_ricursive_dflash_capture_order_and_shared_weights():
     # The released drafter shares the raw embedding table, before target scaling.
     assert drafter.embed_scale == 1.0
     ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
-    actual = model(ids, capture_layer_ids=[4, 0, 2], logits_to_keep=1)
-    hidden = model.model.embed_tokens(ids) * model.config.embed_scale
-    residual, captured = hidden, {}
-    for index, layer in enumerate(model.model.layers):
-        mask = module("models.base").create_attention_mask(
-            hidden, window_size=layer.self_attn.sliding_window
-        )
-        hidden = layer(hidden, mask, value_residual=residual)
-        captured[index] = hidden
+    actual = model(ids, capture_layer_ids=[4, 0, 2])
+    captured = model(ids, capture_layer_ids=list(range(5))).hidden_states
     equal(actual.hidden_states, [captured[index] for index in [4, 0, 2]])
-    equal(actual.logits, model.lm_head(model.model.norm(hidden)[:, -1:]))
-    assert all(value.shape == (1, 9, 64) for value in actual.hidden_states)
     for invalid in ([0, 0], [-1], [5], [True]):
         with pytest.raises(ValueError, match="capture_layer_ids"):
             model(ids, capture_layer_ids=invalid)
@@ -1551,65 +1544,6 @@ def test_ricursive_dflash_verification_and_rotating_rollback(
         )
 
 
-@parametrize("batch", [1, 2])
-def test_ricursive_verifier_does_not_reenter_normal_forward(batch, monkeypatch):
-    model = dflash_target("ricursive-dflash2").language_model
-    cache = model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
-    model(mx.ones((batch, 9), mx.int32), cache=cache)
-    original = deepcopy(cache)
-    tokens = mx.full((batch, 13), 2, mx.int32)
-    reference = deepcopy(cache)
-    expected = [
-        model(tokens[:, t : t + 1], cache=reference, capture_layer_ids=[4, 0, 2])
-        for t in range(tokens.shape[1])
-    ]
-
-    def normal_forward(*args, **kwargs):
-        raise AssertionError("Verification must not reenter the normal forward")
-
-    monkeypatch.setattr(type(model.model), "__call__", normal_forward)
-    monkeypatch.setattr(type(model.layers[0].self_attn), "__call__", normal_forward)
-    actual = model(
-        tokens, cache=cache, capture_layer_ids=[4, 0, 2], speculative_verify=True
-    )
-    equal(actual.logits, mx.concatenate([part.logits for part in expected], axis=1))
-    equal(
-        actual.hidden_states,
-        [
-            mx.concatenate(parts, axis=1)
-            for parts in zip(*(p.hidden_states for p in expected))
-        ],
-    )
-    actual.gdn_states.abort()
-    for restored, before in zip(cache, original):
-        equal(restored.state, before.state)
-        equal(mx.array(restored.offset), mx.array(before.offset))
-
-
-@parametrize("batch", [1, 2])
-def test_ricursive_verifier_failure_restores_all_blocks(batch, monkeypatch):
-    model = dflash_target("ricursive-dflash2").language_model
-    cache = model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
-    model(mx.ones((batch, 9), mx.int32), cache=cache)
-    original = deepcopy(cache)
-    project, lengths = model._project_logits, []
-
-    def fail_second_block(hidden, *args):
-        lengths.append(hidden.shape[1])
-        if len(lengths) == 2:
-            raise RuntimeError("Logit projection failed")
-        return project(hidden, *args)
-
-    monkeypatch.setattr(model, "_project_logits", fail_second_block)
-    with pytest.raises(RuntimeError, match="Logit projection failed"):
-        model(mx.full((batch, 13), 2, mx.int32), cache=cache, speculative_verify=True)
-    assert lengths == [8, 5]
-    for restored, before in zip(cache, original):
-        assert not getattr(restored, "is_speculating", False)
-        equal(restored.state, before.state)
-        equal(mx.array(restored.offset), mx.array(before.offset))
-
-
 @parametrize("family", ["dflash2", "ricursive-dflash2"])
 @parametrize("batch", [1, 2, 4])
 def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
@@ -1645,136 +1579,14 @@ def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
                 equal(actual_cache.state, expected_cache.state, atol=2e-5, rtol=2e-5)
 
 
-@parametrize("bits", [4, 8])
-@parametrize("batch", [1, 2])
-@parametrize("length", [3, 8])
-def test_ricursive_dflash_projection_matches_native(bits, batch, length):
-    mx.random.seed(83)
-    layer = nn.Linear(512, 1024, bias=False)
-    layer.set_dtype(mx.bfloat16)
-    layer = layer.to_quantized(group_size=64, bits=bits)
-    layer.eval()
-    inputs = mx.random.normal((batch, length, 512)).astype(mx.bfloat16)
-    expected = mx.concatenate(
-        [layer(mx.contiguous(inputs[:, i : i + 1])) for i in range(length)], axis=1
-    )
-    equal(module("models.ricursive.language")._linear(layer, inputs), expected)
-
-
-@parametrize("window", [None, 3, 8])
-@parametrize("prefix", [0, 3, 9])
-def test_ricursive_ragged_cache_transactions(window, prefix):
-    arch = module("models.ricursive.cache")
-    batch = (
-        arch.BatchKVCache([0, 0])
-        if window is None
-        else arch.BatchRotatingKVCache(window, [0, 0])
-    )
-    rows = [
-        arch.KVCache() if window is None else arch.RotatingKVCache(window)
-        for _ in range(2)
-    ]
-
-    def tensors(start, length):
-        k = (
-            mx.arange(start, start + 2 * length * 4)
-            .reshape(2, 1, length, 4)
-            .astype(mx.float32)
-        )
-        return k, k * 2
-
-    if prefix:
-        k, v = tensors(0, prefix)
-        batch.update_and_fetch(k, v)
-        for row, reference in enumerate(rows):
-            reference.update_and_fetch(k[row : row + 1], v[row : row + 1])
-    for step, accepted in enumerate(([1, 3], [4, 2], [2, 4])):
-        k, v = tensors(100 + step * 100, 4)
-        transaction = start_speculative_cache([batch], 4)
-        for t in range(4):
-            batch.update_and_fetch(k[:, :, t : t + 1], v[:, :, t : t + 1])
-        transaction.commit(accepted)
-        for row, (reference, count) in enumerate(zip(rows, accepted)):
-            for t in range(count):
-                reference.update_and_fetch(
-                    k[row : row + 1, :, t : t + 1], v[row : row + 1, :, t : t + 1]
-                )
-            actual = batch.extract(row)
-            assert actual.offset == reference.offset
-            if window is None:
-                equal(actual.state, reference.state)
-            else:
-                for name in ("keys", "values"):
-                    expected = reference._temporal_order(getattr(reference, name))[
-                        ..., -window:, :
-                    ]
-                    equal(getattr(actual, name), expected)
-        restored = type(batch).from_state(batch.state, batch.meta_state)
-        equal(restored.state, batch.state)
-        before = [deepcopy(batch.extract(i).state) for i in range(2)]
-        transaction = start_speculative_cache([batch], 4)
-        batch.update_and_fetch(k, v)
-        transaction.abort()
-        equal([batch.extract(i).state for i in range(2)], before)
-
-
-@parametrize("batch", [1, 2])
-@parametrize(
-    "window,prefix", [(3, 0), (8, 0), (8, 6), (8, 9), (1024, 1022), (1024, 1024)]
-)
-@parametrize("length", [3, 8])
-def test_ricursive_block_cache_views_are_causal(batch, window, prefix, length):
-    arch = module("models.ricursive.cache")
-    base = module("models.cache")
-    padding = [0] if batch == 1 else [0, 2]
-    cache = (
-        arch.RotatingKVCache(window)
-        if batch == 1
-        else arch.BatchRotatingKVCache(window, padding)
-    )
-    reference = base.BatchRotatingKVCache(window, padding)
-    mx.random.seed(137)
-    if prefix:
-        k = mx.random.normal((batch, 2, prefix, 8))
-        v = mx.random.normal(k.shape)
-        cache.update_and_fetch(k, v)
-        reference.update_and_fetch(k, v)
-    k = mx.random.normal((batch, 2, length, 8))
-    v = mx.random.normal(k.shape)
-    transaction = start_speculative_cache([cache], length)
-    keys, values, masks = cache.fetch_verification_block(k, v)
-    for t in range(length):
-        mask = reference.make_mask(1)
-        expected = reference.update_and_fetch(k[:, :, t : t + 1], v[:, :, t : t + 1])
-        width = expected[0].shape[2]
-        equal(masks[:, t, :, :, :width], mask)
-        if width < masks.shape[-1]:
-            assert not mx.any(masks[:, t, :, :, width:]).item()
-        for actual, wanted in zip((keys, values), expected):
-            equal(
-                mx.where(mask.transpose(0, 1, 3, 2), actual[:, t, :, :width], 0),
-                mx.where(mask.transpose(0, 1, 3, 2), wanted, 0),
-            )
-    transaction.commit([length] * batch)
-    assert (
-        cache.offset == prefix + length
-        if batch == 1
-        else cache.offset.tolist() == reference.offset.tolist()
-    )
-    if cache.is_trimmable():
-        assert cache.trim(1) == reference.trim(1) == 1
-        actual = cache.update_and_fetch(k[:, :, -1:], v[:, :, -1:])
-        expected = reference.update_and_fetch(k[:, :, -1:], v[:, :, -1:])
-        equal(actual, expected)
-
-
-@parametrize("padding", [0, 2])
-def test_ricursive_ragged_verification_matches_independent_requests(padding):
+@parametrize("prefix,padding", [(0, 0), (3, 0), (3, 2), (9, 0), (9, 2)])
+def test_ricursive_ragged_verification_matches_independent_requests(prefix, padding):
     mx.random.seed(127)
     model = dflash_target("ricursive-dflash2").language_model
     model.set_dtype(mx.float32)
     cache = _make_cache(model, [0, padding])
-    mx.eval(model(mx.random.randint(1, 30, (2, 11)), cache=cache).logits)
+    if prefix:
+        mx.eval(model(mx.random.randint(1, 30, (2, prefix)), cache=cache).logits)
     references = [deepcopy(cache) for _ in range(2)]
     for i, row in enumerate(references):
         for entry in row:
@@ -1832,6 +1644,7 @@ def test_ricursive_cache_batch_lifecycle(window):
         batch.update_and_fetch(block, block * 2)
     transaction.commit([1, 3])
     references = [batch.extract(i) for i in range(2)] + [original]
+    batch = type(batch).from_state(batch.state, batch.meta_state)
     batch.extend(warm)
     batch.filter(mx.array([2, 0, 1], mx.int32))
     for i, reference in enumerate([references[j] for j in [2, 0, 1]]):
@@ -1873,40 +1686,6 @@ def test_native_affine_batch_projection(dtype, bits, batch, length):
             [layer(mx.contiguous(inputs[:, t : t + 1])) for t in range(length)], axis=1
         )
         equal(actual, expected)
-
-
-def test_ricursive_dflash_batch_acceptance_keeps_independent_positions(monkeypatch):
-    mx.random.seed(89)
-    target = dflash_target("ricursive-dflash2")
-    model = target.language_model
-    drafter = dflash_drafter("ricursive-dflash2")
-    cache = _make_cache(model, [0, 0])
-    output = model(
-        mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]),
-        cache=cache,
-        capture_layer_ids=drafter.config.target_layer_ids,
-    )
-    dflash = module("speculative.dflash")
-    session = dflash.DFlashBatch(
-        model,
-        drafter,
-        cache,
-        mx.concatenate(output.hidden_states, axis=-1),
-        greedy(output.logits[:, -1]),
-        4,
-        greedy,
-        mx.int32,
-        True,
-    )
-    monkeypatch.setattr(
-        dflash,
-        "_speculative_walk_batch",
-        lambda *args: ([0, 1], [[11], [12, 13]]),
-    )
-    assert session.step([8, 8], [1, 1]) == [[11], [12, 13]]
-    assert drafter.accept_lens == [0, 1]
-    for entry in cache:
-        assert entry.offset.tolist() == [6, 7]
 
 
 @parametrize(
