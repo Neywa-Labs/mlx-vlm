@@ -2792,6 +2792,279 @@ def test_dense_model(name):
     ModelChecks().forward_cache(model, config["vocab_size"])
 
 
+class TestBailingHybrid(unittest.TestCase):
+    def make_model(self, **overrides):
+        from mlx_vlm.models.bailing_hybrid import Model, ModelConfig
+
+        config = copy.deepcopy(DATA["dense"]["bailing_hybrid"])
+        config.update(overrides)
+        mx.random.seed(17)
+        model = Model(ModelConfig.from_dict(config))
+        model.eval()
+        return model
+
+    def test_public_generation_api(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm import generate
+        from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer
+        from mlx_vlm.utils import StoppingCriteria
+
+        processor = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel({f"t{i}": i for i in range(128)}, unk_token="t0")
+            ),
+            unk_token="t0",
+            pad_token="t0",
+            eos_token="t127",
+        )
+        processor.detokenizer = NaiveStreamingDetokenizer(processor)
+        processor.stopping_criteria = StoppingCriteria([127], processor)
+        model = self.make_model(eos_token_id=[])
+        result = generate(model, processor, "t1", max_tokens=3, verbose=False)
+        self.assertEqual(result.generation_tokens, 3)
+        self.assertEqual(processor.stopping_criteria.eos_token_ids, [127])
+
+    def test_generation_prefill_chunks_and_reset(self):
+        from mlx_vlm.generate.ar import generate_step
+
+        model = self.make_model()
+        ids = mx.array([[1, 2, 3, 4, 5]])
+        sequences = []
+        for chunk_size in (2, 128, 2):
+            sequences.append(
+                [
+                    int(token)
+                    for token, _ in generate_step(
+                        ids,
+                        model,
+                        None,
+                        None,
+                        max_tokens=4,
+                        prefill_step_size=chunk_size,
+                    )
+                ]
+            )
+        self.assertEqual(len(sequences[0]), 4)
+        self.assertEqual(sequences[0], sequences[1])
+        self.assertEqual(sequences[0], sequences[2])
+
+    def test_grouped_router_with_negative_corrected_scores(self):
+        model = self.make_model()
+        gate = model.layers[1].mlp.gate
+        gate.weight = mx.random.normal(gate.weight.shape) * 0.1
+        gate.expert_bias = mx.array([-2.0, -2.1, -2.2, -2.3, -3.0, -3.1, -3.2, -3.3])
+        x = mx.random.normal((2, 3, 64))
+        indices, weights = gate(x)
+        scores = 1 / (1 + np.exp(-np.asarray(x) @ np.asarray(gate.weight).T))
+        corrected = scores + np.asarray(gate.expert_bias)
+        grouped = corrected.reshape(2, 3, 2, 4)
+        groups = np.argsort(np.sort(grouped, axis=-1)[..., -2:].sum(-1), axis=-1)[
+            ..., -1
+        ]
+        selected = np.where(np.arange(2) == groups[..., None], True, False)
+        corrected = np.where(selected[..., None], grouped, -np.inf).reshape(2, 3, 8)
+        expected_indices = np.argsort(corrected, axis=-1)[..., -2:]
+        np.testing.assert_array_equal(
+            np.sort(indices, axis=-1), np.sort(expected_indices, axis=-1)
+        )
+        expected_weights = np.take_along_axis(scores, np.asarray(indices), axis=-1)
+        expected_weights *= 2.5 / expected_weights.sum(-1, keepdims=True)
+        np.testing.assert_allclose(weights, expected_weights, atol=1e-6)
+
+    def test_chunked_and_token_cache_parity(self):
+        for low_rank in (False, True):
+            model = self.make_model(no_kda_lora=not low_rank)
+            ids = mx.array([[1, 7, 3, 9, 11, 2, 5]])
+            expected = model(ids).logits
+            for chunk_size in (1, 3, 6):
+                cache = model.make_cache()
+                actual = mx.concatenate(
+                    [
+                        model(ids[:, i : i + chunk_size], cache=cache).logits
+                        for i in range(0, 7, chunk_size)
+                    ],
+                    axis=1,
+                )
+                np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
+
+    def test_left_padded_batch_cache(self):
+        from mlx_vlm.models.cache import ArraysCache, BatchKVCache
+
+        model = self.make_model()
+        ids = mx.array([[0, 0, 1, 7, 3], [2, 4, 6, 8, 9]])
+        cache = [
+            (
+                ArraysCache(4, left_padding=[2, 0])
+                if layer.is_linear
+                else BatchKVCache([2, 0])
+            )
+            for layer in model.layers
+        ]
+        actual = model(ids, cache=cache).logits
+        for row, start in ((0, 2), (1, 0)):
+            expected = model(ids[row : row + 1, start:]).logits
+            np.testing.assert_allclose(
+                actual[row : row + 1, start:], expected, atol=3e-5, rtol=3e-5
+            )
+        # A continuation exercises the advanced left-padding and RoPE offsets.
+        next_ids = mx.array([[5], [10]])
+        actual = model(next_ids, cache=cache).logits
+        for row, start in ((0, 2), (1, 0)):
+            prompt = mx.concatenate(
+                [ids[row : row + 1, start:], next_ids[row : row + 1]], axis=1
+            )
+            np.testing.assert_allclose(
+                actual[row], model(prompt).logits[0, -1:], atol=3e-5, rtol=3e-5
+            )
+
+    def test_kda_against_numpy_recurrence(self):
+        model = self.make_model()
+        attn = model.layers[0].attention
+        x = mx.random.normal((1, 5, 64))
+        attn.A_log = mx.random.uniform(-1, 1, (2,))
+        attn.dt_bias = mx.random.uniform(-1, 1, (64,))
+        qkv = []
+        for name in ("q", "k", "v"):
+            projected = np.asarray(getattr(attn, f"{name}_proj")(x)).astype(np.float64)
+            weights = np.asarray(getattr(attn, f"{name}_conv1d").conv.weight)[..., 0]
+            padded = np.pad(projected, ((0, 0), (3, 0), (0, 0)))
+            y = sum(padded[:, j : j + 5] * weights[:, j] for j in range(4))
+            qkv.append((y / (1 + np.exp(-y))).reshape(1, 5, 2, 32))
+        q, k, v = qkv
+        q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(32)
+        k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+        a = np.asarray(attn.f_proj(x)).reshape(1, 5, 2, 32).astype(np.float64)
+        a = np.exp(np.asarray(attn.A_log))[None, None, :, None] * (
+            a + np.asarray(attn.dt_bias).reshape(2, 32)
+        )
+        decay = np.exp(-5 / (1 + np.exp(-a)))
+        beta = 1 / (1 + np.exp(-np.asarray(attn.b_proj(x))))
+        state = np.zeros((1, 2, 32, 32), dtype=np.float64)
+        outputs = []
+        for t in range(5):
+            state *= decay[:, t, :, :, None]
+            residual = v[:, t] - np.einsum("bhkv,bhk->bhv", state, k[:, t])
+            state += np.einsum("bhk,bhv->bhkv", k[:, t], residual * beta[:, t, :, None])
+            outputs.append(np.einsum("bhkv,bhk->bhv", state, q[:, t]))
+        out = np.stack(outputs, axis=1)
+        out = out / np.sqrt((out * out).mean(-1, keepdims=True) + 1e-6)
+        out *= np.asarray(attn.o_norm.weight)
+        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
+        expected = (out.reshape(1, 5, 64) * gate) @ np.asarray(attn.o_proj.weight).T
+        actual = attn(x)
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        attn.train()  # Exercise the portable operations fallback as well.
+        np.testing.assert_allclose(attn(x), expected, atol=2e-5, rtol=2e-5)
+
+    def test_mla_against_expanded_attention(self):
+        model = self.make_model()
+        attn = model.layers[1].attention
+        x = mx.random.normal((1, 5, 64))
+        q = (
+            attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
+            .reshape(1, 5, 2, 48)
+            .transpose(0, 2, 1, 3)
+        )
+        latent, k_rot = mx.split(attn.kv_a_proj_with_mqa(x), [32], axis=-1)
+        latent = attn.kv_a_layernorm(latent)
+        # Explicit per-head K/V expansion, independent of absorbed decode.
+        keys = np.einsum(
+            "btl,hlk->bhtk", np.asarray(latent), np.asarray(attn.embed_q.weight)
+        )
+        values = np.einsum(
+            "btl,hvl->bhtv", np.asarray(latent), np.asarray(attn.unembed_out.weight)
+        )
+        q_rot = np.asarray(attn.rope(q[..., 32:]))
+        k_rot = np.asarray(attn.rope(k_rot[:, None]))
+        queries = np.concatenate([np.asarray(q[..., :32]), q_rot], -1)
+        keys = np.concatenate([keys, np.broadcast_to(k_rot, (1, 2, 5, 16))], -1)
+        scores = queries @ keys.swapaxes(-1, -2) / np.sqrt(48)
+        scores = np.where(np.tril(np.ones((5, 5), dtype=bool)), scores, -np.inf)
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        probs /= probs.sum(-1, keepdims=True)
+        out = (probs @ values).transpose(0, 2, 1, 3)
+        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
+        expected = (out * gate[..., None]).reshape(1, 5, 64) @ np.asarray(
+            attn.dense.weight
+        ).T
+        mask = mx.array(np.tril(np.ones((5, 5), dtype=bool)))
+        np.testing.assert_allclose(attn(x, mask), expected, atol=2e-5, rtol=2e-5)
+
+    def test_fp8_sanitize_and_nextn_exclusion(self):
+        model = self.make_model()
+        prefix = "model.layers.0.attention"
+        conv = mx.random.normal((64, 1, 4))
+        # E4M3 byte 0x38 represents 1.0; different blocks have different scales.
+        weights = {
+            f"{prefix}.q_proj.weight_scale_inv": mx.array([[2.0, 3.0], [4.0, 5.0]]),
+            f"{prefix}.q_proj.weight": mx.full((160, 192), 0x38, mx.uint8),
+            f"{prefix}.q_conv1d.weight": conv,
+            "model.layers.4.eh_proj.weight": mx.zeros((64, 128)),
+        }
+        result = model.sanitize(weights)
+        actual = result[f"language_model.{prefix}.q_proj.weight"]
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        self.assertEqual(float(actual[0, 0]), 2.0)
+        self.assertEqual(float(actual[150, 180]), 5.0)
+        np.testing.assert_array_equal(
+            result[f"language_model.{prefix}.q_conv1d.conv.weight"], conv.swapaxes(1, 2)
+        )
+        self.assertFalse(any("layers.4." in name for name in result))
+        self.assertFalse(any("scale_inv" in name for name in result))
+
+    def test_native_and_quantized_checkpoint_loading(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.quant_utils import quantize_model
+        from mlx_vlm.utils import load_model, save_weights
+
+        model = self.make_model()
+        source = {
+            name.removeprefix("language_model."): value
+            for name, value in tree_flatten(model.parameters())
+        }
+        for i, layer in enumerate(model.layers):
+            prefix = f"model.layers.{i}"
+            if i >= model.config.first_k_dense_replace:
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    experts = source.pop(f"{prefix}.mlp.switch_mlp.{proj}.weight")
+                    for e in range(model.config.num_experts):
+                        source[f"{prefix}.mlp.experts.{e}.{proj}.weight"] = experts[e]
+            prefix += ".attention"
+            if layer.is_linear:
+                for name in ("q", "k", "v"):
+                    weight = source.pop(f"{prefix}.{name}_conv1d.conv.weight")
+                    source[f"{prefix}.{name}_conv1d.weight"] = weight.swapaxes(1, 2)
+            else:
+                key = source.pop(f"{prefix}.embed_q.weight").swapaxes(-1, -2)
+                value = source.pop(f"{prefix}.unembed_out.weight")
+                source[f"{prefix}.kv_b_proj.weight"] = mx.concatenate(
+                    [key, value], axis=1
+                ).reshape(-1, model.config.kv_lora_rank)
+        source["model.layers.4.eh_proj.weight"] = mx.zeros((64, 128))
+        ids = mx.array([[1, 2, 3, 4]])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            config = model.config.to_dict()
+            (path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(str(path / "model.safetensors"), source)
+            loaded = load_model(path)
+            np.testing.assert_allclose(loaded(ids).logits, model(ids).logits, atol=1e-6)
+
+            quantized, config = quantize_model(model, config, group_size=32, bits=4)
+            save_weights(path, quantized)
+            (path / "config.json").write_text(json.dumps(config))
+            loaded = load_model(path)
+            np.testing.assert_allclose(
+                loaded(ids).logits, quantized(ids).logits, atol=1e-6
+            )
+
+
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
