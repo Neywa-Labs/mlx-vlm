@@ -7,9 +7,9 @@ from ..base import (
     project_logits,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache, RotatingKVCache
 from ..linear import DECODE_BLOCK_SIZE, linear
 from ..quantized_verifier import optimized_affine_linear
+from .cache import KVCache, RotatingKVCache
 from .config import ModelConfig
 
 
@@ -90,7 +90,12 @@ class Attention(nn.Module):
             v.transpose(0, 2, 1, 3) for v in (queries, keys, values)
         )
 
-        if decode_block:
+        out = (
+            self._attention_block(queries, keys, values, cache)
+            if decode_block
+            else None
+        )
+        if decode_block and out is None:
             # Keep one-token RoPE, attention, and physical cache order while
             # sharing projection work across the verification block.
             outputs = []
@@ -113,7 +118,7 @@ class Attention(nn.Module):
                     )
                 )
             out = mx.concatenate(outputs, axis=2)
-        else:
+        elif not decode_block:
             out = self._attention(queries, keys, values, mask, cache)
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         if hasattr(self, "g_proj"):
@@ -122,6 +127,27 @@ class Attention(nn.Module):
                 gate = gate.astype(mx.float32)
             out = out * mx.sigmoid(gate).astype(out.dtype)
         return _linear(self.o_proj, out)
+
+    def _attention_block(self, queries, keys, values, cache):
+        fetch = getattr(cache, "fetch_verification_block", None)
+        if fetch is None:
+            return None
+        if self.is_sliding:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+        views = fetch(keys, values)
+        if views is None:
+            return None
+        keys, values, mask = views
+        batch, heads, length, dim = queries.shape
+        queries = queries.transpose(0, 2, 1, 3).reshape(batch * length, heads, 1, dim)
+        keys = keys.reshape(batch * length, *keys.shape[2:])
+        values = values.reshape(batch * length, *values.shape[2:])
+        mask = mask.reshape(batch * length, 1, 1, mask.shape[-1])
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask
+        )
+        return output.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
 
     def _attention(self, queries, keys, values, mask, cache):
         if self.is_sliding:
@@ -224,13 +250,6 @@ class RicursiveModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    # Ragged cache compaction changes BF16 attention reduction order. Keep
-    # batch rows aligned so verification matches ordinary batched decoding.
-    requires_uniform_batch_acceptance = True
-    # Multi-row verification repeats the native batch projection per draft
-    # position. Ordinary decoding is faster; resume drafting for a lone row.
-    dflash_batch_size_limit = 1
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

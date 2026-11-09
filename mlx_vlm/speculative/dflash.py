@@ -77,11 +77,6 @@ def _dflash_next_block_size(
     return min(block_total, current)
 
 
-def _dflash_should_draft(model, batch_size):
-    limit = getattr(model, "dflash_batch_size_limit", None)
-    return limit is None or batch_size <= limit
-
-
 def _dflash_committed_hidden_segments(
     hidden_full: mx.array, new_tokens_list: List[List[int]]
 ) -> List[mx.array]:
@@ -104,9 +99,6 @@ def _reserve_dflash_target_cache(prompt_cache: List[Any], block_size: int) -> No
 
 
 def _dflash_verify(lm, inputs, cache, capture_layer_ids):
-    if inputs.shape[1] == 1 and not _dflash_should_draft(lm, inputs.shape[0]):
-        # No proposals means no rollback state is needed.
-        return lm(inputs, cache=cache, capture_layer_ids=capture_layer_ids), None
     # Older architectures still own their verifier entry point. Models using
     # ordinary forward calls need only the shared cache transaction.
     if callable(getattr(lm, "rollback_speculative_cache", None)):
@@ -418,9 +410,6 @@ class DFlashBatch:
         block_size = _dflash_next_block_size(
             self.draft, self.block_size, max(budgets) + 1, self.initial_block_size
         )
-        drafting = _dflash_should_draft(self.model, len(budgets))
-        if not drafting:
-            block_size = 1
         sampler = self.sampler
         row_ids = [0] * len(budgets)
         if not self.greedy and self.positioned_sampling:
@@ -466,11 +455,7 @@ class DFlashBatch:
                 ]
             )
 
-        draft_tokens = (
-            self.sampler_rng.draft_tokens(draft_rows)
-            if drafting
-            else mx.zeros((len(budgets), 0), dtype=self.dtype)
-        )
+        draft_tokens = self.sampler_rng.draft_tokens(draft_rows)
         inputs = mx.concatenate(
             [mx.array(self.bonus, self.dtype)[:, None], draft_tokens], axis=1
         )
@@ -529,21 +514,10 @@ class DFlashBatch:
         except BaseException:
             abort_speculative_round(transaction)
             raise
-        segments = [hidden[i : i + 1, : len(row)] for i, row in enumerate(tokens)]
-        # Draft caches have not consumed the pending context during target-only
-        # steps. Retain it so a surviving row can resume speculation exactly.
-        self.hidden = (
-            segments
-            if drafting
-            else [
-                mx.concatenate([old, new], axis=1)
-                for old, new in zip(self.hidden, segments)
-            ]
-        )
+        self.hidden = [hidden[i : i + 1, : len(row)] for i, row in enumerate(tokens)]
         self.bonus = [row[-1] for row in tokens]
-        if drafting:
-            for count in accepted:
-                _record_speculative_round(self.draft, count, block_size - 1)
+        for count in accepted:
+            _record_speculative_round(self.draft, count, block_size - 1)
         return tokens
 
 
@@ -773,8 +747,15 @@ def _dflash_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
-    hidden_by_orig = unpad_hidden(hidden, prompt_cache)
+    hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
     draft_batch = getattr(draft_model, "draft_batch", None)
+    if callable(draft_batch):
+        offsets = getattr(prompt_cache[0], "offset", None)
+        if isinstance(offsets, mx.array) and offsets.size == B:
+            lengths = offsets.reshape(-1).tolist()
+            hidden_by_orig = [
+                h[:, -min(h.shape[1], n) :] for h, n in zip(hidden_by_orig, lengths)
+            ]
 
     total_emitted = sum(emitted)
 
@@ -793,9 +774,6 @@ def _dflash_rounds_batch(
             break
 
         n_active = len(active_idx)
-        drafting = _dflash_should_draft(lm, n_active)
-        if not drafting:
-            bs = 1
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
@@ -846,11 +824,7 @@ def _dflash_rounds_batch(
         # Keep draft collectives on the verifier stream so distributed ranks
         # cannot submit draft and target reductions in different orders.
         with mx.stream(generation_stream):
-            draft_tokens = (
-                sampler_rng.draft_tokens(draft_active_rows)
-                if drafting
-                else mx.zeros((n_active, 0), dtype=token_dtype)
-            )
+            draft_tokens = sampler_rng.draft_tokens(draft_active_rows)
 
         gdn_states = None
         try:
@@ -913,17 +887,10 @@ def _dflash_rounds_batch(
             for j in range(n_active):
                 orig = active_idx[j]
                 if hidden_segments[j].shape[1] > 0:
-                    hidden_by_orig[orig] = (
-                        hidden_segments[j]
-                        if drafting
-                        else mx.concatenate(
-                            [hidden_by_orig[orig], hidden_segments[j]], axis=1
-                        )
-                    )
+                    hidden_by_orig[orig] = hidden_segments[j]
 
-            if drafting:
-                for a in accepted_list:
-                    _record_speculative_round(draft_model, a, bs - 1)
+            for a in accepted_list:
+                _record_speculative_round(draft_model, a, bs - 1)
 
             with mx.stream(generation_stream):
                 commit_speculative_round(

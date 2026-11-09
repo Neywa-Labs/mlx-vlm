@@ -1551,6 +1551,41 @@ def test_ricursive_dflash_verification_and_rotating_rollback(
         )
 
 
+@parametrize("family", ["dflash2", "ricursive-dflash2"])
+@parametrize("batch", [1, 2, 4])
+def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
+    mx.random.seed(103)
+    target, draft = dflash_target(family), dflash_drafter(family)
+    target.language_model.set_dtype(mx.float32)
+    draft.set_dtype(mx.float32)
+    draft.bind(target)
+    draft.eval()
+    for layer in draft.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            conv.base_kernel = mx.random.normal(conv.base_kernel.shape) * 0.05
+    serial_caches = [draft.make_cache() for _ in range(batch)]
+    batch_caches = [draft.make_cache() for _ in range(batch)]
+    width = draft.config.hidden_size * len(draft.config.target_layer_ids)
+    for step in range(3):
+        hidden = [
+            mx.random.normal((1, (11 - row) if step == 0 else row + 1, width))
+            for row in range(batch)
+        ]
+        anchors = list(range(1 + step, batch + 1 + step))
+        expected = mx.concatenate(
+            [
+                draft.draft_block(anchor, h, cache, 3, greedy)
+                for anchor, h, cache in zip(anchors, hidden, serial_caches)
+            ]
+        )
+        actual = draft.draft_batch(anchors, hidden, batch_caches, 3, greedy, mx.int32)
+        equal(actual, expected)
+        for actual_row, expected_row in zip(batch_caches, serial_caches):
+            for actual_cache, expected_cache in zip(actual_row, expected_row):
+                assert actual_cache.offset == expected_cache.offset
+                equal(actual_cache.state, expected_cache.state, atol=2e-5, rtol=2e-5)
+
+
 @parametrize("bits", [4, 8])
 @parametrize("batch", [1, 2])
 @parametrize("length", [3, 8])
@@ -1567,121 +1602,174 @@ def test_ricursive_dflash_projection_matches_native(bits, batch, length):
     equal(module("models.ricursive.language")._linear(layer, inputs), expected)
 
 
-@parametrize("batch", [2, 4])
-@parametrize("padded", [False, True])
-@parametrize("sampling", ["greedy", "sampled", "positioned"])
-def test_ricursive_dflash_batch_fallback_and_resume(
-    batch, padded, sampling, monkeypatch
-):
-    mx.random.seed(107)
-    target = dflash_target("ricursive-dflash2")
-    model = target.language_model
-    draft = dflash_drafter("ricursive-dflash2")
-    draft.eval()
-    prompt = mx.arange(batch * 5).reshape(batch, 5) % 31
-    padding = [i % 3 for i in range(batch)] if padded else [0] * batch
-    reference, cache = [_make_cache(model, padding) for _ in range(2)]
-    bonus = greedy(model(prompt, cache=reference).logits[:, -1])
-    output = model(prompt, cache=cache, capture_layer_ids=draft.config.target_layer_ids)
-    sampler = (
-        NS(sample_target=lambda logits, **kwargs: greedy(logits))
-        if sampling == "positioned"
-        else greedy
+@parametrize("window", [None, 3, 8])
+@parametrize("prefix", [0, 3, 9])
+def test_ricursive_ragged_cache_transactions(window, prefix):
+    arch = module("models.ricursive.cache")
+    batch = (
+        arch.BatchKVCache([0, 0])
+        if window is None
+        else arch.BatchRotatingKVCache(window, [0, 0])
     )
-    session = module("speculative.dflash").DFlashBatch(
-        model,
-        draft,
-        cache,
-        mx.concatenate(output.hidden_states, axis=-1),
-        bonus,
-        4,
-        sampler,
-        mx.int32,
-        sampling == "greedy",
-    )
-    draft_method = "draft_block_greedy" if sampling == "greedy" else "draft_block"
-    original = getattr(draft, draft_method)
-    calls = []
+    rows = [
+        arch.KVCache() if window is None else arch.RotatingKVCache(window)
+        for _ in range(2)
+    ]
 
-    def record(*args, **kwargs):
-        calls.append(args[1].shape[1])
-        return original(*args, **kwargs)
+    def tensors(start, length):
+        k = (
+            mx.arange(start, start + 2 * length * 4)
+            .reshape(2, 1, length, 4)
+            .astype(mx.float32)
+        )
+        return k, k * 2
 
-    monkeypatch.setattr(draft, draft_method, record)
-    for _ in range(4):
-        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
-        assert session.step([12] * batch, [1] * batch) == [[v] for v in bonus.tolist()]
-    assert calls == []
-    assert not draft.draft_lens
-    assert [h.shape[1] for h in session.hidden] == [9 - p for p in padding]
-    assert all(c.offset == 0 for row in session.draft_caches for c in row)
-
-    # A continuation can be detached and re-admitted without losing pending context.
-    detached = session.snapshot(batch - 1)
-    session.filter(list(range(batch - 1)))
-    session.extend(detached)
-    session.filter([batch - 1])
-    for c in reference:
-        c.filter(mx.array([batch - 1], mx.int32))
-    bonus = bonus[-1:]
-    actual = session.step([8], [5])[0]
-    expected = []
-    for _ in actual:
-        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
-        expected.append(bonus.item())
-    assert actual == expected
-    assert calls == [9 - padding[-1]]
-    assert draft.draft_lens
-
-
-def test_ricursive_dflash_legacy_batch_fallback_and_resume(monkeypatch):
-    mx.random.seed(109)
-    target = dflash_target("ricursive-dflash2")
-    model = target.language_model
-    draft = dflash_drafter("ricursive-dflash2")
-    draft.eval()
-    prompt = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]])
-    reference, cache = [_make_cache(model, [0, 0]) for _ in range(2)]
-    bonus = greedy(model(prompt, cache=reference).logits[:, -1])
-    output = model(prompt, cache=cache, capture_layer_ids=draft.config.target_layer_ids)
-    original = draft.draft_block_greedy
-    calls = []
-
-    def record(*args, **kwargs):
-        calls.append(args[1].shape[1])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(draft, "draft_block_greedy", record)
-    rounds = module("speculative.dflash")._dflash_rounds_batch(
-        model,
-        draft,
-        cache,
-        mx.concatenate(output.hidden_states, axis=-1),
-        first_bonus=bonus,
-        max_tokens=8,
-        sampler=greedy,
-        draft_block_size=4,
-        stop_check=lambda row, token: row == 0,
-    )
-    first, _ = next(rounds)
-    bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
-    assert first == bonus.tolist()
-    assert calls == []
-    for c in reference:
-        c.filter(mx.array([1], mx.int32))
-    bonus = bonus[1:]
-    for tokens, _ in rounds:
-        assert tokens[0] is None
-        bonus = greedy(model(bonus[:, None], cache=reference).logits[:, -1])
-        assert tokens[1] == bonus.item()
-    assert calls[0] == 5
+    if prefix:
+        k, v = tensors(0, prefix)
+        batch.update_and_fetch(k, v)
+        for row, reference in enumerate(rows):
+            reference.update_and_fetch(k[row : row + 1], v[row : row + 1])
+    for step, accepted in enumerate(([1, 3], [4, 2], [2, 4])):
+        k, v = tensors(100 + step * 100, 4)
+        transaction = start_speculative_cache([batch], 4)
+        for t in range(4):
+            batch.update_and_fetch(k[:, :, t : t + 1], v[:, :, t : t + 1])
+        transaction.commit(accepted)
+        for row, (reference, count) in enumerate(zip(rows, accepted)):
+            for t in range(count):
+                reference.update_and_fetch(
+                    k[row : row + 1, :, t : t + 1], v[row : row + 1, :, t : t + 1]
+                )
+            actual = batch.extract(row)
+            assert actual.offset == reference.offset
+            if window is None:
+                equal(actual.state, reference.state)
+            else:
+                for name in ("keys", "values"):
+                    expected = reference._temporal_order(getattr(reference, name))[
+                        ..., -window:, :
+                    ]
+                    equal(getattr(actual, name), expected)
+        restored = type(batch).from_state(batch.state, batch.meta_state)
+        equal(restored.state, batch.state)
+        before = [deepcopy(batch.extract(i).state) for i in range(2)]
+        transaction = start_speculative_cache([batch], 4)
+        batch.update_and_fetch(k, v)
+        transaction.abort()
+        equal([batch.extract(i).state for i in range(2)], before)
 
 
-def test_ricursive_dflash_batch_acceptance_keeps_cache_positions_aligned(monkeypatch):
+@parametrize("padding", [0, 2])
+def test_ricursive_ragged_verification_matches_independent_requests(padding):
+    mx.random.seed(127)
+    model = dflash_target("ricursive-dflash2").language_model
+    model.set_dtype(mx.float32)
+    cache = _make_cache(model, [0, padding])
+    mx.eval(model(mx.random.randint(1, 30, (2, 11)), cache=cache).logits)
+    references = [deepcopy(cache) for _ in range(2)]
+    for i, row in enumerate(references):
+        for entry in row:
+            entry.filter(mx.array([i], mx.int32))
+    for accepted in ([1, 3], [4, 2], [2, 4]):
+        ids = mx.random.randint(1, 30, (2, 4))
+        expected = []
+        for i, row in enumerate(references):
+            temporary = deepcopy(row)
+            outputs = [
+                model(ids[i : i + 1, t : t + 1], cache=temporary).logits
+                for t in range(4)
+            ]
+            expected.append(mx.concatenate(outputs, axis=1))
+        actual = model(
+            ids, cache=cache, capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate(expected), atol=3e-5, rtol=3e-5)
+        actual.gdn_states.commit(accepted)
+        for i, (row, count) in enumerate(zip(references, accepted)):
+            for t in range(count):
+                mx.eval(model(ids[i : i + 1, t : t + 1], cache=row).logits)
+            for a, e in zip(cache, row):
+                a, e = a.extract(i), e.extract(0)
+                assert a.offset == e.offset
+                equal(a.state, e.state, atol=3e-5, rtol=3e-5)
+
+
+@parametrize("window", [None, 8])
+def test_ricursive_cache_batch_lifecycle(window):
+    arch = module("models.ricursive.cache")
+
+    def single():
+        return arch.KVCache() if window is None else arch.RotatingKVCache(window)
+
+    def content(cache):
+        if window is None:
+            return cache.state
+        return tuple(
+            cache._temporal_order(getattr(cache, name))[..., -window:, :]
+            for name in ("keys", "values")
+        )
+
+    original = single()
+    k = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    original.update_and_fetch(k, k * 2)
+    warm = original.to_batch([3])
+    equal(content(warm.extract(0)), content(original))
+    with pytest.raises(ValueError):
+        original.to_batch([0, 0])
+    batch = original.prefix_cache_merge([original, original], [5, 5])
+    transaction = start_speculative_cache([batch], 4)
+    for t in range(4):
+        block = mx.full((2, 1, 1, 4), t + 20, mx.float32)
+        batch.update_and_fetch(block, block * 2)
+    transaction.commit([1, 3])
+    references = [batch.extract(i) for i in range(2)] + [original]
+    batch.extend(warm)
+    batch.filter(mx.array([2, 0, 1], mx.int32))
+    for i, reference in enumerate([references[j] for j in [2, 0, 1]]):
+        equal(content(batch.extract(i)), content(reference))
+    batch.prepare(lengths=[1, 2, 3], right_padding=[2, 1, 0])
+    block = mx.full((3, 1, 3, 4), 42, mx.float32)
+    batch.update_and_fetch(block, block * 2)
+    batch.finalize()
+    for i, (reference, n) in enumerate(
+        zip([references[j] for j in [2, 0, 1]], [1, 2, 3])
+    ):
+        reference.update_and_fetch(block[i : i + 1, :, :n], block[i : i + 1, :, :n] * 2)
+        assert batch.extract(i).offset == reference.offset
+        equal(content(batch.extract(i)), content(reference))
+
+    empty = single().to_batch([0, 1])
+    restored = type(empty).from_state(empty.state, empty.meta_state)
+    restored.update_and_fetch(block[:2], block[:2])
+    equal(restored.offset, mx.array([3, 2]))
+
+
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("bits", [2, 4, 8])
+@parametrize("batch,length", [(2, 3), (4, 5), (8, 8)])
+def test_native_affine_batch_projection(dtype, bits, batch, length):
+    from mlx_vlm.models.quantized_batch import native_affine_batch_linear
+
+    mx.random.seed(131)
+    for group_size, outputs in [(32, 67), (64, 1024), (128, 256)]:
+        layer = nn.Linear(512, outputs, bias=True)
+        layer.set_dtype(dtype)
+        layer = layer.to_quantized(group_size=group_size, bits=bits)
+        layer.eval()
+        inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+        actual = native_affine_batch_linear(layer, inputs)
+        if actual is None:
+            pytest.skip("Native affine batch QMV is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(inputs[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+
+
+def test_ricursive_dflash_batch_acceptance_keeps_independent_positions(monkeypatch):
     mx.random.seed(89)
     target = dflash_target("ricursive-dflash2")
     model = target.language_model
-    model.dflash_batch_size_limit = None
     drafter = dflash_drafter("ricursive-dflash2")
     cache = _make_cache(model, [0, 0])
     output = model(
@@ -1706,10 +1794,10 @@ def test_ricursive_dflash_batch_acceptance_keeps_cache_positions_aligned(monkeyp
         "_speculative_walk_batch",
         lambda *args: ([0, 1], [[11], [12, 13]]),
     )
-    assert session.step([8, 8], [1, 1]) == [[11], [12]]
-    assert drafter.accept_lens == [0, 0]
+    assert session.step([8, 8], [1, 1]) == [[11], [12, 13]]
+    assert drafter.accept_lens == [0, 1]
     for entry in cache:
-        assert entry.offset.tolist() == [6, 6]
+        assert entry.offset.tolist() == [6, 7]
 
 
 @parametrize(
