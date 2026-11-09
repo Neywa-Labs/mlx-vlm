@@ -1220,6 +1220,28 @@ def _source_fp8_pair(rows=130, cols=160):
     return weight, scales
 
 
+@pytest.mark.parametrize("family", ["bailing_hybrid", "mimo_v2_flash"])
+def test_block_fp8_checkpoint_sanitization(family):
+    from mlx_vlm.tests.test_models import DATA
+
+    module = importlib.import_module("mlx_vlm.models." + family)
+    config = module.ModelConfig.from_dict(copy.deepcopy(DATA["dense"][family]))
+    model = module.Model(config)
+    weight, scale_inv = _source_fp8_pair()
+    key = "model.layers.0.mlp.gate_proj.weight"
+    sanitized = model.sanitize({key: weight, key + "_scale_inv": scale_inv})
+    output_key = "language_model." + key
+    assert sanitized.keys() == {output_key}
+    scales = mx.repeat(mx.repeat(scale_inv, 128, axis=0), 128, axis=1)
+    expected = (
+        mx.from_fp8(weight, dtype=mx.bfloat16)
+        * scales[: weight.shape[0], : weight.shape[1]]
+    )
+    assert sanitized[output_key].dtype == mx.bfloat16
+    assert mx.array_equal(sanitized[output_key], expected).item()
+    assert mx.array_equal(model.sanitize(dict(sanitized))[output_key], expected).item()
+
+
 def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     weight, scale_inv = _source_fp8_pair()
     restored = _dequantize_fp8_weight(weight, scale_inv)

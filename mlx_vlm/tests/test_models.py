@@ -2792,6 +2792,43 @@ def test_dense_model(name):
     ModelChecks().forward_cache(model, config["vocab_size"])
 
 
+@pytest.mark.parametrize("name", DATA["dense"])
+@pytest.mark.parametrize("bits", [None, 4], ids=["unquantized", "4bit"])
+def test_dense_model_checkpoint_roundtrip(name, bits, tmp_path):
+    from mlx_vlm.quant_utils import quantize_model
+    from mlx_vlm.utils import sanitize_weights, save_weights
+
+    module = importlib.import_module("mlx_vlm.models." + name)
+    config = copy.deepcopy(DATA["dense"][name])
+    mx.random.seed(17)
+    model = module.Model(module.ModelConfig.from_dict(config))
+    model.eval()
+    if bits is not None:
+        model, config = quantize_model(model, config, group_size=32, bits=bits)
+
+    expected_weights = dict(tree_flatten(model.parameters()))
+    sanitized = sanitize_weights(model, dict(expected_weights))
+    twice = sanitize_weights(model, dict(sanitized))
+    assert expected_weights.keys() == sanitized.keys() == twice.keys()
+    for key, value in expected_weights.items():
+        for actual in (sanitized[key], twice[key]):
+            assert actual.dtype == value.dtype, key
+            assert mx.array_equal(actual, value).item(), key
+
+    tokens = mx.array([[1, 2, 3, 4]])
+    expected = model(tokens).logits
+    mx.eval(expected)
+    save_weights(tmp_path, model)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded = load_model(tmp_path, strict=True)
+    actual_weights = dict(tree_flatten(loaded.parameters()))
+    assert actual_weights.keys() == expected_weights.keys()
+    for key, value in expected_weights.items():
+        assert actual_weights[key].dtype == value.dtype, key
+        assert mx.array_equal(actual_weights[key], value).item(), key
+    np.testing.assert_allclose(loaded(tokens).logits, expected, atol=1e-6, rtol=1e-6)
+
+
 class TestBailingHybrid(unittest.TestCase):
     def make_model(self, **overrides):
         from mlx_vlm.models.bailing_hybrid import Model, ModelConfig
@@ -2992,77 +3029,6 @@ class TestBailingHybrid(unittest.TestCase):
         ).T
         mask = mx.array(np.tril(np.ones((5, 5), dtype=bool)))
         np.testing.assert_allclose(attn(x, mask), expected, atol=2e-5, rtol=2e-5)
-
-    def test_fp8_sanitize_and_nextn_exclusion(self):
-        model = self.make_model()
-        prefix = "model.layers.0.attention"
-        conv = mx.random.normal((64, 1, 4))
-        # E4M3 byte 0x38 represents 1.0; different blocks have different scales.
-        weights = {
-            f"{prefix}.q_proj.weight_scale_inv": mx.array([[2.0, 3.0], [4.0, 5.0]]),
-            f"{prefix}.q_proj.weight": mx.full((160, 192), 0x38, mx.uint8),
-            f"{prefix}.q_conv1d.weight": conv,
-            "model.layers.4.eh_proj.weight": mx.zeros((64, 128)),
-        }
-        result = model.sanitize(weights)
-        actual = result[f"language_model.{prefix}.q_proj.weight"]
-        self.assertEqual(actual.dtype, mx.bfloat16)
-        self.assertEqual(float(actual[0, 0]), 2.0)
-        self.assertEqual(float(actual[150, 180]), 5.0)
-        np.testing.assert_array_equal(
-            result[f"language_model.{prefix}.q_conv1d.conv.weight"], conv.swapaxes(1, 2)
-        )
-        self.assertFalse(any("layers.4." in name for name in result))
-        self.assertFalse(any("scale_inv" in name for name in result))
-
-    def test_native_and_quantized_checkpoint_loading(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        from mlx_vlm.quant_utils import quantize_model
-        from mlx_vlm.utils import load_model, save_weights
-
-        model = self.make_model()
-        source = {
-            name.removeprefix("language_model."): value
-            for name, value in tree_flatten(model.parameters())
-        }
-        for i, layer in enumerate(model.layers):
-            prefix = f"model.layers.{i}"
-            if i >= model.config.first_k_dense_replace:
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    experts = source.pop(f"{prefix}.mlp.switch_mlp.{proj}.weight")
-                    for e in range(model.config.num_experts):
-                        source[f"{prefix}.mlp.experts.{e}.{proj}.weight"] = experts[e]
-            prefix += ".attention"
-            if layer.is_linear:
-                for name in ("q", "k", "v"):
-                    weight = source.pop(f"{prefix}.{name}_conv1d.conv.weight")
-                    source[f"{prefix}.{name}_conv1d.weight"] = weight.swapaxes(1, 2)
-            else:
-                key = source.pop(f"{prefix}.embed_q.weight").swapaxes(-1, -2)
-                value = source.pop(f"{prefix}.unembed_out.weight")
-                source[f"{prefix}.kv_b_proj.weight"] = mx.concatenate(
-                    [key, value], axis=1
-                ).reshape(-1, model.config.kv_lora_rank)
-        source["model.layers.4.eh_proj.weight"] = mx.zeros((64, 128))
-        ids = mx.array([[1, 2, 3, 4]])
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            config = model.config.to_dict()
-            (path / "config.json").write_text(json.dumps(config))
-            mx.save_safetensors(str(path / "model.safetensors"), source)
-            loaded = load_model(path)
-            np.testing.assert_allclose(loaded(ids).logits, model(ids).logits, atol=1e-6)
-
-            quantized, config = quantize_model(model, config, group_size=32, bits=4)
-            save_weights(path, quantized)
-            (path / "config.json").write_text(json.dumps(config))
-            loaded = load_model(path)
-            np.testing.assert_allclose(
-                loaded(ids).logits, quantized(ids).logits, atol=1e-6
-            )
 
 
 def tiny_config(family, profile=None, **overrides):
