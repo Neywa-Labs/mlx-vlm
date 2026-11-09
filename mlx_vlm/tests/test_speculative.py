@@ -650,7 +650,7 @@ def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
         generator.close()
 
 
-@parametrize("family", ["qwen", "glm", "deepseek", "gemma"])
+@parametrize("family", ["qwen", "glm", "deepseek", "gemma", "ling"])
 @parametrize("pause_after", [1, 8])
 @parametrize("sampling", [False, True, "positioned"])
 @parametrize("phased", [False, True])
@@ -1412,7 +1412,13 @@ def test_generation_and_request_reset(family, temperature, seed):
 
 @parametrize(
     "family,failure",
-    [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
+    [
+        ("qwen", False),
+        ("glm", False),
+        ("deepseek", False),
+        ("ling", False),
+        ("glm", True),
+    ],
 )
 def test_mtp_generation(family, failure, monkeypatch):
     mx.random.seed(2127)
@@ -1463,7 +1469,7 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", ["qwen", "glm", "deepseek"])
+@parametrize("family", ["qwen", "glm", "deepseek", "ling"])
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
@@ -1966,7 +1972,16 @@ def test_sampler_rng_isolation():
     assert first.shape == (1,) and mx.array_equal(first, second).item()
 
 
-@parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
+@parametrize(
+    "family,quant",
+    [
+        ("qwen", "mxfp8"),
+        ("glm", "affine"),
+        ("glm", "mxfp8"),
+        ("ling", "affine"),
+        ("ling", "mxfp8"),
+    ],
+)
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     name = TINY_MODELS[family]["module"]
     text = tiny_config(family)
@@ -1977,7 +1992,10 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
         else f"model.language_model.layers.{text.num_hidden_layers}.eh_proj"
     )
     key = "layers.0.mlp.down_proj" if family == "qwen" else "eh_proj"
-    fp8 = family == "qwen" or quant == "affine"
+    if family == "ling":
+        prefix = f"model.layers.{text.num_hidden_layers}.attention.q_b_proj"
+        key = "mtp.attention.q_b_proj"
+    fp8 = family in ("qwen", "ling") or quant == "affine"
     config = dict(model_type=name, text_config=text.to_dict())
     weights = {prefix + ".weight": mx.ones((128, 128), dtype=mx.bfloat16)}
     if fp8:
@@ -2325,6 +2343,7 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path, type_key, model_
 @parametrize(
     "family, model_type",
     [
+        ("ling", "bailing_hybrid"),
         ("glm", "glm5_next"),
         ("glm", "glm5_next_text"),
         ("deepseek", "deepseek_v4"),
@@ -2359,7 +2378,26 @@ def test_load_registered_native_drafter(
     reference.set_dtype(mx.bfloat16)
     weights = {}
     for key, value in tree_flatten(reference.parameters()):
-        if family == "glm":
+        if family == "ling":
+            if key == "mtp.attention.unembed_out.weight":
+                continue
+            if key == "mtp.attention.embed_q.weight":
+                value = mx.concatenate(
+                    [
+                        value.swapaxes(-1, -2),
+                        reference.mtp.attention.unembed_out.weight,
+                    ],
+                    axis=1,
+                ).reshape(-1, text["kv_lora_rank"])
+                key = "mtp.attention.kv_b_proj.weight"
+            key = f"model.layers.{text['num_hidden_layers']}." + key.removeprefix(
+                "mtp."
+            )
+            if ".switch_mlp." in key:
+                for expert, tensor in enumerate(value):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = tensor
+                continue
+        elif family == "glm":
             key = key.removeprefix("mtp_block.")
             key = key.replace("shared_head_norm.", "shared_head.norm.")
             key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
@@ -3664,7 +3702,7 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
     equal(model(probes, cache=caches).logits, mx.concatenate(expected), atol=1e-4)
 
 
-@parametrize("family", ["glm", "qwen"])
+@parametrize("family", ["glm", "qwen", "ling"])
 @parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
@@ -3674,10 +3712,15 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
-        else arch.Qwen3_5GatedDeltaNet(cfg)
+        else (
+            arch.KimiDeltaAttention(cfg)
+            if family == "ling"
+            else arch.Qwen3_5GatedDeltaNet(cfg)
+        )
     )
     layer.eval()
-    cache = ArraysCache(2, left_padding=[0] * 3)
+    slots = 4 if family == "ling" else 2
+    cache = ArraysCache(slots, left_padding=[0] * 3)
     cache.prepare(lengths=[100] * 3)
     mx.eval(layer(mx.random.normal((3, 4, cfg.hidden_size)), cache=cache), cache.state)
     for retained in ([0, 2, 5], [3, 1, 4]):
@@ -3691,7 +3734,7 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
         for i in range(0, 5, step):
             mx.eval(layer(inputs[:, i : i + step], cache=cache))
         transaction.commit(retained)
-        for slot in range(2):
+        for slot in range(slots):
             expected = mx.concatenate(
                 [states[n][slot][row : row + 1] for row, n in enumerate(retained)]
             )

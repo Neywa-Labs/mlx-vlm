@@ -6,6 +6,7 @@ from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from ..base import (
     LanguageModelOutput,
@@ -16,6 +17,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..kimi_k3.language import ShortConv1d
+from ..linear import linear
 from ..mla import MultiLinear
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
@@ -76,6 +78,7 @@ class Gate(nn.Module):
 class SparseMoE(nn.Module):
     def __init__(self, args, layer_idx):
         super().__init__()
+        self.sharding_group = None
 
         def limit(values):
             return values[layer_idx] if values and layer_idx < len(values) else None
@@ -101,11 +104,15 @@ class SparseMoE(nn.Module):
         )
 
     def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
         indices, scores = self.gate(x)
         experts = self.switch_mlp(x, indices)
         out = (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
         return out
 
 
@@ -156,13 +163,25 @@ class KimiDeltaAttention(nn.Module):
         lengths = cache.lengths if cache is not None else None
         qkv = []
         for i, name in enumerate(("q", "k", "v")):
-            y, state = getattr(self, f"{name}_conv1d")(
-                getattr(self, f"{name}_proj")(x),
-                cache[i] if cache is not None else None,
+            conv = getattr(self, f"{name}_conv1d")
+            projected = getattr(self, f"{name}_proj")(x)
+            previous = cache[i] if cache is not None else None
+            y, state = conv(
+                projected,
+                previous,
                 mask,
                 lengths,
             )
             if cache is not None:
+                if cache.is_speculating:
+                    width = conv.kernel_size - 1
+                    if previous is None:
+                        previous = mx.zeros((B, width, projected.shape[-1]), x.dtype)
+                    if mask is not None:
+                        projected = mx.where(mask[..., None], projected, 0)
+                    cache.record_speculative_window(
+                        i, mx.concatenate([previous, projected], axis=1), width
+                    )
                 cache[i] = state
             qkv.append(y.reshape(B, T, self.num_heads, self.head_dim))
         q, k, v = qkv
@@ -179,13 +198,13 @@ class KimiDeltaAttention(nn.Module):
             self.b_proj(x).astype(mx.float32),
             self.A_log[:, None],
             self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=cache[3] if cache is not None else None,
+            cache=cache,
+            cache_index=3,
             mask=mask,
             use_kernel=not self.training,
             lower_bound=self.args.kda_lower_bound if self.args.kda_safe_gate else None,
         )
         if cache is not None:
-            cache[3] = state
             cache.advance(T)
         gate = (
             self.g_proj(x) if self.args.no_kda_lora else self.g_b_proj(self.g_a_proj(x))
@@ -325,9 +344,19 @@ class TextModel(nn.Module):
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
+    @property
+    def embed_tokens(self):
+        return self.word_embeddings
+
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         h = self.word_embeddings(inputs) if inputs_embeds is None else inputs_embeds
         cache = cache if cache is not None else [None] * len(self.layers)
+        # Keep the decode arithmetic during verification: expanded MLA and
+        # block convolutions otherwise round differently from single-token BF16.
+        if h.shape[1] > 1 and any(getattr(c, "is_speculating", False) for c in cache):
+            return mx.concatenate(
+                [self(None, cache, h[:, i : i + 1]) for i in range(h.shape[1])], axis=1
+            )
         masks = {}
         for layer, c in zip(self.layers, cache):
             if layer.is_linear not in masks:
@@ -340,6 +369,73 @@ class TextModel(nn.Module):
         return self.norm(h)
 
 
+def shard_decoder_layer(layer, group):
+    size, rank = group.size(), group.rank()
+    if size == 1:
+        return
+    attn = layer.attention
+    heads = attn.num_heads // size
+    start, end = rank * heads, (rank + 1) * heads
+    if layer.is_linear:
+        dim = attn.head_dim
+        for name in ("q", "k", "v"):
+            setattr(
+                attn,
+                f"{name}_proj",
+                shard_linear(
+                    getattr(attn, f"{name}_proj"), "all-to-sharded", group=group
+                ),
+            )
+            conv = getattr(attn, f"{name}_conv1d").conv
+            conv.weight = mx.contiguous(conv.weight[start * dim : end * dim])
+            conv.groups = heads * dim
+        for name in ("f", "g"):
+            name = f"{name}_proj" if attn.args.no_kda_lora else f"{name}_b_proj"
+            setattr(
+                attn,
+                name,
+                shard_linear(getattr(attn, name), "all-to-sharded", group=group),
+            )
+        attn.b_proj = shard_linear(attn.b_proj, "all-to-sharded", group=group)
+        attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+        attn.A_log = attn.A_log[start:end]
+        attn.dt_bias = attn.dt_bias[start * dim : end * dim]
+    else:
+        name = "q_proj" if attn.args.q_lora_rank is None else "q_b_proj"
+        setattr(
+            attn, name, shard_linear(getattr(attn, name), "all-to-sharded", group=group)
+        )
+        if attn.g_proj is not None:
+            attn.g_proj = shard_linear(attn.g_proj, "all-to-sharded", group=group)
+        attn.dense = shard_linear(attn.dense, "sharded-to-all", group=group)
+        attn.embed_q.apply(lambda w: mx.contiguous(w[start:end]))
+        attn.unembed_out.apply(lambda w: mx.contiguous(w[start:end]))
+    attn.num_heads = heads
+    if isinstance(layer.mlp, SparseMoE):
+        layer.mlp.sharding_group = group
+        modules = [layer.mlp.switch_mlp]
+        if layer.mlp.shared_experts is not None:
+            modules.append(layer.mlp.shared_experts)
+        for mlp in modules:
+            for name, mode in (
+                ("gate_proj", "all-to-sharded"),
+                ("up_proj", "all-to-sharded"),
+                ("down_proj", "sharded-to-all"),
+            ):
+                shard_inplace(getattr(mlp, name), mode, group=group)
+    else:
+        for name, mode in (
+            ("gate_proj", "all-to-sharded"),
+            ("up_proj", "all-to-sharded"),
+            ("down_proj", "sharded-to-all"),
+        ):
+            setattr(
+                layer.mlp,
+                name,
+                shard_linear(getattr(layer.mlp, name), mode, group=group),
+            )
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -349,14 +445,35 @@ class LanguageModel(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs, cache=None, inputs_embeds=None, **kwargs):
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        inputs_embeds=None,
+        return_hidden=False,
+        skip_logits=False,
+        **kwargs,
+    ):
         h = self.model(inputs, cache, inputs_embeds)
-        logits = (
-            self.model.word_embeddings.as_linear(h)
-            if self.args.tie_word_embeddings
-            else self.lm_head(h)
+        logits = None if skip_logits else self.logits_from_hidden(h)
+        return LanguageModelOutput(
+            logits=logits, hidden_states=[h] if return_hidden else None
         )
-        return LanguageModelOutput(logits=logits)
+
+    def logits_from_hidden(self, h):
+        head = (
+            self.model.word_embeddings.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        return linear(head, h)
+
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        if self.args.num_attention_heads % group.size():
+            raise ValueError("Attention heads must be divisible by the group size")
+        for layer in self.layers:
+            shard_decoder_layer(layer, group)
 
     @property
     def layers(self):
@@ -389,61 +506,92 @@ class LanguageModel(nn.Module):
             if not (m := re.match(r"model\.layers\.(\d+)\.", k))
             or int(m[1]) < self.args.num_hidden_layers
         }
-        for key in list(weights):
-            if key.endswith(".weight_scale_inv"):
-                scale = weights.pop(key)
-                name = key.removesuffix("_scale_inv")
-                raw = weights[name]
-                raw = (
-                    mx.from_fp8(raw, dtype=mx.bfloat16)
-                    if raw.dtype == mx.uint8
-                    else raw
-                )
-                rows, cols = raw.shape
-                padded_rows, padded_cols = (rows + 127) // 128 * 128, (
-                    cols + 127
-                ) // 128 * 128
-                raw = mx.pad(raw, ((0, padded_rows - rows), (0, padded_cols - cols)))
-                raw = raw.reshape(padded_rows // 128, 128, padded_cols // 128, 128)
-                weights[name] = (
-                    (raw * scale[:, None, :, None])
-                    .reshape(padded_rows, padded_cols)[:rows, :cols]
-                    .astype(mx.bfloat16)
-                )
-        for i, layer in enumerate(self.layers):
-            prefix = f"model.layers.{i}"
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                for suffix in ("weight", "scales", "biases"):
-                    if f"{prefix}.mlp.experts.0.{proj}.{suffix}" in weights:
-                        weights[f"{prefix}.mlp.switch_mlp.{proj}.{suffix}"] = mx.stack(
-                            [
-                                weights.pop(f"{prefix}.mlp.experts.{e}.{proj}.{suffix}")
-                                for e in range(self.args.num_experts)
-                            ]
-                        )
-            prefix += ".attention"
-            if layer.is_linear:
-                for name in ("q", "k", "v"):
-                    key = f"{prefix}.{name}_conv1d.weight"
-                    if key in weights:
-                        w = weights.pop(key)
-                        weights[f"{prefix}.{name}_conv1d.conv.weight"] = (
-                            w.swapaxes(1, 2) if w.ndim == 3 else w[..., None]
-                        )
-            else:
-                key = f"{prefix}.kv_b_proj.weight"
-                if key in weights:
-                    w = weights.pop(key).reshape(
-                        self.args.num_attention_heads,
-                        self.args.qk_nope_head_dim + self.args.v_head_dim,
-                        self.args.kv_lora_rank,
-                    )
-                    weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
-                        w[:, : self.args.qk_nope_head_dim].swapaxes(-1, -2)
-                    )
-                    weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(
-                        w[:, self.args.qk_nope_head_dim :]
-                    )
+        weights = sanitize_weights(
+            weights,
+            self.args,
+            [
+                (f"model.layers.{i}", layer.is_linear)
+                for i, layer in enumerate(self.layers)
+            ],
+        )
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights
+
+
+def sanitize_weights(weights, args, layers):
+    for key in list(weights):
+        if key.endswith(".weight_scale_inv"):
+            scale = weights.pop(key)
+            name = key.removesuffix("_scale_inv")
+            raw = weights[name]
+            raw = mx.from_fp8(raw, dtype=mx.bfloat16) if raw.dtype == mx.uint8 else raw
+            rows, cols = raw.shape
+            padded_rows, padded_cols = (rows + 127) // 128 * 128, (
+                cols + 127
+            ) // 128 * 128
+            raw = mx.pad(raw, ((0, padded_rows - rows), (0, padded_cols - cols)))
+            raw = raw.reshape(padded_rows // 128, 128, padded_cols // 128, 128)
+            weights[name] = (
+                (raw * scale[:, None, :, None])
+                .reshape(padded_rows, padded_cols)[:rows, :cols]
+                .astype(mx.bfloat16)
+            )
+    for prefix, is_linear in layers:
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight", "scales", "biases"):
+                if f"{prefix}.mlp.experts.0.{proj}.{suffix}" in weights:
+                    weights[f"{prefix}.mlp.switch_mlp.{proj}.{suffix}"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{proj}.{suffix}")
+                            for e in range(args.num_experts)
+                        ]
+                    )
+        prefix += ".attention"
+        if is_linear:
+            for name in ("q", "k", "v"):
+                key = f"{prefix}.{name}_conv1d.weight"
+                if key in weights:
+                    w = weights.pop(key)
+                    weights[f"{prefix}.{name}_conv1d.conv.weight"] = (
+                        w.swapaxes(1, 2) if w.ndim == 3 else w[..., None]
+                    )
+        else:
+            key = f"{prefix}.kv_b_proj.weight"
+            if key in weights:
+                w = weights.pop(key)
+                quantized = f"{prefix}.kv_b_proj.scales" in weights
+                if quantized:
+                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{prefix}.kv_b_proj.biases", None)
+                    bits = w.shape[-1] * 32 // args.kv_lora_rank
+                    group_size = args.kv_lora_rank // scales.shape[-1]
+                    mode = "mxfp8" if scales.dtype == mx.uint8 else "affine"
+                    w = mx.dequantize(
+                        w, scales, biases, bits=bits, group_size=group_size, mode=mode
+                    )
+                w = w.reshape(
+                    args.num_attention_heads,
+                    args.qk_nope_head_dim + args.v_head_dim,
+                    args.kv_lora_rank,
+                )
+                weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
+                    w[:, : args.qk_nope_head_dim].swapaxes(-1, -2)
+                )
+                weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(
+                    w[:, args.qk_nope_head_dim :]
+                )
+                if quantized:
+                    for projection in ("embed_q", "unembed_out"):
+                        name = f"{prefix}.{projection}"
+                        packed = mx.quantize(
+                            weights[name + ".weight"],
+                            bits=bits,
+                            group_size=group_size,
+                            mode=mode,
+                        )
+                        for suffix, tensor in zip(
+                            ("weight", "scales", "biases"), packed
+                        ):
+                            weights[name + "." + suffix] = tensor
+    return weights

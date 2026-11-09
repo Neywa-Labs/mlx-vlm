@@ -18,3 +18,10 @@ python -m mlx_vlm.generate \
   --trust-remote-code \
   --prompt "Explain why the sky is blue." --max-tokens 128
 ```
+
+Add `--mtp` during conversion to extract the bundled NEXTN drafter into
+`./Ling-3.1-flash-4bit-mtp`. Enable it during generation with
+`--draft-model ./Ling-3.1-flash-4bit-mtp --draft-kind mtp --draft-block-size 2`.
+
+Tensor parallelism uses the standard `examples/sharded_generate.py` entrypoint.
+The number of ranks must divide the attention-head count and MLP widths.

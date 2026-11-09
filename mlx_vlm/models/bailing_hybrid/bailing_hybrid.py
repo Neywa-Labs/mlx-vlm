@@ -18,6 +18,9 @@ class Model(BailingModel):
             for key, value in self.language_model.sanitize(weights).items()
         }
 
+    def shard(self, group=None):
+        self.language_model.shard(group)
+
     @property
     def quant_predicate(self):
         return self.language_model.quant_predicate
