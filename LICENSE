@@ -1,8 +1,6 @@
 MIT License
 
 Copyright © 2025 Prince Canuma
-Copyright © 2023-2024 Apple Inc. (MLX-derived portions, including
-mlx_vlm/models/quantized_batch.py)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
