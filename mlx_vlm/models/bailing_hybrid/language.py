@@ -340,6 +340,7 @@ class DecoderLayer(nn.Module):
 class TextModel(nn.Module):
     def __init__(self, args):
         super().__init__()
+        self.sharding_group = None
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -366,6 +367,10 @@ class TextModel(nn.Module):
                     else create_attention_mask(h, c, return_array=True)
                 )
             h = layer(h, masks[layer.is_linear], c)
+            if self.sharding_group is not None and not self.training:
+                # Bound the graph around recurrent state and collectives:
+                # evaluating the full prefill graph can stall Metal/JACCL.
+                mx.eval(h, c.state if c is not None else [])
         return self.norm(h)
 
 
@@ -474,6 +479,7 @@ class LanguageModel(nn.Module):
             raise ValueError("Attention heads must be divisible by the group size")
         for layer in self.layers:
             shard_decoder_layer(layer, group)
+        self.model.sharding_group = group if group.size() > 1 else None
 
     @property
     def layers(self):
