@@ -1,7 +1,4 @@
-"""Ling 3.1 hybrid KDA / gated MLA decoder.
-
-Architecture reference: inclusionAI/Ling-3.1-flash (MIT license).
-"""
+# Copyright © 2026 Neywa Labs Inc.
 
 import math
 import re
