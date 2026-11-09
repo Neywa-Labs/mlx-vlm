@@ -64,9 +64,16 @@ class Attention(nn.Module):
                 self.head_dim, traditional=False, base=config.rope_theta
             )
 
-    def __call__(
-        self, x, mask=None, cache=None, value_residual=None, verification=False
-    ):
+    def __call__(self, x, mask=None, cache=None, value_residual=None):
+        queries, keys, values = self._project_qkv(x, cache, value_residual)
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        return self._project_output(x, output)
+
+    def _project_qkv(self, x, cache, value_residual):
         batch, length, _ = x.shape
         value_states = x
         if value_residual is not None:
@@ -89,7 +96,14 @@ class Attention(nn.Module):
             v.transpose(0, 2, 1, 3) for v in (queries, keys, values)
         )
 
-        out = self._attention(queries, keys, values, mask, cache, verification)
+        if self.is_sliding:
+            offset = cache.offset if cache is not None else 0
+            queries = self.rope(queries, offset=offset)
+            keys = self.rope(keys, offset=offset)
+        return queries, keys, values
+
+    def _project_output(self, x, out):
+        batch, length, _ = x.shape
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         if hasattr(self, "g_proj"):
             gate = _linear(self.g_proj, x)
@@ -97,31 +111,6 @@ class Attention(nn.Module):
                 gate = gate.astype(mx.float32)
             out = out * mx.sigmoid(gate).astype(out.dtype)
         return _linear(self.o_proj, out)
-
-    def _attention(self, queries, keys, values, mask, cache, verification):
-        if self.is_sliding:
-            offset = cache.offset if cache is not None else 0
-            queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys, offset=offset)
-        fetch_block = getattr(cache, "fetch_verification_block", None)
-        block = callable(fetch_block) and verification and queries.shape[2] > 1
-        if block:
-            keys, values, mask = fetch_block(keys, values)
-            batch, heads, length, dim = queries.shape
-            queries = queries.transpose(0, 2, 1, 3).reshape(
-                batch * length, heads, 1, dim
-            )
-            keys = keys.reshape(batch * length, *keys.shape[2:])
-            values = values.reshape(batch * length, *values.shape[2:])
-            mask = mask.reshape(batch * length, 1, 1, mask.shape[-1])
-        elif cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-        if block:
-            output = output.reshape(batch, length, heads, dim).transpose(0, 2, 1, 3)
-        return output
 
 
 class MLP(nn.Module):
@@ -162,12 +151,8 @@ class DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(
-        self, x, mask=None, cache=None, value_residual=None, verification=False
-    ):
-        attn = self.self_attn(
-            self.input_layernorm(x), mask, cache, value_residual, verification
-        )
+    def __call__(self, x, mask=None, cache=None, value_residual=None):
+        attn = self.self_attn(self.input_layernorm(x), mask, cache, value_residual)
         x = x + self.post_attention_layernorm(attn)
         return x + self.post_feedforward_layernorm(
             self.mlp(self.pre_feedforward_layernorm(x))
@@ -189,31 +174,38 @@ class RicursiveModel(nn.Module):
         inputs_embeds=None,
         capture_layer_ids=None,
         hidden_sink=None,
-        verification=False,
     ):
+        capture = self._capture_layers(capture_layer_ids)
+        h = self._embed(inputs, inputs_embeds)
+        # The residual is the scaled input embedding, before the first pre-norm.
+        value_residual = h if self.config.use_valres else None
+        if cache is None:
+            cache = [None] * len(self.layers)
+        captured = {}
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
+            window = self.config.sliding_window if layer.self_attn.is_sliding else None
+            mask = create_attention_mask(h, c, window_size=window)
+            h = layer(h, mask, c, value_residual)
+            if index in capture:
+                captured[index] = h
+        if hidden_sink is not None:
+            hidden_sink.extend(captured[index] for index in capture_layer_ids or [])
+        return self.norm(h)
+
+    def _capture_layers(self, capture_layer_ids):
         capture = set(capture_layer_ids or [])
         if len(capture) != len(capture_layer_ids or []) or any(
             type(index) is not int or not 0 <= index < len(self.layers)
             for index in capture
         ):
             raise ValueError("capture_layer_ids must be unique valid layer indices")
-        captured = {}
+        return capture
+
+    def _embed(self, inputs, inputs_embeds=None):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if self.config.embed_scale is not None:
             h = h * self.config.embed_scale
-        # The residual is the scaled input embedding, before the first pre-norm.
-        value_residual = h if self.config.use_valres else None
-        if cache is None:
-            cache = [None] * len(self.layers)
-        for index, (layer, c) in enumerate(zip(self.layers, cache)):
-            window = self.config.sliding_window if layer.self_attn.is_sliding else None
-            mask = create_attention_mask(h, c, window_size=window)
-            h = layer(h, mask, c, value_residual, verification)
-            if index in capture:
-                captured[index] = h
-        if hidden_sink is not None:
-            hidden_sink.extend(captured[index] for index in capture_layer_ids or [])
-        return self.norm(h)
+        return h
 
 
 class LanguageModel(nn.Module):
@@ -240,42 +232,29 @@ class LanguageModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
         if kwargs.pop("speculative_verify", False):
-            from ...speculative.common import verify_forward
+            from .speculative_verifier import verify
 
-            output, transaction = verify_forward(
-                self,
-                inputs,
-                cache,
-                capture_layer_ids=capture_layer_ids,
-                verification=True,
-            )
-            output.gdn_states = transaction
-            return output
+            return verify(self, inputs, cache, capture_layer_ids)
         hidden_sink = [] if capture_layer_ids is not None else None
-        out = self.model(
-            inputs,
-            cache,
-            inputs_embeds,
-            capture_layer_ids,
-            hidden_sink,
-            kwargs.pop("verification", False),
+        out = self.model(inputs, cache, inputs_embeds, capture_layer_ids, hidden_sink)
+        return LanguageModelOutput(
+            logits=self._project_logits(out, logits_to_keep), hidden_states=hidden_sink
         )
+
+    def _project_logits(self, hidden, logits_to_keep=0):
         projection = (
             self.model.embed_tokens.as_linear
             if self.config.tie_word_embeddings
             else self.lm_head
         )
-        return LanguageModelOutput(
-            logits=project_logits(
-                out,
-                (
-                    projection
-                    if self.training
-                    else lambda hidden: _linear(projection, hidden)
-                ),
-                logits_to_keep,
+        return project_logits(
+            hidden,
+            (
+                projection
+                if self.training
+                else lambda hidden: _linear(projection, hidden)
             ),
-            hidden_states=hidden_sink,
+            logits_to_keep,
         )
 
     def rollback_speculative_cache(self, caches, transaction, accepted, block_size):

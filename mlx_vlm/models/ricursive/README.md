@@ -58,8 +58,9 @@ target layers 1, 20, 39, 58, and 77. Its first four layers use sliding-window Ro
 attention; its final layer uses global attention without RoPE. Four-tap dynamic
 convolutions and the candidate-path selector use the shared DFlash2 implementation.
 
-Verification uses the normal target layers and decode-equivalent short-block
-projections. Following the Mistral Large 4 verifier, affine projections share
+`speculative_verify=True` dispatches directly to the dedicated verifier, which
+shares the target's projections and normalization operations with normal generation.
+Following the Mistral Large 4 verifier, affine projections share
 weights across draft positions while preserving native small-batch reductions.
 Full-attention caches retain per-request append positions, and sliding caches
 retain per-request ring cursors. Transactions discard rejected writes without
@@ -119,10 +120,29 @@ requests and confirmed active drafting at both batch sizes 2 and 1. Two addition
 while crossing attention dispatch boundaries.
 
 The shared model, processor, speculative, generation, and cache suites passed
-3,262 tests, with 2 skips and 126 passing subtests. Tests cover native affine
+3,266 tests, with 2 skips and 126 passing subtests. Tests cover native affine
 projection parity, independent acceptance, sliding-window rollback and rollover,
 cache serialization, padded prefixes, filtering, extension, and causal block
 views before and after sliding-window rollover.
+
+The dedicated verifier additionally matched all 1,024 saved normal-decoding
+reference tokens at batch sizes 1, 2, and 4 (2K context), and batch 1 at 8K.
+On the full model, 20 alternating calls per implementation using the same
+weight arrays and cached prefix produced bitwise-identical logits and all five
+hidden-state taps. For batch 2, 2K context, and a five-token block, median
+verification plus rollback latency was 333.8 ms before and 328.1 ms after
+separating verifier dispatch.
+
+Paired full-generation medians were 17.27 / 14.49 tok/s (before / after),
+with ranges of 13.83–20.71 / 14.32–14.66 tok/s. This variability limits
+conclusions about end-to-end performance. Both retained 47.41 GB peak allocation.
+Tests also verify that speculation never reenters the normal model or attention
+forward, and that a projection failure in a later block restores the entire
+cache transaction.
+
+The context/batch timing table below records the reference implementation at
+[`ef77fb3b`](https://github.com/Neywa-Labs/mlx-vlm/commit/ef77fb3bcb2172e805ffa9b136fe1709d3cfbd3c).
+The paired check above measures the dispatch refactor separately.
 
 Apple M5 Max (128 GiB), MLX 0.32.4, affine 4-bit target (group size 64), BF16 official
 drafter, activations, and KV caches. Medians of two runs, 128 generated tokens per

@@ -1551,6 +1551,65 @@ def test_ricursive_dflash_verification_and_rotating_rollback(
         )
 
 
+@parametrize("batch", [1, 2])
+def test_ricursive_verifier_does_not_reenter_normal_forward(batch, monkeypatch):
+    model = dflash_target("ricursive-dflash2").language_model
+    cache = model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
+    model(mx.ones((batch, 9), mx.int32), cache=cache)
+    original = deepcopy(cache)
+    tokens = mx.full((batch, 13), 2, mx.int32)
+    reference = deepcopy(cache)
+    expected = [
+        model(tokens[:, t : t + 1], cache=reference, capture_layer_ids=[4, 0, 2])
+        for t in range(tokens.shape[1])
+    ]
+
+    def normal_forward(*args, **kwargs):
+        raise AssertionError("Verification must not reenter the normal forward")
+
+    monkeypatch.setattr(type(model.model), "__call__", normal_forward)
+    monkeypatch.setattr(type(model.layers[0].self_attn), "__call__", normal_forward)
+    actual = model(
+        tokens, cache=cache, capture_layer_ids=[4, 0, 2], speculative_verify=True
+    )
+    equal(actual.logits, mx.concatenate([part.logits for part in expected], axis=1))
+    equal(
+        actual.hidden_states,
+        [
+            mx.concatenate(parts, axis=1)
+            for parts in zip(*(p.hidden_states for p in expected))
+        ],
+    )
+    actual.gdn_states.abort()
+    for restored, before in zip(cache, original):
+        equal(restored.state, before.state)
+        equal(mx.array(restored.offset), mx.array(before.offset))
+
+
+@parametrize("batch", [1, 2])
+def test_ricursive_verifier_failure_restores_all_blocks(batch, monkeypatch):
+    model = dflash_target("ricursive-dflash2").language_model
+    cache = model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
+    model(mx.ones((batch, 9), mx.int32), cache=cache)
+    original = deepcopy(cache)
+    project, lengths = model._project_logits, []
+
+    def fail_second_block(hidden, *args):
+        lengths.append(hidden.shape[1])
+        if len(lengths) == 2:
+            raise RuntimeError("Logit projection failed")
+        return project(hidden, *args)
+
+    monkeypatch.setattr(model, "_project_logits", fail_second_block)
+    with pytest.raises(RuntimeError, match="Logit projection failed"):
+        model(mx.full((batch, 13), 2, mx.int32), cache=cache, speculative_verify=True)
+    assert lengths == [8, 5]
+    for restored, before in zip(cache, original):
+        assert not getattr(restored, "is_speculating", False)
+        equal(restored.state, before.state)
+        equal(mx.array(restored.offset), mx.array(before.offset))
+
+
 @parametrize("family", ["dflash2", "ricursive-dflash2"])
 @parametrize("batch", [1, 2, 4])
 def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
