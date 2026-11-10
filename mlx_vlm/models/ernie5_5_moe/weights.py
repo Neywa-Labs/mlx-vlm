@@ -6,28 +6,7 @@ import re
 
 import mlx.core as mx
 
-
-def dequantize_fp8(weight, scales, block_size=(128, 128)):
-    """Decode E4M3FN bytes with floating point or UE8M0 block scales."""
-    from ...quantization.checkpoint import _E4M3_DECODE_LUT
-
-    if weight.dtype == mx.uint8:
-        weight = _E4M3_DECODE_LUT[weight]
-    else:
-        weight = weight.astype(mx.float32)
-    if scales.dtype == mx.uint8:
-        scales = mx.power(2.0, scales.astype(mx.float32) - 127)
-    else:
-        scales = scales.astype(mx.float32)
-    rows, cols = weight.shape[-2:]
-    br, bc = block_size
-    if rows % br == 0 and cols % bc == 0:
-        blocked = weight.reshape(*weight.shape[:-2], rows // br, br, cols // bc, bc)
-        weight = (blocked * scales[..., :, None, :, None]).reshape(weight.shape)
-    else:
-        scale = mx.repeat(mx.repeat(scales, br, axis=-2), bc, axis=-1)
-        weight = weight * scale[..., :rows, :cols]
-    return weight.astype(mx.bfloat16)
+from ...fp8 import _dequantize_fp8_weight
 
 
 def sanitize(weights, config):
@@ -43,8 +22,10 @@ def sanitize(weights, config):
             continue
         scale_key = key + "_scale_inv"
         if scale_key in weights:
-            value = dequantize_fp8(value, weights[scale_key])
-        elif value.dtype == mx.uint8:
+            value = _dequantize_fp8_weight(value, weights[scale_key]).astype(
+                mx.bfloat16
+            )
+        elif value.dtype == mx.uint8 and not key.endswith(".scales"):
             raise ValueError(f"FP8 weight without its scale: {key}")
 
         if key == "model.mhc_contract.hc_head_fn":

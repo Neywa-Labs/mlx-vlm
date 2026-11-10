@@ -14,13 +14,24 @@ class Ernie55MTPSplitter(MTPSplitter):
     def select_keys(self, key, text_config):
         key = key.removeprefix("language_model.")
         prefix = f"model.layers.{text_config.get('num_hidden_layers', 43)}."
+        name = key.removeprefix(prefix)
         return key.startswith("echo.") or (
-            key.startswith(prefix) and key.removeprefix(prefix) in ECHO_WEIGHT_NAMES
+            key.startswith(prefix)
+            and (
+                name.removesuffix("_scale_inv") in ECHO_WEIGHT_NAMES
+                or name
+                in ("e_proj.scales", "e_proj.biases", "h_proj.scales", "h_proj.biases")
+            )
         )
 
     def rename(self, tensors, text_config):
         return extract_echo_weights(tensors, TextConfig.from_dict(text_config))
 
+    def quantization_from_source(self, tensors, source_config):
+        if any(key.endswith(".scales") for key in tensors):
+            return source_config.get("quantization")
+        return None
+
     def should_quantize_key(self, key):
-        # Auxiliary projections stay dense, as in ordinary target conversion.
+        # Preserve the source precision of the auxiliary projections.
         return False

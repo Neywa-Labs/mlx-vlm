@@ -29,7 +29,14 @@ def extract_echo_weights(weights, config):
             out[key.removeprefix("echo.")] = value
         elif key.startswith(prefix):
             name = key.removeprefix(prefix)
-            if name in ECHO_WEIGHT_NAMES:
+            if name in (
+                "e_proj.scales",
+                "e_proj.biases",
+                "h_proj.scales",
+                "h_proj.biases",
+            ):
+                out[name] = value
+            elif name in ECHO_WEIGHT_NAMES:
                 out[ECHO_WEIGHT_NAMES[name]] = (
                     value.T if name == "hc_head_fn" else value
                 )

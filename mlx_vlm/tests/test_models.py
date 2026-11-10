@@ -6811,45 +6811,138 @@ class TestErnie55Operations(unittest.TestCase):
         np.testing.assert_allclose(post, expected_post, atol=2e-6, rtol=2e-6)
         np.testing.assert_allclose(comb, expected_comb, atol=2e-6, rtol=2e-6)
 
-    def test_fp8_tail_blocks_and_ue8m0(self):
-        from mlx_vlm.models.ernie5_5_moe.weights import dequantize_fp8
-
+    def test_fp8_tail_blocks_use_shared_decoder(self):
+        model = self.make_model()
+        key = "model.layers.0.self_attn.linear_q_down_proj.weight"
         codes = mx.full((129, 131), 0x38, dtype=mx.uint8)  # E4M3 1.0
-        for scales in (
-            mx.array([[1.0, 2.0], [4.0, 8.0]]),
-            mx.array([[127, 128], [129, 130]], dtype=mx.uint8),
-        ):
-            out = dequantize_fp8(codes, scales).astype(mx.float32)
-            expected = np.repeat(np.repeat([[1, 2], [4, 8]], 128, axis=0), 128, axis=1)[
-                :129, :131
-            ]
-            np.testing.assert_array_equal(out, expected)
+        scales = mx.array([[1.0, 2.0], [4.0, 8.0]])
+        out = model.sanitize({key: codes, key + "_scale_inv": scales})
+        expected = np.repeat(np.repeat([[1, 2], [4, 8]], 128, axis=0), 128, axis=1)[
+            :129, :131
+        ]
+        np.testing.assert_array_equal(
+            out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
+            expected,
+        )
 
-    def test_released_ue8m0_checkpoint_uses_model_decoder(self):
+    def test_released_fp8_checkpoint_uses_shared_loader(self):
+        from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+        from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES, EchoWeights
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_vlm.speculative.drafters import load_drafter
+
         config = model_case("ernie5_5_moe")["config"]
+        config.update(
+            hybrid_mla_kv_lora_rank=64,
+            hybrid_mla_qk_nope_head_dim=32,
+            hybrid_mla_v_head_dim=32,
+        )
+        model = Model(ModelConfig.from_dict(config))
+        weights = dict(tree_flatten(model.parameters()))
+        expected = {}
+
+        def add_fp8(key, value):
+            codes = mx.to_fp8(value.astype(mx.float32))
+            weights[key] = codes
+            weights[key + "_scale_inv"] = mx.ones(
+                ((value.shape[0] + 127) // 128, (value.shape[1] + 127) // 128)
+            )
+            expected[key] = mx.from_fp8(codes, dtype=mx.bfloat16)
+
+        target = "language_model.model.layers.0.attn.wq_a.weight"
+        raw = "model.layers.0.self_attn.linear_q_down_proj.weight"
+        add_fp8(raw, weights.pop(target))
+        add_fp8(
+            "model.layers.0.self_attn.linear_o_group_proj",
+            weights.pop("language_model.model.layers.0.attn.wo_a.weight").reshape(
+                32, 32
+            ),
+        )
+        prefix = "language_model.model.layers.1.attn."
+        fused = mx.concatenate(
+            [
+                weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2),
+                weights.pop(prefix + "unembed_out.weight"),
+            ],
+            axis=1,
+        ).reshape(-1, 64)
+        add_fp8("model.layers.1.self_attn.kv_b_proj.weight", fused)
+        for source, dest in (
+            ("w1", "gate_proj"),
+            ("w2", "down_proj"),
+            ("w3", "up_proj"),
+        ):
+            experts = weights.pop(
+                f"language_model.model.layers.1.ffn.switch_mlp.{dest}.weight"
+            )
+            for i, value in enumerate(experts):
+                add_fp8(
+                    f"model.layers.1.block_sparse_moe.experts.{i}.{source}.weight",
+                    value,
+                )
+        aux = dict(tree_flatten(EchoWeights(model.config).parameters()))
+        for source, dest in ECHO_WEIGHT_NAMES.items():
+            key = f"model.layers.2.{source}"
+            value = aux[dest]
+            if source in ("e_proj.weight", "h_proj.weight"):
+                add_fp8(key, value)
+            else:
+                weights[key] = value.T if source == "hc_head_fn" else value
+
+        # The release declares UE8M0 but stores the block scales as float32.
         config["quantization_config"] = {
             "quant_method": "fp8",
             "fmt": "e4m3",
             "scale_fmt": "ue8m0",
             "weight_block_size": [128, 128],
         }
-        key = "model.layers.0.self_attn.linear_q_down_proj.weight"
-        weights = {
-            key: mx.full(
-                (config["q_lora_rank"], config["hidden_size"]), 0x38, mx.uint8
-            ),
-            key + "_scale_inv": mx.array([[129]], mx.uint8),
-        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / "config.json").write_text(json.dumps(config))
             mx.save_safetensors(str(path / "model.safetensors"), weights)
-            loaded = load_model(path, strict=False)
-            actual = loaded.layers[0].attn.wq_a.weight
-            self.assertEqual(actual.dtype, mx.bfloat16)
-            np.testing.assert_array_equal(
-                actual.astype(mx.float32), np.full(actual.shape, 4.0)
+            loaded = load_model(path, strict=True)
+            draft, kind = load_drafter(str(path))
+            self.assertEqual(kind, "mtp")
+            self.assertIsInstance(loaded.layers[0].attn.wq_a, nn.QuantizedLinear)
+            self.assertIsInstance(
+                loaded.layers[1].ffn.switch_mlp.gate_proj, QuantizedSwitchLinear
             )
+            self.assertEqual(loaded.layers[0].attn.wq_a.mode, "mxfp8")
+            self.assertIsInstance(draft.e_proj, nn.QuantizedLinear)
+            for proj in ("e_proj", "h_proj"):
+                module = getattr(draft, proj)
+                restored = mx.dequantize(
+                    module.weight, module.scales, mode="mxfp8", bits=8, group_size=32
+                )
+                np.testing.assert_array_equal(
+                    restored.astype(mx.float32),
+                    expected[f"model.layers.2.{proj}.weight"].astype(mx.float32),
+                )
+            kv = expected["model.layers.1.self_attn.kv_b_proj.weight"].reshape(
+                4, 64, 64
+            )
+            np.testing.assert_array_equal(
+                loaded.layers[1].attn.embed_q.weight.astype(mx.float32),
+                kv[:, :32].swapaxes(-1, -2).astype(mx.float32),
+            )
+            inputs = mx.arange(9)[None]
+            reference = loaded(inputs).logits
+            self.assertTrue(mx.all(mx.isfinite(reference)).item())
+            config["quantization"] = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization_config"] = config["quantization"]
+            (path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(
+                str(path / "model.safetensors"), dict(tree_flatten(loaded.parameters()))
+            )
+            reloaded = load_model(path, strict=True)
+            np.testing.assert_allclose(
+                reloaded(inputs).logits, reference, atol=2e-5, rtol=2e-5
+            )
+            draft_again, _ = load_drafter(str(path))
+            for name, value in tree_flatten(draft.parameters()):
+                np.testing.assert_array_equal(
+                    value, dict(tree_flatten(draft_again.parameters()))[name]
+                )
 
     def test_native_quantized_checkpoint_roundtrip(self):
         import json
@@ -6959,4 +7052,6 @@ class TestErnie55Operations(unittest.TestCase):
         right.pooled = mx.zeros((2, 3, 1))
         right._pool_lengths = [3, 3]
         expected = mx.broadcast_to(mx.array([True, False, False]), (2, 2, 3))
-        np.testing.assert_array_equal(right.make_mask(2, offset=8), expected)
+        np.testing.assert_array_equal(
+            right.make_mask(2, offset=mx.array([8, 8])), expected
+        )

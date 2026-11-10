@@ -531,9 +531,23 @@ class LanguageModel(nn.Module):
             key = f"model.layers.{i}.attn.kv_b_proj.weight"
             if ratio == -2 and key in weights:
                 attn = self.layers[i].attn
-                w = weights.pop(key).reshape(
-                    attn.heads, attn.nope + attn.value_dim, attn.latent
-                )
+                w = weights.pop(key)
+                scale_key = key.removesuffix("weight") + "scales"
+                if scale_key in weights:
+                    # The shared loader converts released FP8 linears to MXFP8.
+                    # Restore this fused projection before transposing its K part,
+                    # following the MLA layout conversion used by DeepSeek.
+                    scales = weights.pop(scale_key)
+                    biases = weights.pop(key.removesuffix("weight") + "biases", None)
+                    w = mx.dequantize(
+                        w,
+                        scales,
+                        biases,
+                        group_size=attn.latent // scales.shape[-1],
+                        bits=w.shape[-1] * 32 // attn.latent,
+                        mode="mxfp8" if scales.dtype == mx.uint8 else "affine",
+                    )
+                w = w.reshape(attn.heads, attn.nope + attn.value_dim, attn.latent)
                 k, v = mx.split(w, [attn.nope], axis=1)
                 prefix = f"model.layers.{i}.attn."
                 weights[prefix + "embed_q.weight"] = k.swapaxes(-1, -2)
