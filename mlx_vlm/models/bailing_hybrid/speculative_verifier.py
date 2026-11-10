@@ -21,8 +21,9 @@ def route_block(x, weight, bias, top_k, n_group, topk_group, normalize, scaling)
 
 
 @mx.compile
-def combine_experts(experts, scores, x):
-    return (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
+def combine_experts(experts, scores, x, sharded):
+    dtype = mx.float32 if sharded else x.dtype
+    return (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(dtype)
 
 
 class BailingHybridSpeculativeVerifier:
@@ -64,7 +65,7 @@ class BailingHybridSpeculativeVerifier:
                 args.routed_scaling_factor,
             )
             experts = layer.switch_mlp(x, indices)
-            out = combine_experts(experts, scores, x)
+            out = combine_experts(experts, scores, x, layer.sharding_group is not None)
             if layer.shared_experts is not None:
                 out = out + self._feed_forward(layer.shared_experts, x)
         else:
@@ -76,7 +77,7 @@ class BailingHybridSpeculativeVerifier:
             )
         if layer.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=layer.sharding_group)
-        return out
+        return out.astype(x.dtype) if isinstance(layer, SparseMoE) else out
 
     def _gated_delta(self, attention, x, mask, cache):
         batch, length, _ = x.shape

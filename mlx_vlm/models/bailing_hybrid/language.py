@@ -128,11 +128,14 @@ class SparseMoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
         indices, scores = self.gate(x)
         experts = self.switch_mlp(x, indices)
-        out = (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
+        # Shards hold partial expert sums; round only after adding the shared
+        # expert and reducing across ranks.
+        dtype = mx.float32 if self.sharding_group is not None else x.dtype
+        out = (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(dtype)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
+            out = mx.distributed.all_sum(out, group=self.sharding_group).astype(x.dtype)
         return out
 
 
