@@ -4384,3 +4384,61 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     assert manager._prefill_reserve_bytes == 0
     assert manager.memory_plan.lengths == []
     gen.close()
+
+
+def test_ernie55_chunked_decode_compression_and_sparse_attention(ernie55_learned_model):
+    model = ernie55_learned_model
+    tokens = mx.arange(19)[None]
+    expected = model(tokens).logits
+    for chunks in ([1] * 19, [2, 2, 3, 4, 8], [7, 1, 8, 3], [8, 8, 3]):
+        cache = model.make_cache()
+        actual, offset = [], 0
+        for size in chunks:
+            actual.append(model(tokens[:, offset : offset + size], cache=cache).logits)
+            offset += size
+        actual = mx.concatenate(actual, axis=1)
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        assert cache[0][1].pooled.shape[1] == 2
+        assert cache[0][1].remainder == 3
+        assert cache[1][0].offset == 19
+        assert cache[1][1].offset == 19
+    # Future tokens must not leak through a completed compressor window.
+    changed = mx.concatenate([tokens[:, :7], mx.full((1, 12), 99)], axis=1)
+    np.testing.assert_allclose(
+        model(changed).logits[:, :7], expected[:, :7], atol=2e-5, rtol=2e-5
+    )
+
+
+def test_ernie55_cache_merge_extract_filter_and_reset(ernie55_learned_model):
+    model = ernie55_learned_model
+    caches = []
+    for length in (3, 11):
+        cache = model.make_cache()
+        model(mx.arange(length)[None], cache=cache)
+        caches.append(cache)
+    merged = [CacheList.merge([c[i] for c in caches]) for i in range(2)]
+    inputs = mx.array([[3, 4, 5], [11, 12, 13]])
+    actual = model(inputs, cache=merged).logits
+    expected = mx.concatenate(
+        [model(mx.arange(n + 3)[None]).logits[:, -3:] for n in (3, 11)]
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    extracted = [c.extract(1) for c in merged]
+    for c in merged:
+        c.filter(mx.array([1]))
+    actual = model(mx.array([[14]]), cache=merged).logits
+    np.testing.assert_allclose(
+        actual,
+        model(mx.array([[14]]), cache=extracted).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
+        actual, model(mx.arange(15)[None]).logits[:, -1:], atol=2e-5, rtol=2e-5
+    )
+    np.testing.assert_allclose(
+        model(inputs, cache=model.make_cache()).logits,
+        model(inputs).logits,
+        atol=2e-5,
+        rtol=2e-5,
+    )

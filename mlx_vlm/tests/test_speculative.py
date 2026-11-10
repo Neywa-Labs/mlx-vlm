@@ -4306,32 +4306,17 @@ def test_speculative_lifetime_counters_survive_reset():
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
 
 
-def _tiny_ernie_echo():
-    from mlx_vlm.models.ernie5_5_moe import Model as Target
-    from mlx_vlm.models.ernie5_5_moe import ModelConfig as TargetConfig
-    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model as Draft
-    from mlx_vlm.speculative.drafters.ernie5_5_mtp import ModelConfig as DraftConfig
-    from mlx_vlm.tests.test_models import model_case
-
-    mx.random.seed(55)
-    config = TargetConfig.from_dict(model_case("ernie5_5_moe")["config"])
-    target = Target(config)
-    draft = Draft(DraftConfig(text_config=config))
-    mx.eval(target.parameters(), draft.parameters())
-    return target, draft
-
-
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("prompt_length", [7, 8, 10])
 @pytest.mark.parametrize("accepted", [0, 2, 4])
 def test_ernie_echo_rollback_matches_committed_prefix(
-    batch_size, prompt_length, accepted
+    batch_size, prompt_length, accepted, ernie55_model
 ):
     import numpy as np
 
     from mlx_vlm.generate.ar import _make_cache
 
-    target, _ = _tiny_ernie_echo()
+    target = ernie55_model
     lm = target.language_model
     padding = [3, 0] if batch_size == 2 else [0]
     cache = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
@@ -4377,10 +4362,10 @@ def test_ernie_echo_rollback_matches_committed_prefix(
 
 @pytest.mark.parametrize("prompt_length", [7, 8])
 @pytest.mark.parametrize("draft_behavior", ["learned", "accept_all", "reject_all"])
-def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
+def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior, ernie55_echo):
     from mlx_vlm.generate.ar import generate_step
 
-    target, draft = _tiny_ernie_echo()
+    target, draft = ernie55_echo
     prompt = mx.arange(prompt_length)[None]
     expected = [
         int(t)
@@ -4435,14 +4420,16 @@ def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
             assert set(draft.accept_lens) == {0}
 
 
-def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path):
+def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(
+    tmp_path, ernie55_echo
+):
     import numpy as np
 
     from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES
     from mlx_vlm.speculative.drafters import load_drafter
     from mlx_vlm.utils import load_model
 
-    target, draft = _tiny_ernie_echo()
+    target, draft = ernie55_echo
     original = dict(tree_flatten(draft.parameters()))
     weights = dict(tree_flatten(target.parameters()))
     prefix = f"model.layers.{target.config.num_hidden_layers}."
@@ -4477,8 +4464,8 @@ def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path):
         load_drafter(str(tmp_path))
 
 
-def test_ernie_echo_shared_decoder_preserves_target_router():
-    target, draft = _tiny_ernie_echo()
+def test_ernie_echo_shared_decoder_preserves_target_router(ernie55_echo):
+    target, draft = ernie55_echo
     original = target.layers[-1].ffn.e_score_correction_bias
     draft.e_score_correction_bias = mx.arange(
         target.config.n_routed_experts, dtype=mx.float32

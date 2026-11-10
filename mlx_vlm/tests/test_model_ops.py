@@ -3334,3 +3334,89 @@ def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
     np.testing.assert_allclose(
         y[..., 4:6], b * np.cos(angles) + a * np.sin(angles), atol=2e-6
     )
+
+
+def test_ernie55_situ_and_multimax_reference(ernie55_model):
+    from mlx_vlm.models.ernie5_5_moe.language import MultiMax, SiTU
+
+    config = ernie55_model.config
+    up = np.linspace(-100, 100, 97).astype(np.float32)
+    gate = np.linspace(-30, 30, 97).astype(np.float32)
+    expected = 4 * np.tanh(gate / 4) / (1 + np.exp(-gate)) * 25 * np.tanh(up / 25)
+    np.testing.assert_allclose(
+        SiTU(config)(mx.array(up), mx.array(gate)), expected, atol=2e-5, rtol=2e-5
+    )
+    head = MultiMax()
+    head.multimax_ranges = mx.array([-2.0, 2.0, -3.0, 3.0])
+    head.multimax_ts = mx.array([0.2, 0.3, 0.1, -0.1])
+    expected = (
+        gate
+        + 0.2 * np.maximum(-2 - gate, 0)
+        + 0.3 * np.maximum(gate - 2, 0)
+        + 0.1 * np.maximum(-3 - gate, 0) ** 2
+        - 0.1 * np.maximum(gate - 3, 0) ** 2
+    )
+    np.testing.assert_allclose(head(mx.array(gate)), expected, atol=2e-5, rtol=2e-5)
+
+
+def test_ernie55_multi_router_selection_uses_bias_but_weights_do_not(ernie55_model):
+    from mlx_vlm.models.ernie5_5_moe.language import MultiRouter
+
+    config = ernie55_model.config
+    gate = MultiRouter(config)
+    gate.weight = mx.random.normal(gate.weight.shape) * 0.2
+    gate.weight_1 = mx.random.normal(gate.weight_1.shape) * 0.2
+    gate.routed_scaling_factor_param = mx.array([0.5, 1.5, 2.0, 3.0])
+    x = mx.random.normal((2, 3, config.hidden_size))
+    bias = mx.array([0.1, 10.0, -10.0, 0.0])
+    ids, actual = gate(x, bias)
+    sigmoid = lambda y: 1 / (1 + np.exp(-y))
+    scores = sigmoid(np.array(x) @ np.array(gate.weight).T) + sigmoid(
+        np.array(x) @ np.array(gate.weight_1).T
+    )
+    expected_ids = np.argsort(-(scores + np.array(bias)), axis=-1)[..., :2]
+    assert np.array_equal(np.sort(ids, axis=-1), np.sort(expected_ids, axis=-1))
+    expected = np.take_along_axis(scores, np.array(ids), axis=-1)
+    expected = (
+        expected
+        / expected.sum(-1, keepdims=True)
+        * np.array(gate.routed_scaling_factor_param)[np.array(ids)]
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_ernie55_hyper_connection_epsilon_and_sinkhorn_reference(ernie55_learned_model):
+    hc = ernie55_learned_model.layers[0].attn_hc
+    hc.norm_eps = 0.5  # Distinguishes sqrt(mean)+eps from sqrt(mean+eps).
+    x = mx.random.normal((2, 3, 4, 64))
+    actual, post, comb = hc(x)
+    residual = np.array(x)
+    flat = residual.reshape(2, 3, -1)
+    mixes = (
+        flat @ np.array(hc.fn).T / (np.sqrt((flat**2).mean(-1, keepdims=True)) + 0.5)
+    )
+    pre = (
+        1
+        / (
+            1
+            + np.exp(-(mixes[..., :4] * np.array(hc.scale)[0] + np.array(hc.base)[:4]))
+        )
+        + hc.eps
+    )
+    expected_post = 2 / (
+        1 + np.exp(-(mixes[..., 4:8] * np.array(hc.scale)[1] + np.array(hc.base)[4:8]))
+    )
+    expected_comb = (
+        mixes[..., 8:] * np.array(hc.scale)[2] + np.array(hc.base)[8:]
+    ).reshape(2, 3, 4, 4)
+    expected_comb = np.exp(expected_comb - expected_comb.max(-1, keepdims=True))
+    expected_comb = expected_comb / expected_comb.sum(-1, keepdims=True) + hc.eps
+    expected_comb /= expected_comb.sum(-2, keepdims=True) + hc.eps
+    for _ in range(hc.iters - 1):
+        expected_comb /= expected_comb.sum(-1, keepdims=True) + hc.eps
+        expected_comb /= expected_comb.sum(-2, keepdims=True) + hc.eps
+    np.testing.assert_allclose(
+        actual, (pre[..., None] * residual).sum(-2), atol=2e-6, rtol=2e-6
+    )
+    np.testing.assert_allclose(post, expected_post, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(comb, expected_comb, atol=2e-6, rtol=2e-6)

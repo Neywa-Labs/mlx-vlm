@@ -57,16 +57,17 @@ The indexer stores its cache in the backbone dtype, without the FP8/FP4 activati
 
 ## Validation
 
-Tiny configurations live in the shared model test catalog. Regressions cover compression boundaries, chunked prefill, sparse decode, causal masking, cache merging/extraction/filtering, padding, state restoration, quantized loading, and continuous batching with late arrivals and cancellation. A tiny checkpoint with the released FP8 naming and scale format exercises strict loading through the shared loader, MLA layout conversion, ECHO projections, and a native MXFP8 save/reload round trip. Component equations are compared with independent NumPy references.
+Tiny configurations live in the shared model test catalog, with shared pytest fixtures for the target and ECHO drafter. Regressions cover compression boundaries, chunked prefill, sparse decode, causal masking, cache merging/extraction/filtering, padding, state restoration, and continuous batching with late arrivals and cancellation. Cache checks live in `test_cache.py`; component equations are compared with independent NumPy references in `test_model_ops.py`.
 
 The released checkpoint also passes strict loading and text-generation smoke tests. Independent PyTorch FP32 checks cover a complete tiny model and the released first layer across a compression boundary; these are separate from full-checkpoint generation checks.
 
 ECHO regressions cover forced acceptance/rejection, compressor rollback across boundaries, repeated generation, padded batches, early completion, and auxiliary-weight conversion/loading. An independent PyTorch check of ECHO's equations matched full prefill and token-by-token decode with maximum FP32 logit error below `1e-6` and no top-token disagreements across 38 comparisons.
 
 ```sh
-python -m pytest mlx_vlm/tests/test_models.py -k 'ernie55 or ernie5_5'
-python -m pytest mlx_vlm/tests/test_generate.py -k ernie55
-python -m pytest mlx_vlm/tests/test_speculative.py -k ernie_echo
+python -m pytest \
+  mlx_vlm/tests/test_models.py mlx_vlm/tests/test_model_ops.py \
+  mlx_vlm/tests/test_cache.py mlx_vlm/tests/test_generate.py \
+  mlx_vlm/tests/test_speculative.py -k 'ernie55 or ernie5_5 or ernie_echo'
 ```
 
 ## Measured performance
