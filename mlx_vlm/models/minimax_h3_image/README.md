@@ -3,8 +3,7 @@
 Native MLX text-to-image generation and image editing for
 [`MiniMaxAI/MiniMax-H3-Image`](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image).
 The model uses a Qwen3-VL conditioner, a 33B diffusion transformer with six
-step-specific output heads, and a tiled image VAE. Inference does not require
-PyTorch or Diffusers.
+step-specific output heads, and a tiled image VAE.
 
 ## Generate
 
@@ -104,19 +103,10 @@ invalid answers raise an error before image generation starts.
 - Prompts are truncated to 4096 tokens, without a chat template.
 - The model works best near 16 megapixels. Small requests are generated on
   a canvas of at least 4 megapixels and then resized to the requested size.
-  `--gen-kwargs '{"min_generation_area":1024}'` disables that minimum for
-  small smoke tests. Internal canvas dimensions round to multiples of 32.
-- The released floating-point components total approximately 135 GB on disk.
-  The loader downloads only the Diffusers transformer/VAE copies and the
-  conditioner. Converted MLX checkpoints are also supported, including affine
-  quantization. The text encoder is released after conditioning, and the fixed
-  AdaLN tables are cached so their large projections can be released.
-- Seeds are reproducible within the MLX implementation; MLX's random generator
-  does not reproduce PyTorch's initial noise byte for byte.
+  `--gen-kwargs '{"min_generation_area":1024}'` disables that minimum.
+  Internal canvas dimensions round to multiples of 32.
 
 Weights use the [MiniMax H3 Image Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE).
-The [Diffusers reference code](https://github.com/huggingface/diffusers/tree/main/src/diffusers/modular_pipelines/minimax_h3_image)
-uses [Apache-2.0](https://github.com/huggingface/diffusers/blob/main/LICENSE).
 The bundled prompt-expansion templates come from
 [MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE/tree/main/prompt)
 under the same MiniMax H3 Image Community License as the model weights.
