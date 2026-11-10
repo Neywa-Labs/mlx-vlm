@@ -17,15 +17,14 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
 from ..kimi_k3.language import ShortConv1d
-from ..linear import DECODE_BLOCK_SIZE, linear, native_batch_linear, tokenwise
+from ..linear import DECODE_BLOCK_SIZE, linear
 from ..mla import MultiLinear
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
+from .speculative_verifier import BailingHybridSpeculativeVerifier
 
-
-def project(module, x, verify):
-    return linear(module, x) if verify else module(x)
+_SPECULATIVE_VERIFIER = BailingHybridSpeculativeVerifier()
 
 
 @partial(mx.compile, shapeless=True)
@@ -46,15 +45,9 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
 
-    def __call__(self, x, verify=False):
-        out = project(
-            self.down_proj,
-            clipped_swiglu(
-                project(self.up_proj, x, verify),
-                project(self.gate_proj, x, verify),
-                self.limit,
-            ),
-            verify,
+    def __call__(self, x):
+        out = self.down_proj(
+            clipped_swiglu(self.up_proj(x), self.gate_proj(x), self.limit)
         )
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -117,14 +110,14 @@ class SparseMoE(nn.Module):
             else None
         )
 
-    def __call__(self, x, verify=False):
+    def __call__(self, x):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
-        indices, scores = tokenwise(self.gate, x) if verify else self.gate(x)
+        indices, scores = self.gate(x)
         experts = self.switch_mlp(x, indices)
         out = (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
         if self.shared_experts is not None:
-            out = out + self.shared_experts(x, verify=verify)
+            out = out + self.shared_experts(x)
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
         return out
@@ -173,55 +166,43 @@ class KimiDeltaAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(projection_size, args.hidden_size, bias=False)
 
-    def __call__(self, x, mask=None, cache=None, verify=False):
+    def __call__(self, x, mask=None, cache=None):
+        if cache is not None and cache.is_speculating:
+            return _SPECULATIVE_VERIFIER._gated_delta(self, x, mask, cache)
         B, T, _ = x.shape
         lengths = cache.lengths if cache is not None else None
         qkv = []
         for i, name in enumerate(("q", "k", "v")):
             conv = getattr(self, f"{name}_conv1d")
-            projected = project(getattr(self, f"{name}_proj"), x, verify)
+            projected = getattr(self, f"{name}_proj")(x)
             previous = cache[i] if cache is not None else None
-            if verify and T > 1:
-                state, steps = previous, []
-                for t in range(T):
-                    y, state = conv(
-                        mx.contiguous(projected[:, t : t + 1]),
-                        state,
-                        None if mask is None else mask[:, t : t + 1],
-                        None if lengths is None else lengths - t,
-                    )
-                    steps.append(y)
-                y = mx.concatenate(steps, axis=1)
-            else:
-                y, state = conv(projected, previous, mask, lengths)
+            y, state = conv(projected, previous, mask, lengths)
             if cache is not None:
-                if cache.is_speculating:
-                    width = conv.kernel_size - 1
-                    if previous is None:
-                        previous = mx.zeros((B, width, projected.shape[-1]), x.dtype)
-                    if mask is not None:
-                        projected = mx.where(mask[..., None], projected, 0)
-                    cache.record_speculative_window(
-                        i, mx.concatenate([previous, projected], axis=1), width
-                    )
                 cache[i] = state
             qkv.append(y.reshape(B, T, self.num_heads, self.head_dim))
-        q, k, v = qkv
+        a = self.f_proj(x) if self.args.no_kda_lora else self.f_b_proj(self.f_a_proj(x))
+        out = self.recurrent(*qkv, a, self.b_proj(x), cache, mask)
+        gate = (
+            self.g_proj(x) if self.args.no_kda_lora else self.g_b_proj(self.g_a_proj(x))
+        )
+        gate = mx.sigmoid(gate.astype(mx.float32)).astype(x.dtype)
+        out = self.o_proj(self.o_norm(out).reshape(B, T, -1) * gate)
+        if self.output_group is not None:
+            out = mx.distributed.all_sum(out, group=self.output_group)
+        return out
+
+    def recurrent(self, q, k, v, a, b, cache, mask):
+        B, T = q.shape[:2]
         # FLA applies L2 normalization (epsilon inside sqrt), then scales Q.
         scale = self.head_dim**-0.5
         q = scale**2 * mx.fast.rms_norm(q, None, 1e-6 / self.head_dim)
         k = scale * mx.fast.rms_norm(k, None, 1e-6 / self.head_dim)
-        a = (
-            project(self.f_proj, x, verify)
-            if self.args.no_kda_lora
-            else project(self.f_b_proj, project(self.f_a_proj, x, verify), verify)
-        )
         out, state = gated_delta_update(
             q,
             k,
             v,
             a.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32),
-            project(self.b_proj, x, verify).astype(mx.float32),
+            b.astype(mx.float32),
             self.A_log[:, None],
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             cache=cache,
@@ -232,15 +213,6 @@ class KimiDeltaAttention(nn.Module):
         )
         if cache is not None:
             cache.advance(T)
-        gate = (
-            project(self.g_proj, x, verify)
-            if self.args.no_kda_lora
-            else project(self.g_b_proj, project(self.g_a_proj, x, verify), verify)
-        )
-        gate = mx.sigmoid(gate.astype(mx.float32)).astype(x.dtype)
-        out = project(self.o_proj, self.o_norm(out).reshape(B, T, -1) * gate, verify)
-        if self.output_group is not None:
-            out = mx.distributed.all_sum(out, group=self.output_group)
         return out
 
 
@@ -306,52 +278,26 @@ class MultiLatentAttention(nn.Module):
                     1 + 0.1 * args.rope_scaling["mscale_all_dim"] * math.log(factor)
                 ) ** 2
 
-    def __call__(self, x, mask=None, cache=None, verify=False):
+    def __call__(self, x, mask=None, cache=None):
         args = self.args
         B, T, _ = x.shape
         q = (
-            project(self.q_proj, x, verify)
+            self.q_proj(x)
             if args.q_lora_rank is None
-            else project(
-                self.q_b_proj,
-                self.q_a_layernorm(project(self.q_a_proj, x, verify)),
-                verify,
-            )
+            else self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
         )
         q = q.reshape(B, T, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         latent, k_pe = mx.split(
-            project(self.kv_a_proj_with_mqa, x, verify), [args.kv_lora_rank], axis=-1
+            self.kv_a_proj_with_mqa(x), [args.kv_lora_rank], axis=-1
         )
         latent = self.kv_a_layernorm(latent)[:, None]
         k_pe = k_pe[:, None]
-        if verify and T > 1:
-            # As in Mistral Large 4, project the block together while each query
-            # sees exactly the cache prefix of an ordinary decode step.
-            prefix = cache.state[0].shape[-2] if cache.state[0] is not None else 0
-            outputs = []
-            for t in range(T):
-                step_mask = (
-                    None if mask is None else mask[..., t : t + 1, : prefix + t + 1]
-                )
-                outputs.append(
-                    self.attend(
-                        mx.contiguous(q[:, :, t : t + 1]),
-                        mx.contiguous(latent[:, :, t : t + 1]),
-                        mx.contiguous(k_pe[:, :, t : t + 1]),
-                        step_mask,
-                        cache,
-                    )
-                )
-            out = mx.concatenate(outputs, axis=2)
-        else:
-            out = self.attend(q, latent, k_pe, mask, cache)
+        out = self.attend(q, latent, k_pe, mask, cache)
         out = out.transpose(0, 2, 1, 3)
         if self.g_proj is not None:
-            gate = mx.sigmoid(
-                project(self.g_proj, x, verify).astype(mx.float32)
-            ).astype(x.dtype)
+            gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(x.dtype)
             out = out * gate.reshape(B, T, self.num_heads, -1)
-        out = project(self.dense, out.reshape(B, T, -1), verify)
+        out = self.dense(out.reshape(B, T, -1))
         if self.output_group is not None:
             out = mx.distributed.all_sum(out, group=self.output_group)
         return out
@@ -398,9 +344,9 @@ class DecoderLayer(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-    def __call__(self, x, mask=None, cache=None, verify=False):
-        h = x + self.attention(self.input_layernorm(x), mask, cache, verify=verify)
-        return h + self.mlp(self.post_attention_layernorm(h), verify=verify)
+    def __call__(self, x, mask=None, cache=None):
+        h = x + self.attention(self.input_layernorm(x), mask, cache)
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class TextModel(nn.Module):
@@ -418,15 +364,8 @@ class TextModel(nn.Module):
     def __call__(self, inputs, cache=None, inputs_embeds=None):
         h = self.word_embeddings(inputs) if inputs_embeds is None else inputs_embeds
         cache = cache if cache is not None else [None] * len(self.layers)
-        verify = any(getattr(c, "is_speculating", False) for c in cache)
-        if verify and h.shape[1] > DECODE_BLOCK_SIZE:
-            return mx.concatenate(
-                [
-                    self(None, cache, h[:, i : i + DECODE_BLOCK_SIZE])
-                    for i in range(0, h.shape[1], DECODE_BLOCK_SIZE)
-                ],
-                axis=1,
-            )
+        if any(getattr(c, "is_speculating", False) for c in cache):
+            return _SPECULATIVE_VERIFIER(self, h, cache)
         masks = {}
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             if layer.is_linear not in masks:
@@ -435,13 +374,13 @@ class TextModel(nn.Module):
                     if layer.is_linear
                     else create_attention_mask(h, c, return_array=True)
                 )
-            h = layer(h, masks[layer.is_linear], c, verify=verify)
+            h = layer(h, masks[layer.is_linear], c)
             if (
                 self.sharding_group is not None
                 and not self.training
                 and mx.default_device() == mx.gpu
             ):
-                if not verify and h.shape[1] > DECODE_BLOCK_SIZE:
+                if h.shape[1] > DECODE_BLOCK_SIZE:
                     # Large prefill graphs can stall Metal/JACCL.
                     mx.eval(h, c.state if c is not None else [])
                 elif (i + 1) % 4 == 0:
@@ -546,24 +485,19 @@ class LanguageModel(nn.Module):
             logits=logits, hidden_states=[h] if return_hidden else None
         )
 
-    def logits_from_hidden(self, h, *, verify=False):
+    def logits_from_hidden(self, h):
         head = (
             self.model.word_embeddings.as_linear
             if self.args.tie_word_embeddings
             else self.lm_head
         )
-        return native_batch_linear(head, h) if verify else linear(head, h)
+        return linear(head, h)
 
     def speculative_logits_from_hidden(self, h):
-        return self.logits_from_hidden(h, verify=True)
+        return _SPECULATIVE_VERIFIER.logits_from_hidden(self, h)
 
     def speculative_verify_hidden(self, inputs, cache):
-        from ...speculative.common import verify_forward
-
-        output, transaction = verify_forward(
-            self, inputs, cache, skip_logits=True, return_hidden=True
-        )
-        return output.hidden_states[-1], {}, transaction
+        return _SPECULATIVE_VERIFIER.verify_hidden(self, inputs, cache)
 
     def shard(self, group=None):
         group = group or mx.distributed.init()
