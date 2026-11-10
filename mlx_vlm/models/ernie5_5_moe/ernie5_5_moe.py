@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 from typing import Optional
 
 import mlx.core as mx

@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Auxiliary ECHO parameters retained by ordinary loading and conversion."""
 
 import mlx.core as mx

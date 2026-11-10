@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """ERNIE 5.5 Flash: HCA/MLA, latent multi-router MoE and mHC.
 
 Architecture reference: https://github.com/baidu/vLLM-ERNIE

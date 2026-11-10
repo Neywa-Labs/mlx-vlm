@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Select the bundled ECHO auxiliaries; decoder parameters stay shared."""
 
 from ....models.ernie5_5_moe.config import ModelConfig as TextConfig

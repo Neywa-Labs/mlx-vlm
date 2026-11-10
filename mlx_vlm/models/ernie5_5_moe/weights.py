@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Released block-FP8 and MLX checkpoint normalization."""
 
 import re

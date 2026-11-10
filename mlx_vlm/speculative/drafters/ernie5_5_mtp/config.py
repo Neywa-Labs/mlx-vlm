@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 from dataclasses import dataclass
 from typing import Optional
 
