@@ -3035,6 +3035,14 @@ def _distributed_model_worker(family, dtype_name):
                     sharded.shard(group)
             stage("evaluating sharded weights")
             mx.eval(sharded.parameters())
+            # Metal kernels are initialized per process. Warm each rank with
+            # the reference while its peers are idle, before any rank can
+            # enqueue a collective that waits on a still-compiling peer.
+            stage("reference outputs")
+            expected = _distributed_model_outputs(reference, stage)
+            if rank == 0:
+                np.savez(barrier_dir / "reference.npz", **expected)
+            del expected
             stage("models ready")
         host_barrier(f"models-ready-{rank}")
     local_weights = dict(tree_flatten(sharded.parameters()))
@@ -3044,15 +3052,6 @@ def _distributed_model_worker(family, dtype_name):
         for name in names:
             assert local_weights[name].size * group.size() == weights[name].size, name
 
-    # Evaluate the identical reference once, while the other ranks are idle.
-    # Separate reference and distributed GPU work instead of alternating them
-    # with test-only CPU collectives on every decoding step.
-    if group.rank() == 0:
-        stage("reference outputs")
-        np.savez(
-            barrier_dir / "reference.npz",
-            **_distributed_model_outputs(reference, stage),
-        )
     del reference, weights, local_weights
     host_barrier("reference-ready")
     stage("sharded outputs")
