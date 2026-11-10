@@ -1,5 +1,7 @@
 # Copyright © 2026 Neywa Labs Inc.
 
+from functools import partial
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -30,6 +32,74 @@ def _linear(layer, x):
     return linear(layer, x)
 
 
+@partial(mx.compile, shapeless=True)
+def _rms_norm(x, weight, eps):
+    # Preserve the upstream FP32 steps before rounding and applying the weight.
+    hidden = x.astype(mx.float32)
+    variance = mx.mean(hidden * hidden, axis=-1, keepdims=True)
+    normalized = hidden * mx.rsqrt(variance + eps)
+    return normalized.astype(x.dtype) * weight
+
+
+@mx.compile
+def _apply_rotary(x, angles):
+    # Upstream rounds the trigonometric values before the FP32 rotation.
+    cos = mx.cos(angles).astype(x.dtype).astype(mx.float32)[:, None]
+    sin = mx.sin(angles).astype(x.dtype).astype(mx.float32)[:, None]
+    first, second = mx.split(x.astype(mx.float32), 2, axis=-1)
+    return mx.concatenate(
+        (first * cos - second * sin, second * cos + first * sin), axis=-1
+    ).astype(x.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _interpolate_values(x, residual, weight):
+    blend = mx.sigmoid(weight[0].astype(mx.float32)).astype(x.dtype)
+    # Match torch.lerp's FP32 interpolation and single output rounding.
+    blend = blend.astype(mx.float32)
+    seed = residual.astype(x.dtype).astype(mx.float32)
+    end = x.astype(mx.float32)
+    delta = end - seed
+    return mx.where(
+        blend < 0.5, seed + blend * delta, end + (blend - 1) * delta
+    ).astype(x.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _gate_attention(out, gate, full_precision):
+    if full_precision:
+        gate = gate.astype(mx.float32)
+    return out * mx.sigmoid(gate).astype(out.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _clipped_swiglu(gate, up, threshold):
+    if threshold:
+        gate = mx.minimum(gate, threshold)
+        up = mx.clip(up, -threshold, threshold)
+    # SiLU rounds once, before the separate BF16/FP16 multiplication by up.
+    activation = nn.silu(gate.astype(mx.float32)).astype(gate.dtype)
+    return activation * up
+
+
+class RMSNorm(nn.RMSNorm):
+    def __call__(self, x):
+        return _rms_norm(x, self.weight, self.eps)
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dims, base):
+        super().__init__()
+        self._inv_freq = 1.0 / mx.array(
+            [base ** (i / dims) for i in range(0, dims, 2)], dtype=mx.float32
+        )
+
+    def __call__(self, x, offset=0):
+        positions = mx.arange(x.shape[-2], dtype=mx.float32)
+        positions = positions + mx.array(offset, dtype=mx.float32).reshape(-1, 1)
+        return _apply_rotary(x, positions[..., None] * self._inv_freq)
+
+
 class Attention(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
@@ -53,8 +123,8 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(
             self.n_heads * self.head_dim, config.hidden_size, bias=False
         )
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         if config.use_valres:
             self.value_res_lambda = mx.zeros((1,))
         if config.use_gated_attention:
@@ -62,9 +132,7 @@ class Attention(nn.Module):
                 config.hidden_size, self.n_heads * self.head_dim, bias=False
             )
         if self.is_sliding:
-            self.rope = nn.RoPE(
-                self.head_dim, traditional=False, base=config.rope_theta
-            )
+            self.rope = RotaryEmbedding(self.head_dim, config.rope_theta)
 
     def __call__(self, x, mask=None, cache=None, value_residual=None):
         queries, keys, values = self._project_qkv(x, cache, value_residual)
@@ -79,9 +147,7 @@ class Attention(nn.Module):
         batch, length, _ = x.shape
         value_states = x
         if value_residual is not None:
-            blend = mx.sigmoid(self.value_res_lambda[0]).astype(x.dtype)
-            seed = value_residual.astype(x.dtype)
-            value_states = seed + blend * (x - seed)
+            value_states = _interpolate_values(x, value_residual, self.value_res_lambda)
 
         queries = self.q_norm(
             _linear(self.q_proj, x).reshape(batch, length, self.n_heads, self.head_dim)
@@ -108,10 +174,9 @@ class Attention(nn.Module):
         batch, length, _ = x.shape
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         if hasattr(self, "g_proj"):
-            gate = _linear(self.g_proj, x)
-            if self.gate_full_precision:
-                gate = gate.astype(mx.float32)
-            out = out * mx.sigmoid(gate).astype(out.dtype)
+            out = _gate_attention(
+                out, _linear(self.g_proj, x), self.gate_full_precision
+            )
         return _linear(self.o_proj, out)
 
 
@@ -131,10 +196,7 @@ class MLP(nn.Module):
 
     def __call__(self, x):
         gate, up = _linear(self.gate_proj, x), _linear(self.up_proj, x)
-        if self.clamp_threshold:
-            gate = mx.minimum(gate, self.clamp_threshold)
-            up = mx.clip(up, -self.clamp_threshold, self.clamp_threshold)
-        return _linear(self.down_proj, nn.silu(gate) * up)
+        return _linear(self.down_proj, _clipped_swiglu(gate, up, self.clamp_threshold))
 
 
 class DecoderLayer(nn.Module):
@@ -142,14 +204,14 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Attention(config, layer_idx)
         self.mlp = MLP(config)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = nn.RMSNorm(
+        self.pre_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = nn.RMSNorm(
+        self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -167,7 +229,7 @@ class RicursiveModel(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
@@ -184,10 +246,12 @@ class RicursiveModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         captured = {}
+        masks = {}
         for index, (layer, c) in enumerate(zip(self.layers, cache)):
             window = self.config.sliding_window if layer.self_attn.is_sliding else None
-            mask = create_attention_mask(h, c, window_size=window)
-            h = layer(h, mask, c, value_residual)
+            if window not in masks:
+                masks[window] = create_attention_mask(h, c, window_size=window)
+            h = layer(h, masks[window], c, value_residual)
             if index in capture:
                 captured[index] = h
         if hidden_sink is not None:
@@ -206,7 +270,8 @@ class RicursiveModel(nn.Module):
     def _embed(self, inputs, inputs_embeds=None):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if self.config.embed_scale is not None:
-            h = h * self.config.embed_scale
+            # Keep the Python scalar in FP32 until the scaled embedding is rounded.
+            h = (h.astype(mx.float32) * self.config.embed_scale).astype(h.dtype)
         return h
 
 
