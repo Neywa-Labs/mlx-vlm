@@ -157,6 +157,20 @@ def test_silu_rounds_before_up_product(config, values):
     assert mx.array_equal(mlp(values).reshape(-1), expected)
 
 
+@pytest.mark.parametrize("length", [1, 8, 513])
+def test_compiled_mlp_preserves_updated_weights(config, length):
+    mx.random.seed(31)
+    mlp = MLP(config)
+    mlp.eval()
+    x = mx.random.normal((2, length, config.hidden_size))
+    for _ in range(2):
+        expected = mlp._forward(x)
+        actual = mlp(x)
+        assert actual.shape == expected.shape
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+        mlp.gate_proj.weight = mlp.gate_proj.weight * 0.5
+
+
 def test_rope_rounds_trigonometry_before_rotation(values):
     rope = RotaryEmbedding(8, 10000)
     x = mx.broadcast_to(values[:, None], (2, 1, 1, 8))

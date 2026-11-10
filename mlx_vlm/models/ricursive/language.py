@@ -193,8 +193,14 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(
             config.intermediate_size, config.hidden_size, bias=False
         )
+        self._compiled_forward = mx.compile(self._forward, inputs=self.state)
 
     def __call__(self, x):
+        if self.training:
+            return self._forward(x)
+        return self._compiled_forward(x)
+
+    def _forward(self, x):
         gate, up = _linear(self.gate_proj, x), _linear(self.up_proj, x)
         return _linear(self.down_proj, _clipped_swiglu(gate, up, self.clamp_threshold))
 
