@@ -25,7 +25,12 @@ def native_batch_linear(module, x):
     """Match independent B×1 calls, including dense and mixed-dtype fallbacks."""
     if x.ndim != 3 or x.shape[1] <= 1:
         return module(x)
+    from .linear_batch import native_block_linear
     from .quantized_verifier import exact_quantized_linear, singleton_quantized_linear
+
+    output = native_block_linear(module, x)
+    if output is not None:
+        return output
 
     # Narrow and FP32 projections can use a different native QMV reduction.
     if (

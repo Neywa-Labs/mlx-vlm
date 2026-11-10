@@ -1684,6 +1684,44 @@ def test_native_affine_batch_projection(dtype, bits, batch, length):
 
 
 @parametrize(
+    "dtype,kind",
+    [(dtype, "dense") for dtype in (mx.bfloat16, mx.float16)]
+    + list(
+        product(
+            (mx.bfloat16, mx.float16, mx.float32),
+            ("weight_scale_2", "weight_global_scale"),
+        )
+    ),
+)
+@parametrize("batch,length", [(1, 3), (2, 4), (4, 5), (8, 8)])
+def test_native_block_projection(dtype, batch, length, kind):
+    from mlx_vlm.models.linear_batch import native_block_linear
+
+    mx.random.seed(1337)
+    for inputs, outputs in [(1024, 67), (1024, 2048), (4096, 512)]:
+        layer = nn.Linear(inputs, outputs, bias=kind != "dense")
+        layer.weight = mx.random.normal(layer.weight.shape)
+        layer.set_dtype(dtype)
+        if kind != "dense":
+            layer = ScaledQuantizedLinear(
+                layer.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+                mx.array(0.027 if kind == "weight_scale_2" else 37.0),
+                kind,
+                pre_quant_scale=mx.random.uniform(0.5, 1.5, (inputs,)),
+            )
+        layer.eval()
+        x = mx.random.normal((batch, length, inputs)).astype(dtype)
+        actual = native_block_linear(layer, x)
+        if actual is None:
+            pytest.skip("Native block projection is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(x[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        equal(native_batch_linear(layer, x), expected)
+
+
+@parametrize(
     "family,failure",
     [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
 )
