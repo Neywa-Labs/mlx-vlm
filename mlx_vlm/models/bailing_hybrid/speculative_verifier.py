@@ -4,6 +4,7 @@ import mlx.core as mx
 from mlx.nn.layers.distributed import sum_gradients
 
 from ..base import create_attention_mask, create_ssm_mask
+from ..fast_ops import short_conv_block
 from ..linear import DECODE_BLOCK_SIZE, linear, native_batch_linear, tokenwise
 
 
@@ -85,7 +86,14 @@ class BailingHybridSpeculativeVerifier:
             conv = getattr(attention, f"{name}_conv1d")
             projected = linear(getattr(attention, f"{name}_proj"), x)
             previous = cache[i] if cache is not None else None
-            if length > 1:
+            fused = (
+                short_conv_block(projected, previous, conv.conv.weight)
+                if not conv.training and mask is None and lengths is None
+                else None
+            )
+            if fused is not None:
+                y, state = fused
+            elif length > 1:
                 state, steps = previous, []
                 for t in range(length):
                     y, state = conv(

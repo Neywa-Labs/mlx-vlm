@@ -68,6 +68,39 @@ prism_ops = importlib.import_module(
 qwen35 = importlib.import_module("mlx_vlm.models.qwen3_5")
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("batch,channels", [(1, 128), (2, 7)])
+@pytest.mark.parametrize("width", [2, 3, 4, 5])
+@pytest.mark.parametrize("length", [2, 4, 8])
+def test_short_conv_block_matches_stateful_decode(
+    dtype, batch, channels, width, length
+):
+    from mlx_vlm.models.fast_ops import short_conv_block
+    from mlx_vlm.models.kimi_k3.language import ShortConv1d
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal short-block kernel")
+    mx.random.seed(2131)
+    conv = ShortConv1d(channels, width)
+    conv.conv.weight = conv.conv.weight.astype(dtype)
+    conv.eval()
+    expected_state = mx.random.normal((batch, width - 1, channels)).astype(dtype)
+    actual_state = expected_state
+    for step in range(3):
+        if step == 1:
+            conv.conv.weight = -conv.conv.weight
+        inputs = mx.random.normal((batch, length * 2, channels)).astype(dtype)[:, ::2]
+        expected = []
+        for t in range(length):
+            value, expected_state = conv(
+                mx.contiguous(inputs[:, t : t + 1]), expected_state, None, None
+            )
+            expected.append(value)
+        actual, actual_state = short_conv_block(inputs, actual_state, conv.conv.weight)
+        assert mx.array_equal(actual, mx.concatenate(expected, axis=1)).item()
+        assert mx.array_equal(actual_state, expected_state).item()
+
+
 def test_mimo_v2_unfuses_tensor_parallel_qkv_shards():
     module = importlib.import_module("mlx_vlm.models.mimo_v2")
     text = module.TextConfig(
