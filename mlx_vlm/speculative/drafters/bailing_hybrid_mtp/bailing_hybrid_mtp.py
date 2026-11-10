@@ -17,12 +17,27 @@ class NextNLayer(DecoderLayer):
         self.eh_proj = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
         self.final_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, embeddings, hidden, cache):
-        h = self.eh_proj(
+    def project_inputs(self, embeddings, hidden):
+        return self.eh_proj(
             mx.concatenate([self.enorm(embeddings), self.hnorm(hidden)], axis=-1)
         )
+
+    def __call__(self, embeddings, hidden, cache):
+        h = self.project_inputs(embeddings, hidden)
         mask = create_attention_mask(h, cache, return_array=True)
         return self.final_layernorm(super().__call__(h, mask, cache))
+
+    def cache_prefix(self, embeddings, hidden, cache):
+        # Past positions only need K/V; their attention and expert outputs
+        # do not contribute to the next proposal.
+        h = self.input_layernorm(self.project_inputs(embeddings, hidden))
+        attention = self.attention
+        latent, k_pe = mx.split(
+            attention.kv_a_proj_with_mqa(h), [attention.args.kv_lora_rank], axis=-1
+        )
+        latent = attention.kv_a_layernorm(latent)[:, None]
+        k_pe = attention.rope(k_pe[:, None], offset=cache.offset)
+        cache.update_and_fetch(latent, k_pe)
 
 
 class Model(AutoregressiveMTPDraftModel):
@@ -56,6 +71,21 @@ class Model(AutoregressiveMTPDraftModel):
     def _forward_hidden(self, token_embed, hidden, tokens, cache, **kwargs):
         h = self.mtp(token_embed, hidden, cache[0])
         return h, h
+
+    def _prepare_verified_cache(
+        self, verify_hidden, draft_tokens, accepted, token_dtype
+    ):
+        # Replace speculative K/V, which used estimated hidden states, with
+        # the verified target states before producing the next proposal.
+        super()._prepare_verified_cache(verify_hidden, draft_tokens, 0, token_dtype)
+        if accepted:
+            self.mtp.cache_prefix(
+                self._input_embed(draft_tokens[:, :accepted].astype(token_dtype)),
+                verify_hidden[:, :accepted],
+                self._cache[0],
+            )
+            self._next_position += accepted
+        return accepted
 
     def sanitize(self, weights):
         return sanitize_weights(

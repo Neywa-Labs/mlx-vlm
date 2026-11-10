@@ -2814,6 +2814,80 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     assert all(0 <= token < 32 for token in tokens[0].tolist())
 
 
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+@parametrize("quantized", [False, True])
+def test_ling_mtp_verified_cache_skips_past_expert_outputs(
+    dtype, batch, quantized, monkeypatch
+):
+    mx.random.seed(109)
+    target, cfg = language("ling", inference=True)
+    target.set_dtype(dtype)
+    draft = mtp_drafter("ling", cfg)
+    reference = mtp_drafter("ling", cfg)
+    for model in (draft, reference):
+        model.set_dtype(dtype)
+        if quantized:
+            nn.quantize(
+                model,
+                bits=8,
+                group_size=32,
+                mode="mxfp8",
+                class_predicate=lambda path, module: (
+                    hasattr(module, "to_quantized")
+                    and module.weight.shape[-1] % 32 == 0
+                    and model.quant_predicate(path, module)
+                ),
+            )
+        model.eval()
+    padding = None if batch == 1 else [2, 0]
+    draft.reset(target, left_padding=padding)
+    prompt = mx.broadcast_to(mx.array([[1, 2, 3, 4, 5]]), (batch, 5))
+    hidden = mx.random.normal((batch, 5, cfg.hidden_size)).astype(dtype)
+    bonus = mx.full((batch,), 6, mx.int32)
+    draft.prefill_from_target_hidden(prompt, hidden, bonus, greedy, greedy=True)
+    mx.eval(draft.parameters(), draft.draft_eval_state())
+
+    reference.load_weights(tree_flatten(draft.parameters()))
+    reference.reset(target, left_padding=padding)
+    reference._cache = deepcopy(draft._cache)
+    reference._next_position = draft._next_position
+    experts = Mock(wraps=draft.mtp.mlp)
+    monkeypatch.setattr(draft.mtp, "mlp", experts)
+
+    for step, accepted in enumerate((0, 1, 3, 2)):
+        tokens = draft.draft_block(bonus, hidden[:, -1:], None, 4, greedy, greedy=True)
+        mx.eval(tokens, draft.draft_eval_state())
+        experts.reset_mock()
+        verified = mx.random.normal((batch, 4, cfg.hidden_size)).astype(dtype)
+        next_bonus = mx.full((batch, 1), 7 + step, mx.int32)
+        kept = mx.concatenate([tokens[:, :accepted], next_bonus], axis=1)
+
+        # The oracle runs the whole NEXTN layer for the verified prefix.
+        if accepted:
+            reference._forward_tokens(
+                tokens[:, :accepted], verified[:, :accepted], mx.int32
+            )
+        logits, expected_hidden = reference._forward_tokens(
+            next_bonus, verified[:, accepted : accepted + 1], mx.int32
+        )
+        reference._set_seed_from_hidden(logits, greedy, True)
+        reference._seed_hidden = expected_hidden
+        draft.accept_verified_tokens_batch(
+            verified, tokens, [accepted] * batch, kept.tolist(), greedy, mx.int32, True
+        )
+        mx.eval(draft.draft_eval_state(), reference.draft_eval_state())
+        equal(draft._cache[0].state, reference._cache[0].state)
+        equal(draft._seed_hidden, reference._seed_hidden)
+        equal(draft._seed_token, reference._seed_token)
+        equal(draft._cache[0].offset, reference._cache[0].offset)
+        assert draft._next_position == reference._next_position
+        assert draft._round_appended == 0
+        experts.assert_called_once()
+        assert experts.call_args.args[0].shape[:2] == (batch, 1)
+        bonus = next_bonus[:, 0]
+
+
 @parametrize("accepted", [0, 2])
 def test_eagle3_draft_replay(accepted):
     arch = module("speculative.drafters.eagle3")
