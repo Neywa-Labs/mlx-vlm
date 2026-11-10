@@ -9,15 +9,14 @@ Convert the released FP8 checkpoint with the standard converter on a machine wit
 ```sh
 python -m mlx_vlm.convert \
   --hf-path baidu/ERNIE-5.5-Flash-Base \
-  --mlx-path ./ERNIE-5.5-Flash-Base-4bit \
-  -q --q-bits 4 --q-group-size 64
+  --mlx-path ./ERNIE-5.5-Flash-Base-MXFP8
 ```
 
-The default model predicate quantizes routed/shared experts and latent MoE projections. Routers, attention, and residual mixers retain their precision. The dense vocabulary head is promoted to FP32 once at loading, matching its FP32 projection arithmetic without repeated weight conversion. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
+The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. Adding `-q` does not requantize existing MXFP8 projections to 4-bit. The dense vocabulary head is promoted to FP32 once at loading, matching its FP32 projection arithmetic without repeated weight conversion. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
 
 ```sh
 python -m mlx_vlm.generate \
-  --model ./ERNIE-5.5-Flash-Base-4bit \
+  --model ./ERNIE-5.5-Flash-Base-MXFP8 \
   --prompt "Large language models are" \
   --max-tokens 128 --temperature 0
 ```
@@ -30,8 +29,8 @@ ECHO uses the prediction weights bundled in the Base checkpoint. Point both argu
 
 ```sh
 python -m mlx_vlm.generate \
-  --model ./ERNIE-5.5-Flash-Base-4bit \
-  --draft-model ./ERNIE-5.5-Flash-Base-4bit \
+  --model ./ERNIE-5.5-Flash-Base-MXFP8 \
+  --draft-model ./ERNIE-5.5-Flash-Base-MXFP8 \
   --draft-kind mtp --draft-block-size 3 \
   --prompt "Large language models are" \
   --max-tokens 128 --temperature 0
@@ -58,7 +57,7 @@ The indexer stores its cache in the backbone dtype, without the FP8/FP4 activati
 
 ## Validation
 
-Tiny configurations live in the shared model test catalog. Regressions cover compression boundaries, chunked prefill, sparse decode, causal masking, cache merging/extraction/filtering, padding, state restoration, quantized loading, and continuous batching with late arrivals and cancellation. Component equations are compared with independent NumPy references.
+Tiny configurations live in the shared model test catalog. Regressions cover compression boundaries, chunked prefill, sparse decode, causal masking, cache merging/extraction/filtering, padding, state restoration, quantized loading, and continuous batching with late arrivals and cancellation. A tiny checkpoint with the released FP8 naming and scale format exercises strict loading through the shared loader, MLA layout conversion, ECHO projections, and a native MXFP8 save/reload round trip. Component equations are compared with independent NumPy references.
 
 The released checkpoint also passes strict loading and text-generation smoke tests. Independent PyTorch FP32 checks cover a complete tiny model and the released first layer across a compression boundary; these are separate from full-checkpoint generation checks.
 
@@ -74,7 +73,7 @@ python -m pytest mlx_vlm/tests/test_speculative.py -k ernie_echo
 
 These profiling measurements were collected before rebasing the port onto the current shared cache-transaction implementation. The first table records the initial port before one-time vocabulary-head promotion, with a 2 GiB MLX allocator-cache limit. Profiling found that this limit amplified repeated BF16-to-FP32 head conversion. The ECHO comparison below reports the updated implementation.
 
-Measured on November 10, 2026, on one Apple M3 Ultra with 512 GiB of unified memory, using MLX 0.32.4 and the shared `BatchGenerator`. This checkpoint uses 4-bit affine quantization with group size 64 for routed experts only; remaining tensors retain BF16/FP32 precision. It occupies approximately 174.4 GB on disk. The converter command above also quantizes shared experts and latent projections, so its output is a different precision configuration.
+Measured on November 10, 2026, on one Apple M3 Ultra with 512 GiB of unified memory, using MLX 0.32.4 and the shared `BatchGenerator`. This checkpoint uses 4-bit affine quantization with group size 64 for routed experts only; remaining tensors retain BF16/FP32 precision. It occupies approximately 174.4 GB on disk. These measurements use a separately prepared checkpoint; the converter command above produces MXFP8 projections and has not been benchmarked here.
 
 Each request generated exactly 32 tokens with greedy sampling and EOS stopping disabled for the throughput measurement. Results are medians of three runs after model/kernel warmup at each batch size. Every run used a fresh KV cache, no prefix reuse or draft model, and a prefill chunk size of 128. Both throughput columns are aggregate rates across the batch; batch 1 is the latency baseline. TTFT is measured in-process. Memory is the maximum MLX allocator peak across the three runs, including model weights, in decimal GB.
 
