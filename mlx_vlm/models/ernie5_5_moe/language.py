@@ -73,6 +73,7 @@ class MultiRouter(nn.Module):
         ids = mx.argpartition(-(scores + bias), kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        ids = mx.stop_gradient(ids)
         weights = mx.take_along_axis(scores, ids, axis=-1)
         if self.normalize:
             weights /= mx.maximum(weights.sum(axis=-1, keepdims=True), 1e-20)
