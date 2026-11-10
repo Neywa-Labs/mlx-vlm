@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 from transformers import PreTrainedTokenizerFast
 
 from ..base import install_auto_processor_patch

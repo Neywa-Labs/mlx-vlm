@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """ECHO autoregressive draft using the target's shared final MLA/MoE layer."""
 
 import mlx.core as mx
