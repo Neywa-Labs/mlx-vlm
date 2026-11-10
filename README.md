@@ -278,10 +278,6 @@ mlx_vlm.server --model mlx-community/Qwen3.8-27B-4bit \
   --draft-model Qwen3.8-27B-DFlash2-4bit
 ```
 
-[Ripple-65B-Preview](mlx_vlm/models/ricursive/README.md#speculative-decoding)
-also supports its official `ricursiveAI/Ripple-65B-Preview-DFlash2` drafter,
-including its global NoPE layer and four-tap dynamic convolutions.
-
 Liquid AI's DSpark checkpoint uses a Qwen3-style block drafter plus a learned
 Markov correction head. It is auto-detected and runs through the exact target
 verification path:
