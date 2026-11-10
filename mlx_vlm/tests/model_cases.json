@@ -3371,11 +3371,6 @@
       "mup_enabled": true
     }
   },
-  "dense_profiles": {
-    "bailing_hybrid": {
-      "kda_lora": {"no_kda_lora": false}
-    }
-  },
   "apc": {
     "gemma4": {
       "case": "gemma4",

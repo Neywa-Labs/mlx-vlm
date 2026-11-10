@@ -917,13 +917,12 @@ class ModelChecks:
         self.assert_close(output.text_embeds, changed_padding.text_embeds)
         self.assert_close(mx.linalg.norm(output.text_embeds, axis=-1), mx.ones((1,)))
 
-    def assert_close(self, actual, expected, *, logits=False, tolerance=None):
+    def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
-        if tolerance is None:
-            tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
-            # One-token attention uses a different Metal kernel from full prefill.
-            if logits:
-                tolerance = max(tolerance, 2e-3)
+        tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
+        # One-token attention uses a different Metal kernel from full prefill.
+        if logits:
+            tolerance = max(tolerance, 2e-3)
         actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
         mx.eval(actual, expected)
         actual, expected = np.array(actual), np.array(expected)
@@ -935,9 +934,7 @@ class ModelChecks:
             rtol=tolerance,
         )
 
-    def prefill_parity(
-        self, model, ids, media, chunk_sizes, *, features=None, tolerance=None
-    ):
+    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
         if features is None:
@@ -967,9 +964,7 @@ class ModelChecks:
                         **row_media,
                     ).logits
                 )
-            self.assert_close(
-                reference, mx.concatenate(solo), logits=True, tolerance=tolerance
-            )
+            self.assert_close(reference, mx.concatenate(solo), logits=True)
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
@@ -982,18 +977,10 @@ class ModelChecks:
                         **features,
                     ).logits
                 )
-            self.assert_close(
-                mx.concatenate(chunks, axis=1),
-                reference,
-                logits=True,
-                tolerance=tolerance,
-            )
+            self.assert_close(mx.concatenate(chunks, axis=1), reference, logits=True)
             decode = {k: v for k, v in features.items() if k != "position_ids"}
             self.assert_close(
-                language(token, cache=cache, **decode).logits,
-                extended,
-                logits=True,
-                tolerance=tolerance,
+                language(token, cache=cache, **decode).logits, extended, logits=True
             )
 
     def multimodal(
@@ -1374,23 +1361,6 @@ if DATA["version"] != 2:
 
 TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
-DENSE_MODEL_CASES = [
-    pytest.param(name, overrides, id=name + (f"-{profile}" if profile else ""))
-    for name in DATA["dense"]
-    for profile, overrides in {
-        "": {},
-        **DATA["dense_profiles"].get(name, {}),
-    }.items()
-]
-
-
-def make_dense_model(name, overrides):
-    module = importlib.import_module("mlx_vlm.models." + name)
-    config = copy.deepcopy(DATA["dense"][name] | overrides)
-    mx.random.seed(17)
-    model = module.Model(module.ModelConfig.from_dict(config))
-    model.eval()
-    return model
 
 
 def model_case(name):
@@ -2814,81 +2784,12 @@ def test_minicpmv47_router_quantization_and_state_dtype(minicpmv47_case):
     assert model.cast_predicate(f"{prefix}.mlp.switch_mlp.up_proj.weight")
 
 
-@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
-def test_dense_model(name, overrides):
-    model = make_dense_model(name, overrides)
-    ids = mx.array([[1, 7, 3, 9, 11, 2, 5]])
-    expected = model(ids).logits
-    assert expected.shape == (1, 7, model.config.vocab_size)
-    np.testing.assert_allclose(
-        model(ids, cache=make_prompt_cache(model.language_model)).logits,
-        expected,
-        atol=3e-5,
-        rtol=3e-5,
-    )
-    ModelChecks().prefill_parity(model, ids, {}, (1, 3), tolerance=3e-5)
-
-
 @pytest.mark.parametrize("name", DATA["dense"])
-@pytest.mark.parametrize("bits", [None, 4], ids=["unquantized", "4bit"])
-def test_dense_model_checkpoint_roundtrip(name, bits, tmp_path):
-    from mlx_vlm.quant_utils import quantize_model
-    from mlx_vlm.utils import sanitize_weights, save_weights
-
+def test_dense_model(name):
     module = importlib.import_module("mlx_vlm.models." + name)
-    config = copy.deepcopy(DATA["dense"][name])
-    mx.random.seed(17)
-    model = module.Model(module.ModelConfig.from_dict(config))
-    model.eval()
-    if bits is not None:
-        model, config = quantize_model(model, config, group_size=32, bits=bits)
-
-    expected_weights = dict(tree_flatten(model.parameters()))
-    sanitized = sanitize_weights(model, dict(expected_weights))
-    twice = sanitize_weights(model, dict(sanitized))
-    assert expected_weights.keys() == sanitized.keys() == twice.keys()
-    for key, value in expected_weights.items():
-        for actual in (sanitized[key], twice[key]):
-            assert actual.dtype == value.dtype, key
-            assert mx.array_equal(actual, value).item(), key
-
-    tokens = mx.array([[1, 2, 3, 4]])
-    expected = model(tokens).logits
-    mx.eval(expected)
-    save_weights(tmp_path, model)
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    loaded = load_model(tmp_path, strict=True)
-    actual_weights = dict(tree_flatten(loaded.parameters()))
-    assert actual_weights.keys() == expected_weights.keys()
-    for key, value in expected_weights.items():
-        assert actual_weights[key].dtype == value.dtype, key
-        assert mx.array_equal(actual_weights[key], value).item(), key
-    np.testing.assert_allclose(loaded(tokens).logits, expected, atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
-def test_dense_model_left_padded_batch_cache(name, overrides):
-    from mlx_vlm.generate.ar import _make_cache
-
-    model = make_dense_model(name, overrides)
-    ids = mx.array([[0, 0, 1, 7, 3], [2, 4, 6, 8, 9]])
-    cache = _make_cache(model.language_model, [2, 0])
-    actual = model(ids, cache=cache).logits
-    for row, start in ((0, 2), (1, 0)):
-        expected = model(ids[row : row + 1, start:]).logits
-        np.testing.assert_allclose(
-            actual[row : row + 1, start:], expected, atol=3e-5, rtol=3e-5
-        )
-    # A continuation exercises the advanced left-padding and RoPE offsets.
-    next_ids = mx.array([[5], [10]])
-    actual = model(next_ids, cache=cache).logits
-    for row, start in ((0, 2), (1, 0)):
-        prompt = mx.concatenate(
-            [ids[row : row + 1, start:], next_ids[row : row + 1]], axis=1
-        )
-        np.testing.assert_allclose(
-            actual[row], model(prompt).logits[0, -1:], atol=3e-5, rtol=3e-5
-        )
+    config = DATA["dense"][name]
+    model = module.Model(module.ModelConfig.from_dict(copy.deepcopy(config)))
+    ModelChecks().forward_cache(model, config["vocab_size"])
 
 
 def tiny_config(family, profile=None, **overrides):

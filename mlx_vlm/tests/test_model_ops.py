@@ -156,9 +156,14 @@ def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
 
 class TestBailingHybridOps(unittest.TestCase):
     def make_model(self):
-        from mlx_vlm.tests.test_models import make_dense_model
+        from mlx_vlm.models.bailing_hybrid import Model, ModelConfig
+        from mlx_vlm.tests.test_models import DATA
 
-        return make_dense_model("bailing_hybrid", {})
+        config = ModelConfig.from_dict(copy.deepcopy(DATA["dense"]["bailing_hybrid"]))
+        mx.random.seed(17)
+        model = Model(config)
+        model.eval()
+        return model
 
     def test_grouped_router_with_negative_corrected_scores(self):
         model = self.make_model()
