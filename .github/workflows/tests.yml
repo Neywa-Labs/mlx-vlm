@@ -135,7 +135,6 @@ jobs:
               tests/test_oxr.py
               tests/test_position_embedding_resize.py
               tests/test_processors.py
-              tests/test_ricursive_math.py
               tests/test_speculative.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
