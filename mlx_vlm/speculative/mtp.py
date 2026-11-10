@@ -970,6 +970,18 @@ def _mtp_rounds(
     # on the first round picks position 0, which is BOS — they get away with
     # it because subsequent rounds slice into the per-call verify hidden, but
     # the round-1 acceptance is wasted. We don't replicate that quirk.)
+    kv_offset = _mtp_cache_offset_max(prompt_cache)
+    shared_kv = getattr(lm, "shared_kv_from_cache", None)
+    if callable(shared_kv):
+        shared_kv_states = shared_kv(prompt_cache)
+    draft_model.set_shared_kv(
+        shared_kv_states,
+        kv_offset,
+        position=_mtp_draft_position(kv_offset),
+        kv_valid_len=kv_offset,
+    )
+    shared_kv_states = None
+
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
         sampler_rng.draft_call(
@@ -985,18 +997,6 @@ def _mtp_rounds(
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
     hidden = _mtp_draft_hidden(lm, hidden)
-
-    kv_offset = _mtp_cache_offset_max(prompt_cache)
-    shared_kv = getattr(lm, "shared_kv_from_cache", None)
-    if callable(shared_kv):
-        shared_kv_states = shared_kv(prompt_cache)
-    draft_model.set_shared_kv(
-        shared_kv_states,
-        kv_offset,
-        position=_mtp_draft_position(kv_offset),
-        kv_valid_len=kv_offset,
-    )
-    shared_kv_states = None
 
     if thinking_budget_criteria is not None:
         thinking_budget_criteria(first_bonus)
@@ -1289,6 +1289,23 @@ def _mtp_rounds_batch(
         and not _sampler_supports_positioned_target(sampler),
     )
 
+    # Per-row state. ``positions`` stores each row's valid target-KV length.
+    # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
+    # round.
+    shared_kv = getattr(lm, "shared_kv_from_cache", None)
+    shared_padding = _batch_cache_left_padding(prompt_cache)
+    if callable(shared_kv):
+        shared_kv_states = shared_kv(prompt_cache)
+        shared_padding = None
+    draft_model.set_shared_kv(
+        shared_kv_states,
+        kv_offset=L_prefill,
+        position=_mtp_draft_position(mx.array(positions)),
+        kv_valid_len=mx.array(positions),
+        left_padding=shared_padding,
+    )
+    shared_kv_states = None
+
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
         prefill_kwargs = _mtp_draft_kwargs(
@@ -1314,23 +1331,6 @@ def _mtp_rounds_batch(
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
     hidden = _mtp_draft_hidden(lm, hidden)
-
-    # Per-row state. ``positions`` stores each row's valid target-KV length.
-    # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
-    # round.
-    shared_kv = getattr(lm, "shared_kv_from_cache", None)
-    shared_padding = _batch_cache_left_padding(prompt_cache)
-    if callable(shared_kv):
-        shared_kv_states = shared_kv(prompt_cache)
-        shared_padding = None
-    draft_model.set_shared_kv(
-        shared_kv_states,
-        kv_offset=L_prefill,
-        position=_mtp_draft_position(mx.array(positions)),
-        kv_valid_len=mx.array(positions),
-        left_padding=shared_padding,
-    )
-    shared_kv_states = None
 
     b = first_bonus.tolist()
     for state, token in zip(thinking_budget_criteria or [], b):
