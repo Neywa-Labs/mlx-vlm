@@ -41,6 +41,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
+from mlx_vlm.tests.test_models import DENSE_MODEL_CASES, make_dense_model
 from mlx_vlm.utils import StoppingCriteria, ThinkingBudgetCriteria, load_processor
 
 # Generation, sampling, stopping criteria, structured logits, and thinking state.
@@ -191,6 +192,60 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
     )
 
     assert generator._apc_media_token_ids() == set()
+
+
+@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
+def test_dense_model_public_generation_api(name, overrides):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_vlm import generate
+    from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer
+
+    model = make_dense_model(name, overrides)
+    model.config.eos_token_id = []
+    # Keep the tokenizer's EOS outside model outputs to exercise the full budget.
+    eos = model.config.vocab_size
+    processor = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({f"t{i}": i for i in range(eos + 1)}, unk_token="t0")
+        ),
+        unk_token="t0",
+        pad_token="t0",
+        eos_token=f"t{eos}",
+    )
+    processor.detokenizer = NaiveStreamingDetokenizer(processor)
+    processor.stopping_criteria = StoppingCriteria([eos], processor)
+    result = generate(model, processor, "t1", max_tokens=3, verbose=False)
+    assert result.generation_tokens == 3
+    assert processor.stopping_criteria.eos_token_ids == [eos]
+
+
+@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
+def test_dense_model_generation_prefill_chunks_and_reset(name, overrides):
+    from mlx_vlm.generate.ar import generate_step
+
+    model = make_dense_model(name, overrides)
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    sequences = []
+    for chunk_size in (2, 128, 2):
+        sequences.append(
+            [
+                int(token)
+                for token, _ in generate_step(
+                    ids,
+                    model,
+                    None,
+                    None,
+                    max_tokens=4,
+                    prefill_step_size=chunk_size,
+                )
+            ]
+        )
+    assert len(sequences[0]) == 4
+    assert sequences[0] == sequences[1]
+    assert sequences[0] == sequences[2]
 
 
 class TestGenerationBatch:

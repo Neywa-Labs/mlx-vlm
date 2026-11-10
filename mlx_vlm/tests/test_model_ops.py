@@ -154,6 +154,109 @@ def test_mimo_v2_batched_vision_attention_matches_independent_sequences():
     assert mx.allclose(batched, independent)
 
 
+class TestBailingHybridOps(unittest.TestCase):
+    def make_model(self):
+        from mlx_vlm.tests.test_models import make_dense_model
+
+        return make_dense_model("bailing_hybrid", {})
+
+    def test_grouped_router_with_negative_corrected_scores(self):
+        model = self.make_model()
+        gate = model.layers[1].mlp.gate
+        gate.weight = mx.random.normal(gate.weight.shape) * 0.1
+        gate.expert_bias = mx.array([-2.0, -2.1, -2.2, -2.3, -3.0, -3.1, -3.2, -3.3])
+        x = mx.random.normal((2, 3, 64))
+        indices, weights = gate(x)
+        scores = 1 / (1 + np.exp(-np.asarray(x) @ np.asarray(gate.weight).T))
+        corrected = scores + np.asarray(gate.expert_bias)
+        grouped = corrected.reshape(2, 3, 2, 4)
+        groups = np.argsort(np.sort(grouped, axis=-1)[..., -2:].sum(-1), axis=-1)[
+            ..., -1
+        ]
+        selected = np.where(np.arange(2) == groups[..., None], True, False)
+        corrected = np.where(selected[..., None], grouped, -np.inf).reshape(2, 3, 8)
+        expected_indices = np.argsort(corrected, axis=-1)[..., -2:]
+        np.testing.assert_array_equal(
+            np.sort(indices, axis=-1), np.sort(expected_indices, axis=-1)
+        )
+        expected_weights = np.take_along_axis(scores, np.asarray(indices), axis=-1)
+        expected_weights *= 2.5 / expected_weights.sum(-1, keepdims=True)
+        np.testing.assert_allclose(weights, expected_weights, atol=1e-6)
+
+    def test_kda_against_numpy_recurrence(self):
+        model = self.make_model()
+        attn = model.layers[0].attention
+        x = mx.random.normal((1, 5, 64))
+        attn.A_log = mx.random.uniform(-1, 1, (2,))
+        attn.dt_bias = mx.random.uniform(-1, 1, (64,))
+        qkv = []
+        for name in ("q", "k", "v"):
+            projected = np.asarray(getattr(attn, f"{name}_proj")(x)).astype(np.float64)
+            weights = np.asarray(getattr(attn, f"{name}_conv1d").conv.weight)[..., 0]
+            padded = np.pad(projected, ((0, 0), (3, 0), (0, 0)))
+            y = sum(padded[:, j : j + 5] * weights[:, j] for j in range(4))
+            qkv.append((y / (1 + np.exp(-y))).reshape(1, 5, 2, 32))
+        q, k, v = qkv
+        q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(32)
+        k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+        a = np.asarray(attn.f_proj(x)).reshape(1, 5, 2, 32).astype(np.float64)
+        a = np.exp(np.asarray(attn.A_log))[None, None, :, None] * (
+            a + np.asarray(attn.dt_bias).reshape(2, 32)
+        )
+        decay = np.exp(-5 / (1 + np.exp(-a)))
+        beta = 1 / (1 + np.exp(-np.asarray(attn.b_proj(x))))
+        state = np.zeros((1, 2, 32, 32), dtype=np.float64)
+        outputs = []
+        for t in range(5):
+            state *= decay[:, t, :, :, None]
+            residual = v[:, t] - np.einsum("bhkv,bhk->bhv", state, k[:, t])
+            state += np.einsum("bhk,bhv->bhkv", k[:, t], residual * beta[:, t, :, None])
+            outputs.append(np.einsum("bhkv,bhk->bhv", state, q[:, t]))
+        out = np.stack(outputs, axis=1)
+        out = out / np.sqrt((out * out).mean(-1, keepdims=True) + 1e-6)
+        out *= np.asarray(attn.o_norm.weight)
+        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
+        expected = (out.reshape(1, 5, 64) * gate) @ np.asarray(attn.o_proj.weight).T
+        actual = attn(x)
+        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+        attn.train()  # Exercise the portable operations fallback as well.
+        np.testing.assert_allclose(attn(x), expected, atol=2e-5, rtol=2e-5)
+
+    def test_mla_against_expanded_attention(self):
+        model = self.make_model()
+        attn = model.layers[1].attention
+        x = mx.random.normal((1, 5, 64))
+        q = (
+            attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
+            .reshape(1, 5, 2, 48)
+            .transpose(0, 2, 1, 3)
+        )
+        latent, k_rot = mx.split(attn.kv_a_proj_with_mqa(x), [32], axis=-1)
+        latent = attn.kv_a_layernorm(latent)
+        # Explicit per-head K/V expansion, independent of absorbed decode.
+        keys = np.einsum(
+            "btl,hlk->bhtk", np.asarray(latent), np.asarray(attn.embed_q.weight)
+        )
+        values = np.einsum(
+            "btl,hvl->bhtv", np.asarray(latent), np.asarray(attn.unembed_out.weight)
+        )
+        q_rot = np.asarray(attn.rope(q[..., 32:]))
+        k_rot = np.asarray(attn.rope(k_rot[:, None]))
+        queries = np.concatenate([np.asarray(q[..., :32]), q_rot], -1)
+        keys = np.concatenate([keys, np.broadcast_to(k_rot, (1, 2, 5, 16))], -1)
+        scores = queries @ keys.swapaxes(-1, -2) / np.sqrt(48)
+        scores = np.where(np.tril(np.ones((5, 5), dtype=bool)), scores, -np.inf)
+        probs = np.exp(scores - scores.max(-1, keepdims=True))
+        probs /= probs.sum(-1, keepdims=True)
+        out = (probs @ values).transpose(0, 2, 1, 3)
+        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
+        expected = (out * gate[..., None]).reshape(1, 5, 64) @ np.asarray(
+            attn.dense.weight
+        ).T
+        mask = mx.array(np.tril(np.ones((5, 5), dtype=bool)))
+        np.testing.assert_allclose(attn(x, mask), expected, atol=2e-5, rtol=2e-5)
+
+
 # Attention kernels
 
 # Dims chosen only to steer the gate; they do not affect the attention maths.

@@ -917,12 +917,13 @@ class ModelChecks:
         self.assert_close(output.text_embeds, changed_padding.text_embeds)
         self.assert_close(mx.linalg.norm(output.text_embeds, axis=-1), mx.ones((1,)))
 
-    def assert_close(self, actual, expected, *, logits=False):
+    def assert_close(self, actual, expected, *, logits=False, tolerance=None):
         assert actual.shape == expected.shape
-        tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
-        # One-token attention uses a different Metal kernel from full prefill.
-        if logits:
-            tolerance = max(tolerance, 2e-3)
+        if tolerance is None:
+            tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
+            # One-token attention uses a different Metal kernel from full prefill.
+            if logits:
+                tolerance = max(tolerance, 2e-3)
         actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
         mx.eval(actual, expected)
         actual, expected = np.array(actual), np.array(expected)
@@ -934,7 +935,9 @@ class ModelChecks:
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
+    def prefill_parity(
+        self, model, ids, media, chunk_sizes, *, features=None, tolerance=None
+    ):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
         if features is None:
@@ -964,7 +967,9 @@ class ModelChecks:
                         **row_media,
                     ).logits
                 )
-            self.assert_close(reference, mx.concatenate(solo), logits=True)
+            self.assert_close(
+                reference, mx.concatenate(solo), logits=True, tolerance=tolerance
+            )
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
@@ -977,10 +982,18 @@ class ModelChecks:
                         **features,
                     ).logits
                 )
-            self.assert_close(mx.concatenate(chunks, axis=1), reference, logits=True)
+            self.assert_close(
+                mx.concatenate(chunks, axis=1),
+                reference,
+                logits=True,
+                tolerance=tolerance,
+            )
             decode = {k: v for k, v in features.items() if k != "position_ids"}
             self.assert_close(
-                language(token, cache=cache, **decode).logits, extended, logits=True
+                language(token, cache=cache, **decode).logits,
+                extended,
+                logits=True,
+                tolerance=tolerance,
             )
 
     def multimodal(
@@ -1361,6 +1374,23 @@ if DATA["version"] != 2:
 
 TINY_DEFAULTS = DATA["tiny_defaults"]
 TINY_MODELS = DATA["shared_configs"]
+DENSE_MODEL_CASES = [
+    pytest.param(name, overrides, id=name + (f"-{profile}" if profile else ""))
+    for name in DATA["dense"]
+    for profile, overrides in {
+        "": {},
+        **DATA["dense_profiles"].get(name, {}),
+    }.items()
+]
+
+
+def make_dense_model(name, overrides):
+    module = importlib.import_module("mlx_vlm.models." + name)
+    config = copy.deepcopy(DATA["dense"][name] | overrides)
+    mx.random.seed(17)
+    model = module.Model(module.ModelConfig.from_dict(config))
+    model.eval()
+    return model
 
 
 def model_case(name):
@@ -2784,12 +2814,19 @@ def test_minicpmv47_router_quantization_and_state_dtype(minicpmv47_case):
     assert model.cast_predicate(f"{prefix}.mlp.switch_mlp.up_proj.weight")
 
 
-@pytest.mark.parametrize("name", DATA["dense"])
-def test_dense_model(name):
-    module = importlib.import_module("mlx_vlm.models." + name)
-    config = DATA["dense"][name]
-    model = module.Model(module.ModelConfig.from_dict(copy.deepcopy(config)))
-    ModelChecks().forward_cache(model, config["vocab_size"])
+@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
+def test_dense_model(name, overrides):
+    model = make_dense_model(name, overrides)
+    ids = mx.array([[1, 7, 3, 9, 11, 2, 5]])
+    expected = model(ids).logits
+    assert expected.shape == (1, 7, model.config.vocab_size)
+    np.testing.assert_allclose(
+        model(ids, cache=make_prompt_cache(model.language_model)).logits,
+        expected,
+        atol=3e-5,
+        rtol=3e-5,
+    )
+    ModelChecks().prefill_parity(model, ids, {}, (1, 3), tolerance=3e-5)
 
 
 @pytest.mark.parametrize("name", DATA["dense"])
@@ -2829,206 +2866,29 @@ def test_dense_model_checkpoint_roundtrip(name, bits, tmp_path):
     np.testing.assert_allclose(loaded(tokens).logits, expected, atol=1e-6, rtol=1e-6)
 
 
-class TestBailingHybrid(unittest.TestCase):
-    def make_model(self, **overrides):
-        from mlx_vlm.models.bailing_hybrid import Model, ModelConfig
+@pytest.mark.parametrize("name,overrides", DENSE_MODEL_CASES)
+def test_dense_model_left_padded_batch_cache(name, overrides):
+    from mlx_vlm.generate.ar import _make_cache
 
-        config = copy.deepcopy(DATA["dense"]["bailing_hybrid"])
-        config.update(overrides)
-        mx.random.seed(17)
-        model = Model(ModelConfig.from_dict(config))
-        model.eval()
-        return model
-
-    def test_public_generation_api(self):
-        from tokenizers import Tokenizer
-        from tokenizers.models import WordLevel
-        from transformers import PreTrainedTokenizerFast
-
-        from mlx_vlm import generate
-        from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer
-        from mlx_vlm.utils import StoppingCriteria
-
-        processor = PreTrainedTokenizerFast(
-            tokenizer_object=Tokenizer(
-                WordLevel({f"t{i}": i for i in range(128)}, unk_token="t0")
-            ),
-            unk_token="t0",
-            pad_token="t0",
-            eos_token="t127",
+    model = make_dense_model(name, overrides)
+    ids = mx.array([[0, 0, 1, 7, 3], [2, 4, 6, 8, 9]])
+    cache = _make_cache(model.language_model, [2, 0])
+    actual = model(ids, cache=cache).logits
+    for row, start in ((0, 2), (1, 0)):
+        expected = model(ids[row : row + 1, start:]).logits
+        np.testing.assert_allclose(
+            actual[row : row + 1, start:], expected, atol=3e-5, rtol=3e-5
         )
-        processor.detokenizer = NaiveStreamingDetokenizer(processor)
-        processor.stopping_criteria = StoppingCriteria([127], processor)
-        model = self.make_model(eos_token_id=[])
-        result = generate(model, processor, "t1", max_tokens=3, verbose=False)
-        self.assertEqual(result.generation_tokens, 3)
-        self.assertEqual(processor.stopping_criteria.eos_token_ids, [127])
-
-    def test_generation_prefill_chunks_and_reset(self):
-        from mlx_vlm.generate.ar import generate_step
-
-        model = self.make_model()
-        ids = mx.array([[1, 2, 3, 4, 5]])
-        sequences = []
-        for chunk_size in (2, 128, 2):
-            sequences.append(
-                [
-                    int(token)
-                    for token, _ in generate_step(
-                        ids,
-                        model,
-                        None,
-                        None,
-                        max_tokens=4,
-                        prefill_step_size=chunk_size,
-                    )
-                ]
-            )
-        self.assertEqual(len(sequences[0]), 4)
-        self.assertEqual(sequences[0], sequences[1])
-        self.assertEqual(sequences[0], sequences[2])
-
-    def test_grouped_router_with_negative_corrected_scores(self):
-        model = self.make_model()
-        gate = model.layers[1].mlp.gate
-        gate.weight = mx.random.normal(gate.weight.shape) * 0.1
-        gate.expert_bias = mx.array([-2.0, -2.1, -2.2, -2.3, -3.0, -3.1, -3.2, -3.3])
-        x = mx.random.normal((2, 3, 64))
-        indices, weights = gate(x)
-        scores = 1 / (1 + np.exp(-np.asarray(x) @ np.asarray(gate.weight).T))
-        corrected = scores + np.asarray(gate.expert_bias)
-        grouped = corrected.reshape(2, 3, 2, 4)
-        groups = np.argsort(np.sort(grouped, axis=-1)[..., -2:].sum(-1), axis=-1)[
-            ..., -1
-        ]
-        selected = np.where(np.arange(2) == groups[..., None], True, False)
-        corrected = np.where(selected[..., None], grouped, -np.inf).reshape(2, 3, 8)
-        expected_indices = np.argsort(corrected, axis=-1)[..., -2:]
-        np.testing.assert_array_equal(
-            np.sort(indices, axis=-1), np.sort(expected_indices, axis=-1)
+    # A continuation exercises the advanced left-padding and RoPE offsets.
+    next_ids = mx.array([[5], [10]])
+    actual = model(next_ids, cache=cache).logits
+    for row, start in ((0, 2), (1, 0)):
+        prompt = mx.concatenate(
+            [ids[row : row + 1, start:], next_ids[row : row + 1]], axis=1
         )
-        expected_weights = np.take_along_axis(scores, np.asarray(indices), axis=-1)
-        expected_weights *= 2.5 / expected_weights.sum(-1, keepdims=True)
-        np.testing.assert_allclose(weights, expected_weights, atol=1e-6)
-
-    def test_chunked_and_token_cache_parity(self):
-        for low_rank in (False, True):
-            model = self.make_model(no_kda_lora=not low_rank)
-            ids = mx.array([[1, 7, 3, 9, 11, 2, 5]])
-            expected = model(ids).logits
-            for chunk_size in (1, 3, 6):
-                cache = model.make_cache()
-                actual = mx.concatenate(
-                    [
-                        model(ids[:, i : i + chunk_size], cache=cache).logits
-                        for i in range(0, 7, chunk_size)
-                    ],
-                    axis=1,
-                )
-                np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
-
-    def test_left_padded_batch_cache(self):
-        from mlx_vlm.models.cache import ArraysCache, BatchKVCache
-
-        model = self.make_model()
-        ids = mx.array([[0, 0, 1, 7, 3], [2, 4, 6, 8, 9]])
-        cache = [
-            (
-                ArraysCache(4, left_padding=[2, 0])
-                if layer.is_linear
-                else BatchKVCache([2, 0])
-            )
-            for layer in model.layers
-        ]
-        actual = model(ids, cache=cache).logits
-        for row, start in ((0, 2), (1, 0)):
-            expected = model(ids[row : row + 1, start:]).logits
-            np.testing.assert_allclose(
-                actual[row : row + 1, start:], expected, atol=3e-5, rtol=3e-5
-            )
-        # A continuation exercises the advanced left-padding and RoPE offsets.
-        next_ids = mx.array([[5], [10]])
-        actual = model(next_ids, cache=cache).logits
-        for row, start in ((0, 2), (1, 0)):
-            prompt = mx.concatenate(
-                [ids[row : row + 1, start:], next_ids[row : row + 1]], axis=1
-            )
-            np.testing.assert_allclose(
-                actual[row], model(prompt).logits[0, -1:], atol=3e-5, rtol=3e-5
-            )
-
-    def test_kda_against_numpy_recurrence(self):
-        model = self.make_model()
-        attn = model.layers[0].attention
-        x = mx.random.normal((1, 5, 64))
-        attn.A_log = mx.random.uniform(-1, 1, (2,))
-        attn.dt_bias = mx.random.uniform(-1, 1, (64,))
-        qkv = []
-        for name in ("q", "k", "v"):
-            projected = np.asarray(getattr(attn, f"{name}_proj")(x)).astype(np.float64)
-            weights = np.asarray(getattr(attn, f"{name}_conv1d").conv.weight)[..., 0]
-            padded = np.pad(projected, ((0, 0), (3, 0), (0, 0)))
-            y = sum(padded[:, j : j + 5] * weights[:, j] for j in range(4))
-            qkv.append((y / (1 + np.exp(-y))).reshape(1, 5, 2, 32))
-        q, k, v = qkv
-        q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(32)
-        k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
-        a = np.asarray(attn.f_proj(x)).reshape(1, 5, 2, 32).astype(np.float64)
-        a = np.exp(np.asarray(attn.A_log))[None, None, :, None] * (
-            a + np.asarray(attn.dt_bias).reshape(2, 32)
+        np.testing.assert_allclose(
+            actual[row], model(prompt).logits[0, -1:], atol=3e-5, rtol=3e-5
         )
-        decay = np.exp(-5 / (1 + np.exp(-a)))
-        beta = 1 / (1 + np.exp(-np.asarray(attn.b_proj(x))))
-        state = np.zeros((1, 2, 32, 32), dtype=np.float64)
-        outputs = []
-        for t in range(5):
-            state *= decay[:, t, :, :, None]
-            residual = v[:, t] - np.einsum("bhkv,bhk->bhv", state, k[:, t])
-            state += np.einsum("bhk,bhv->bhkv", k[:, t], residual * beta[:, t, :, None])
-            outputs.append(np.einsum("bhkv,bhk->bhv", state, q[:, t]))
-        out = np.stack(outputs, axis=1)
-        out = out / np.sqrt((out * out).mean(-1, keepdims=True) + 1e-6)
-        out *= np.asarray(attn.o_norm.weight)
-        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
-        expected = (out.reshape(1, 5, 64) * gate) @ np.asarray(attn.o_proj.weight).T
-        actual = attn(x)
-        np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
-        attn.train()  # Exercise the portable operations fallback as well.
-        np.testing.assert_allclose(attn(x), expected, atol=2e-5, rtol=2e-5)
-
-    def test_mla_against_expanded_attention(self):
-        model = self.make_model()
-        attn = model.layers[1].attention
-        x = mx.random.normal((1, 5, 64))
-        q = (
-            attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(x)))
-            .reshape(1, 5, 2, 48)
-            .transpose(0, 2, 1, 3)
-        )
-        latent, k_rot = mx.split(attn.kv_a_proj_with_mqa(x), [32], axis=-1)
-        latent = attn.kv_a_layernorm(latent)
-        # Explicit per-head K/V expansion, independent of absorbed decode.
-        keys = np.einsum(
-            "btl,hlk->bhtk", np.asarray(latent), np.asarray(attn.embed_q.weight)
-        )
-        values = np.einsum(
-            "btl,hvl->bhtv", np.asarray(latent), np.asarray(attn.unembed_out.weight)
-        )
-        q_rot = np.asarray(attn.rope(q[..., 32:]))
-        k_rot = np.asarray(attn.rope(k_rot[:, None]))
-        queries = np.concatenate([np.asarray(q[..., :32]), q_rot], -1)
-        keys = np.concatenate([keys, np.broadcast_to(k_rot, (1, 2, 5, 16))], -1)
-        scores = queries @ keys.swapaxes(-1, -2) / np.sqrt(48)
-        scores = np.where(np.tril(np.ones((5, 5), dtype=bool)), scores, -np.inf)
-        probs = np.exp(scores - scores.max(-1, keepdims=True))
-        probs /= probs.sum(-1, keepdims=True)
-        out = (probs @ values).transpose(0, 2, 1, 3)
-        gate = 1 / (1 + np.exp(-np.asarray(attn.g_proj(x))))
-        expected = (out * gate[..., None]).reshape(1, 5, 64) @ np.asarray(
-            attn.dense.weight
-        ).T
-        mask = mx.array(np.tril(np.ones((5, 5), dtype=bool)))
-        np.testing.assert_allclose(attn(x, mask), expected, atol=2e-5, rtol=2e-5)
 
 
 def tiny_config(family, profile=None, **overrides):
