@@ -1665,7 +1665,7 @@ def test_ricursive_cache_batch_lifecycle(window):
 @parametrize("bits", [2, 4, 8])
 @parametrize("batch,length", [(2, 3), (4, 5), (8, 8)])
 def test_native_affine_batch_projection(dtype, bits, batch, length):
-    from mlx_vlm.models.quantized_batch import native_affine_batch_linear
+    from mlx_vlm.models.quantized import native_affine_batch_linear
 
     mx.random.seed(131)
     for group_size, outputs in [(32, 67), (64, 1024), (128, 256)]:
@@ -1695,7 +1695,7 @@ def test_native_affine_batch_projection(dtype, bits, batch, length):
 )
 @parametrize("batch,length", [(1, 3), (2, 4), (4, 5), (8, 8)])
 def test_native_block_projection(dtype, batch, length, kind):
-    from mlx_vlm.models.linear_batch import native_block_linear
+    from mlx_vlm.models.linear import native_block_linear
 
     mx.random.seed(1337)
     for inputs, outputs in [(1024, 67), (1024, 2048), (4096, 512)]:
