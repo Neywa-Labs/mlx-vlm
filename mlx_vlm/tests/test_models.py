@@ -20,7 +20,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict
 from fnmatch import fnmatchcase
 from operator import attrgetter
@@ -2960,8 +2960,33 @@ def _make_distributed_test_model(family, dtype):
     return model
 
 
+def _distributed_model_outputs(model, stage):
+    outputs = {}
+    for batch in (1, 4):
+        cache = make_prompt_cache(model)
+        for step, tokens in enumerate(
+            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
+        ):
+            stage(f"batch={batch} step={step}")
+            ids = mx.array(
+                [
+                    [(t + row) % model.args.vocab_size for t in tokens]
+                    for row in range(batch)
+                ]
+            )
+            logits = model(ids, cache=cache).logits
+            mx.eval(logits)
+            # NumPy cannot represent BF16. This lossless conversion also keeps
+            # validation off the GPU shared by the local distributed ranks.
+            with mx.stream(mx.cpu):
+                outputs[f"batch={batch}-step={step}"] = np.array(
+                    logits.astype(mx.float32)
+                )
+    return outputs
+
+
 def _distributed_model_worker(family, dtype_name):
-    # Report a stalled rank when the CI run is cancelled, without a time limit.
+    # Dump each rank's stack before the parent kills a stalled process group.
     faulthandler.register(signal.SIGTERM, chain=True)
 
     def stage(name):
@@ -3013,61 +3038,70 @@ def _distributed_model_worker(family, dtype_name):
         for name in names:
             assert local_weights[name].size * group.size() == weights[name].size, name
 
-    records = []
-    # Keep model-specific reference tolerances in the fixture. Every rank must
-    # return identical logits; MiniMax also requires exact BF16 reference parity.
-    tolerance = options["tolerances"][dtype_name]
-    vocab_size = reference.args.vocab_size
-    for batch in (1, 4):
-        actual_cache = make_prompt_cache(sharded)
-        expected_cache = make_prompt_cache(reference)
-        for step, tokens in enumerate(
-            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
-        ):
-            stage(f"batch={batch} step={step} reference")
-            ids = mx.array(
-                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
-            )
-            expected = reference(ids, cache=expected_cache).logits
-            mx.eval(expected)
-            stage(f"batch={batch} step={step} barrier")
-            host_barrier(f"reference-{batch}-{step}")
-            stage(f"batch={batch} step={step} sharded")
-            actual = sharded(ids, cache=actual_cache).logits
-            mx.eval(actual)
-            host_barrier(f"actual-{batch}-{step}")
-            stage(f"batch={batch} step={step} gather")
-            gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
-            mx.eval(gathered)
-            ranks_agree = all(
-                mx.array_equal(
-                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
-                ).item()
-                for rank in range(1, group.size())
-            )
-            records.append(
-                dict(
-                    batch=batch,
-                    step=step,
-                    max_error=mx.max(mx.abs(actual - expected)).item(),
-                    ranks_agree=ranks_agree,
-                    passed=mx.allclose(
-                        actual, expected, atol=tolerance, rtol=tolerance
-                    ).item(),
-                )
-            )
-    host_barrier("checks")
-    passed = mx.distributed.all_sum(
-        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
-        group=group,
-        stream=mx.cpu,
-    ).item()
-    print(
-        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
-        flush=True,
+    # Evaluate the identical reference once, while the other ranks are idle.
+    # Separate reference and distributed GPU work instead of alternating them
+    # with test-only CPU collectives on every decoding step.
+    if group.rank() == 0:
+        stage("reference outputs")
+        np.savez(
+            barrier_dir / "reference.npz",
+            **_distributed_model_outputs(reference, stage),
+        )
+    del reference, weights, local_weights
+    host_barrier("reference-ready")
+    stage("sharded outputs")
+    np.savez(
+        barrier_dir / f"rank-{group.rank()}.npz",
+        **_distributed_model_outputs(sharded, stage),
     )
-    assert passed == group.size(), records
+    host_barrier("outputs-ready")
     stage("completed")
+
+
+def _check_distributed_model_outputs(expected, ranks, tolerance):
+    # Keep the fixture tolerances and exact rank agreement. In particular,
+    # MiniMax BF16 must still match the unsharded reference exactly.
+    for rank, actual in enumerate(ranks):
+        assert set(actual) == set(expected), f"rank={rank}: missing or extra outputs"
+        for step, reference in expected.items():
+            message = f"rank={rank} {step}"
+            assert actual[step].shape == reference.shape, message
+            np.testing.assert_allclose(
+                actual[step],
+                reference,
+                atol=tolerance,
+                rtol=tolerance,
+                equal_nan=False,
+                err_msg=message,
+            )
+            np.testing.assert_array_equal(actual[step], ranks[0][step], err_msg=message)
+
+
+def _run_distributed_command(command, *, cwd, env, timeout=120):
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                output, _ = process.communicate()
+            pytest.fail(f"Distributed workers timed out after {timeout}s:\n{output}")
+        finally:
+            # Also clean up peers on assertion failures or interrupted pytest.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        assert process.returncode == 0, output
 
 
 def _run_distributed_model_test(family, dtype, world_size):
@@ -3108,7 +3142,7 @@ def _run_distributed_model_test(family, dtype, world_size):
         dtype,
     ]
     with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
-        process = subprocess.Popen(
+        _run_distributed_command(
             command,
             cwd=repo,
             env=dict(
@@ -3116,16 +3150,70 @@ def _run_distributed_model_test(family, dtype, world_size):
                 PYTHONPATH=str(repo),
                 MLX_TEST_BARRIER_DIR=barrier_dir,
             ),
-            stdout=subprocess.PIPE,
-            text=True,
         )
-        output, _ = process.communicate()
-    assert process.returncode == 0, output
-    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
-    assert len(records) == world_size, output
-    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
-        range(world_size)
-    ), output
+        with ExitStack() as stack:
+            expected = stack.enter_context(np.load(Path(barrier_dir) / "reference.npz"))
+            ranks = [
+                stack.enter_context(np.load(Path(barrier_dir) / f"rank-{rank}.npz"))
+                for rank in range(world_size)
+            ]
+            _check_distributed_model_outputs(
+                expected, ranks, TINY_MODELS[family]["distributed"]["tolerances"][dtype]
+            )
+
+
+@pytest.mark.parametrize("error", ["reference", "rank", "missing", "shape", "nan"])
+def test_distributed_output_validation_rejects_errors(error):
+    expected = {"batch=1-step=0": np.ones((1, 2), dtype=np.float32)}
+    ranks = [copy.deepcopy(expected) for _ in range(2)]
+    if error == "reference":
+        for actual in ranks:
+            actual["batch=1-step=0"] += 1
+    elif error == "rank":
+        # Within reference tolerance, but ranks must agree exactly.
+        ranks[1]["batch=1-step=0"] += 1e-5
+    elif error == "missing":
+        ranks[1].clear()
+    elif error == "shape":
+        ranks[1]["batch=1-step=0"] = np.ones((1, 1), dtype=np.float32)
+    else:
+        ranks[1]["batch=1-step=0"][0, 0] = np.nan
+    with pytest.raises(AssertionError):
+        _check_distributed_model_outputs(expected, ranks, 1e-4)
+
+
+def test_distributed_output_validation_preserves_tolerances():
+    expected = {"batch=1-step=0": np.ones((1, 2), dtype=np.float32)}
+    ranks = [{key: value + 1e-5 for key, value in expected.items()} for _ in range(2)]
+    _check_distributed_model_outputs(expected, ranks, 1e-4)
+    with pytest.raises(AssertionError):
+        _check_distributed_model_outputs(expected, ranks, 0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+def test_distributed_worker_timeout_cleans_up_ranks(tmp_path):
+    command = [
+        sys.executable,
+        "-c",
+        textwrap.dedent("""
+            import os, signal, subprocess, sys, time
+            from pathlib import Path
+
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+            def terminate(signum, frame):
+                child.wait()
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, terminate)
+            Path('pids').write_text(f'{os.getpid()} {child.pid}')
+            print('rank is stalled', flush=True)
+            time.sleep(60)
+            """),
+    ]
+    with pytest.raises(pytest.fail.Exception, match="timed out.*2s:\nrank is stalled"):
+        _run_distributed_command(command, cwd=tmp_path, env=os.environ, timeout=2)
+    for pid in (tmp_path / "pids").read_text().split():
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid), 0)
 
 
 @pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
