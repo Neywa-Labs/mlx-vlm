@@ -4304,3 +4304,194 @@ def test_speculative_lifetime_counters_survive_reset():
     snapshot = common.speculative_stats_snapshot(drafter)
     common._record_speculative_round(drafter, 2, 7)
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
+
+
+def _tiny_ernie_echo():
+    from mlx_vlm.models.ernie5_5_moe import Model as Target
+    from mlx_vlm.models.ernie5_5_moe import ModelConfig as TargetConfig
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model as Draft
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import ModelConfig as DraftConfig
+    from mlx_vlm.tests.test_models import model_case
+
+    mx.random.seed(55)
+    config = TargetConfig.from_dict(model_case("ernie5_5_moe")["config"])
+    target = Target(config)
+    draft = Draft(DraftConfig(text_config=config))
+    mx.eval(target.parameters(), draft.parameters())
+    return target, draft
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("prompt_length", [7, 8, 10])
+@pytest.mark.parametrize("accepted", [0, 2, 4])
+def test_ernie_echo_rollback_matches_committed_prefix(
+    batch_size, prompt_length, accepted
+):
+    import numpy as np
+
+    from mlx_vlm.generate.ar import _make_cache
+
+    target, _ = _tiny_ernie_echo()
+    lm = target.language_model
+    padding = [3, 0] if batch_size == 2 else [0]
+    cache = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    reference = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    prompt = mx.broadcast_to(
+        mx.arange(prompt_length)[None], (batch_size, prompt_length)
+    )
+    lm(prompt, cache=cache)
+    lm(prompt, cache=reference)
+    block = mx.broadcast_to(mx.arange(5)[None] + 15, (batch_size, 5))
+    hidden, _, state = lm.speculative_verify_hidden(block, cache)
+    mx.eval(hidden)
+    lm.rollback_speculative_cache(cache, state, [accepted] * batch_size, 5)
+    lm(block[:, : accepted + 1], cache=reference)
+    probe = mx.full((batch_size, 3), 21)
+    actual = lm(probe, cache=cache).logits
+    expected = lm(probe, cache=reference).logits
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    assert mx.array_equal(
+        mtp._mtp_cache_offset(cache), mtp._mtp_cache_offset(reference)
+    )
+    from mlx_vlm.models.cache import BatchPoolingCache
+
+    for actual_layer, expected_layer in zip(cache, reference):
+        for a, b in zip(actual_layer.caches, expected_layer.caches):
+            if isinstance(a, BatchPoolingCache):
+                # Transactions may compact unused physical pool columns. Compare
+                # every row's valid history, not allocator padding.
+                assert a._pool_lengths == b._pool_lengths
+                assert a.remainder == b.remainder
+                pairs = [
+                    (a.extract(i).state, b.extract(i).state) for i in range(batch_size)
+                ]
+            else:
+                pairs = [(a.state, b.state)]
+            for actual_state, expected_state in pairs:
+                for x, y in zip(
+                    tree_flatten(actual_state), tree_flatten(expected_state)
+                ):
+                    if isinstance(x[1], mx.array) and isinstance(y[1], mx.array):
+                        np.testing.assert_allclose(x[1], y[1], atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("prompt_length", [7, 8])
+@pytest.mark.parametrize("draft_behavior", ["learned", "accept_all", "reject_all"])
+def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
+    from mlx_vlm.generate.ar import generate_step
+
+    target, draft = _tiny_ernie_echo()
+    prompt = mx.arange(prompt_length)[None]
+    expected = [
+        int(t)
+        for t, _ in generate_step(
+            prompt, target, None, None, max_tokens=25, temperature=0
+        )
+    ]
+    if draft_behavior != "learned":
+        original = draft.draft_block
+
+        def force_tokens(
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype=mx.int32,
+            greedy=False,
+        ):
+            original(
+                last_bonus, hidden, cache, block_size, sampler, token_dtype, greedy
+            )
+            position = (
+                draft._cache[0].offset - draft._round_appended - prompt_length + 1
+            )
+            tokens = expected[position : position + block_size - 1]
+            if draft_behavior == "reject_all":
+                tokens = [(t + 1) % target.config.vocab_size for t in tokens]
+            return mx.array([tokens])
+
+        draft.draft_block = force_tokens
+    for _ in range(2):
+        actual = [
+            int(t)
+            for t, _ in generate_step(
+                prompt,
+                target,
+                None,
+                None,
+                max_tokens=25,
+                temperature=0,
+                draft_model=draft,
+                draft_kind="mtp",
+                draft_block_size=3,
+            )
+        ]
+        assert actual == expected
+        assert draft.accept_lens
+        if draft_behavior == "accept_all":
+            assert draft.accept_lens == draft.draft_lens
+        elif draft_behavior == "reject_all":
+            assert set(draft.accept_lens) == {0}
+
+
+def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path):
+    import numpy as np
+
+    from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES
+    from mlx_vlm.speculative.drafters import load_drafter
+    from mlx_vlm.utils import load_model
+
+    target, draft = _tiny_ernie_echo()
+    original = dict(tree_flatten(draft.parameters()))
+    weights = dict(tree_flatten(target.parameters()))
+    prefix = f"model.layers.{target.config.num_hidden_layers}."
+    for source, dest in ECHO_WEIGHT_NAMES.items():
+        value = original[dest]
+        weights[prefix + source] = value.T if source == "hc_head_fn" else value
+    (tmp_path / "config.json").write_text(json.dumps(target.config.to_dict()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "mtp"
+    assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    for key, value in tree_flatten(loaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    # Ordinary conversion saves the loaded target's parameters, including echo.*.
+    converted = load_model(tmp_path)
+    assert converted.echo is not None
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(converted.parameters()))
+    )
+    reloaded, _ = load_drafter(str(tmp_path))
+    for key, value in tree_flatten(reloaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    converted_again = load_model(tmp_path)
+    inputs = mx.arange(9)[None]
+    np.testing.assert_allclose(
+        converted_again(inputs).logits, target(inputs).logits, atol=2e-5, rtol=2e-5
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(target.parameters()))
+    )
+    with pytest.raises(ValueError, match="No MTP tensors"):
+        load_drafter(str(tmp_path))
+
+
+def test_ernie_echo_shared_decoder_preserves_target_router():
+    target, draft = _tiny_ernie_echo()
+    original = target.layers[-1].ffn.e_score_correction_bias
+    draft.e_score_correction_bias = mx.arange(
+        target.config.n_routed_experts, dtype=mx.float32
+    )
+    draft.reset(target)
+    cache = target.make_cache()
+    inputs = mx.arange(9)[None]
+    out = target.language_model(inputs, cache=cache, return_hidden=True)
+    bonus = mx.argmax(out.logits[:, -1], axis=-1)
+    draft.set_shared_kv({}, 9, kv_valid_len=9)
+    draft.prefill_from_target_hidden(
+        inputs, out.hidden_states[-1], bonus, lambda x: mx.argmax(x, -1), greedy=True
+    )
+    mx.eval(draft.draft_eval_state())
+    assert target.layers[-1].ffn.e_score_correction_bias is original
+    assert draft._target.layers[-1] is target.layers[-1]

@@ -20,6 +20,8 @@ def make_quantization_config(config: dict) -> dict | None:
         isinstance(quantization, dict)
         and quantization.get("quant_method") == "fp8"
         and quantization.get("fmt", "e4m3") == "e4m3"
+        # UE8M0 byte scales need the model-specific decoder.
+        and quantization.get("scale_fmt") != "ue8m0"
         and quantization.get("weight_block_size") == [128, 128]
         and quantization.get("store_dtype", "fp8") == "fp8"
     )
