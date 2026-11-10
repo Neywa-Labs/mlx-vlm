@@ -2960,7 +2960,7 @@ def _make_distributed_test_model(family, dtype):
     return model
 
 
-def _distributed_model_outputs(model, stage):
+def _distributed_model_outputs(model, stage, barrier=None):
     outputs = {}
     for batch in (1, 4):
         cache = make_prompt_cache(model)
@@ -2976,13 +2976,19 @@ def _distributed_model_outputs(model, stage):
             )
             logits = model(ids, cache=cache).logits
             mx.eval(logits)
-            # NumPy cannot represent BF16. This lossless conversion also keeps
-            # validation off the GPU shared by the local distributed ranks.
-            with mx.stream(mx.cpu):
-                outputs[f"batch={batch}-step={step}"] = np.array(
-                    logits.astype(mx.float32)
-                )
-    return outputs
+            key = f"batch={batch}-step={step}"
+            outputs[key] = logits
+            if barrier is not None:
+                # Finish this step on every rank before another rank can queue
+                # the next collective on the GPU they share.
+                barrier(key)
+    # Copy only after every rank has finished all GPU work. Interleaving CPU
+    # transfers with another rank's next GPU collective can deadlock Metal.
+    # FP32 preserves the BF16 values that NumPy cannot represent directly.
+    with mx.stream(mx.cpu):
+        return {
+            key: np.array(value.astype(mx.float32)) for key, value in outputs.items()
+        }
 
 
 def _distributed_model_worker(family, dtype_name):
@@ -3052,7 +3058,7 @@ def _distributed_model_worker(family, dtype_name):
     stage("sharded outputs")
     np.savez(
         barrier_dir / f"rank-{group.rank()}.npz",
-        **_distributed_model_outputs(sharded, stage),
+        **_distributed_model_outputs(sharded, stage, host_barrier),
     )
     host_barrier("outputs-ready")
     stage("completed")
@@ -3102,6 +3108,7 @@ def _run_distributed_command(command, *, cwd, env, timeout=120):
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
         assert process.returncode == 0, output
+        return output
 
 
 def _run_distributed_model_test(family, dtype, world_size):
@@ -3142,7 +3149,7 @@ def _run_distributed_model_test(family, dtype, world_size):
         dtype,
     ]
     with tempfile.TemporaryDirectory(prefix="mlx-vlm-distributed-") as barrier_dir:
-        _run_distributed_command(
+        output = _run_distributed_command(
             command,
             cwd=repo,
             env=dict(
@@ -3151,12 +3158,16 @@ def _run_distributed_model_test(family, dtype, world_size):
                 MLX_TEST_BARRIER_DIR=barrier_dir,
             ),
         )
+        # The MLX launcher can return zero after a worker exits unsuccessfully.
+        # Require every result and retain its diagnostics instead of hiding the
+        # original worker failure behind a NumPy FileNotFoundError.
+        paths = [Path(barrier_dir) / "reference.npz"] + [
+            Path(barrier_dir) / f"rank-{rank}.npz" for rank in range(world_size)
+        ]
+        missing = [path.name for path in paths if not path.is_file()]
+        assert not missing, f"Distributed workers did not produce {missing}:\n{output}"
         with ExitStack() as stack:
-            expected = stack.enter_context(np.load(Path(barrier_dir) / "reference.npz"))
-            ranks = [
-                stack.enter_context(np.load(Path(barrier_dir) / f"rank-{rank}.npz"))
-                for rank in range(world_size)
-            ]
+            expected, *ranks = [stack.enter_context(np.load(path)) for path in paths]
             _check_distributed_model_outputs(
                 expected, ranks, TINY_MODELS[family]["distributed"]["tolerances"][dtype]
             )
@@ -3188,6 +3199,33 @@ def test_distributed_output_validation_preserves_tolerances():
     _check_distributed_model_outputs(expected, ranks, 1e-4)
     with pytest.raises(AssertionError):
         _check_distributed_model_outputs(expected, ranks, 0)
+
+
+def test_distributed_outputs_finish_gpu_steps_before_cpu_transfers():
+    barriers = []
+    model = MagicMock(args=NS(vocab_size=32))
+    model.make_cache.return_value = []
+    model.side_effect = lambda ids, cache: NS(logits=ids.astype(mx.bfloat16))
+    to_numpy = np.array
+
+    def copy_output(value):
+        assert len(barriers) == 10, "CPU transfer overlaps a peer's next GPU step"
+        return to_numpy(value)
+
+    with patch.object(np, "array", side_effect=copy_output):
+        outputs = _distributed_model_outputs(model, lambda _: None, barriers.append)
+    assert list(outputs) == barriers
+    assert outputs["batch=4-step=4"].shape == (4, 3)
+
+
+def test_distributed_worker_missing_output_preserves_diagnostics():
+    def failed_worker(command, *, cwd, env):
+        np.savez(Path(env["MLX_TEST_BARRIER_DIR"]) / "reference.npz", logits=[1])
+        return "rank 0: synthetic worker failure"
+
+    with patch(__name__ + "._run_distributed_command", side_effect=failed_worker):
+        with pytest.raises(AssertionError, match="rank 0: synthetic worker failure"):
+            _run_distributed_model_test("minimax_m3", "float32", 2)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
