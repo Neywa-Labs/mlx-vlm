@@ -39,7 +39,7 @@ python -m mlx_vlm.generate \
 
 The block size includes the target bonus token: `3` proposes two draft tokens. The loader automatically identifies ECHO as an MTP drafter. Standard conversion preserves its auxiliary weights; older conversions that discarded them must be regenerated from a checkpoint containing those tensors.
 
-ECHO is opt-in. After promoting the vocabulary head once at loading, it improves throughput in the batch-1 measurements and the batch-4/128-token case below. Mixed-precision block evaluation can still change greedy outputs relative to ordinary decoding.
+ECHO is opt-in. The fresh checkpoint check below improves throughput at batch 1; ordinary decoding is faster in both batch-4 cases. Mixed-precision block evaluation can still change greedy outputs relative to ordinary decoding.
 
 ECHO shares the final MLA/MoE decoder layer, token embeddings, and vocabulary projection with the target. Its own projections, normalization, residual head, and expert-routing bias add approximately 67 MB of parameters. It maintains a separate latent KV cache. Verification uses shared cache transactions to retain accepted HCA pooling history and rewind rejected KV entries. Accepted draft cache entries are rebuilt using the verified target hidden states.
 
@@ -101,6 +101,19 @@ After the head-promotion fix, a paired comparison on the same machine and checkp
 | 4 | 512 | 40.39 | 30.80 | 0.76× | 20.5% |
 
 All 24 runs completed with the requested token counts and full batch occupancy. Outputs repeated exactly within each variant. Six of the ten distinct benchmark request sequences matched AR exactly; four diverged, first at output positions 0, 4, 9, or 18 (zero-based). Two additional 32-token natural-language streaming smoke tests matched exactly. A teacher-forced comparison of block verification with singleton forwards from identical initial caches found 22 top-token differences across 249 proposed positions, including rejected positions. These released mixed-precision results do not establish exact greedy parity. The FP32 reference checks above validate the implementation's equations separately. For batch 4 at 512 input tokens, ordinary decoding remains faster than the tested ECHO configurations.
+
+### Check after rebasing onto current main
+
+A fresh strict load on the rebased implementation repeated the same eight AR/ECHO configurations once each, after warmup. The hardware, checkpoint, allocator limit, prompt tokens, and 32-token output limits were unchanged. These are single-run checks, not three-run medians:
+
+| Batch | Input tokens per request | AR decode tok/s | ECHO decode tok/s | ECHO / AR |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 9.41 | 19.13 | 2.03× |
+| 1 | 512 | 9.42 | 17.38 | 1.84× |
+| 4 | 128 | 41.24 | 35.84 | 0.87× |
+| 4 | 512 | 40.76 | 24.35 | 0.60× |
+
+All cases completed with the requested token counts. Both natural-language streaming smoke tests matched AR for 32 tokens; six of ten benchmark request sequences matched between AR and ECHO. Peak MLX memory reached 180.70 GB, and swap usage stayed unchanged. The current shared runtime has lower batch-4 ECHO throughput than the earlier profiling implementation; that difference has not been isolated. Prefer AR for these batch-4 workloads.
 
 ### Profiling findings
 
