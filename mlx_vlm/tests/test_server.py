@@ -3895,6 +3895,120 @@ def test_anthropic_stream_overlapping_stops_are_chunk_independent(
         ), chunks
 
 
+STOP_PATHS = ["generate", "generator", "stream", "fallback"]
+
+
+def _stop_reply(client, path, parts, parser=_JSON_TOOLS, **payload):
+    ends = [None] * (len(parts) - 1) + ["length"]
+    make = _result if path == "fallback" else _token
+    remaining = iter([make(text, finish_reason=end) for text, end in zip(parts, ends)])
+    endpoint = {
+        "generate": dict(result=_result("".join(parts), finish_reason="length")),
+        "fallback": dict(chunks=remaining),
+    }.get(path, dict(generator=_streaming(remaining)))
+    stream = path in ("stream", "fallback")
+    with _endpoint(parser=parser, **endpoint):
+        response = _post(client, stream=stream, **payload)
+
+    if stream:
+        assert not any("error" in event for event in _data(response))
+        deltas = _deltas(response)
+        calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+        message = dict(
+            reasoning_content=_joined(deltas, "reasoning_content"),
+            content=_joined(deltas, "content"),
+            tool_calls=calls,
+        )
+        finish = [
+            c["choices"][0]["finish_reason"]
+            for c in _data(response)
+            if c.get("choices") and c["choices"][0]["finish_reason"]
+        ]
+    else:
+        (choice,) = response.json()["choices"]
+        message, finish = choice["message"], [choice["finish_reason"]]
+    functions = [call["function"] for call in message["tool_calls"] or []]
+    return NS(
+        reasoning=message["reasoning_content"],
+        content=message["content"],
+        calls=[function["name"] for function in functions if function.get("name")],
+        arguments="".join(function.get("arguments") or "" for function in functions),
+        finish=finish,
+        stream=stream,
+        unread=len(list(remaining)),
+    )
+
+
+@pytest.mark.parametrize("path", STOP_PATHS)
+def test_chat_stop_cuts_text_and_generation(client, path):
+    parts = ["Hello ST", "AR ST", "OP secret", " tail"]
+    reply = _stop_reply(client, path, parts, stop="STOP")
+
+    assert reply.content == ("Hello STAR " if reply.stream else "Hello STAR")
+    assert reply.finish == ["stop"]
+    if path != "generate":
+        assert reply.unread == 1
+
+
+@pytest.mark.parametrize("path", STOP_PATHS)
+def test_chat_stop_matched_at_end_of_output(client, path):
+    stop = ["a", "b", "c", "STOPX", "OP"]
+    reply = _stop_reply(client, path, ["Hello STOP"], stop=stop)
+
+    assert (reply.content, reply.finish) == ("Hello ST", ["stop"])
+
+
+def test_chat_stop_at_start_leaves_no_content(client):
+    reply = _stop_reply(client, "generate", ["\n\nHello\n\nWorld"], stop="\n\n")
+
+    assert (reply.content, reply.finish) == (None, ["stop"])
+
+
+@pytest.mark.parametrize("path", STOP_PATHS)
+def test_chat_stop_skips_reasoning_and_tool_markup(client, path):
+    parts = ["<think>STOP</think>", _CALL, "Hi STOP tail"]
+    reply = _stop_reply(
+        client,
+        path,
+        parts,
+        stop=["weather", "STOP"],
+        tools=[_tool()],
+        enable_thinking=True,
+    )
+
+    assert (reply.reasoning, reply.calls) == ("STOP", ["get_weather"])
+    assert reply.content == ("Hi " if reply.stream else "Hi")
+    assert reply.finish == ["tool_calls"]
+
+
+@pytest.mark.parametrize("path", ["generator", "stream", "fallback"])
+def test_chat_drops_tool_call_after_stop(client, path):
+    text = "Answer STOP " + _CALL
+    reply = _stop_reply(client, path, [text], stop=["STOP"], tools=[_tool()])
+
+    assert reply.content == ("Answer " if reply.stream else "Answer")
+    assert (reply.calls, reply.finish) == ([], ["stop"])
+
+
+@pytest.mark.parametrize("path", ["stream", "fallback"])
+def test_chat_stream_keeps_tool_call_streamed_before_stop(client, path):
+    parts = [
+        "Let me check.",
+        "\n\n",
+        '<tool_call>{"name": "get_weather", ',
+        '"arguments": {"city": "X"}}',
+        "</tool_call>",
+        " Done.",
+        " more",
+    ]
+    parser = load_tool_module("json_tools")
+    reply = _stop_reply(client, path, parts, parser, stop="\n\n", tools=[_tool()])
+
+    assert (reply.content, reply.calls) == ("Let me check.", ["get_weather"])
+    assert json.loads(reply.arguments) == {"city": "X"}
+    assert reply.finish == ["tool_calls"]
+
+
 ANTHROPIC_TOOLS = [_tool(name, "messages") for name in ("get_time", "get_weather")]
 
 

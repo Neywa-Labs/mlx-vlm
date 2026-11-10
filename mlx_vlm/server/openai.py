@@ -11,7 +11,7 @@ import time
 import uuid
 from contextlib import aclosing, suppress
 from datetime import datetime
-from functools import partial
+from functools import cached_property, partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -37,6 +37,7 @@ from ..tools import (
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
 from . import compaction, continuation
+from .anthropic import StopSequenceStreamState, tool_output_before_stop
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
@@ -305,6 +306,73 @@ def _chat_usage_chunk(
         choices=[],
         timings=GenerationTimings.from_metrics(metrics, prompt_tokens, output_tokens),
     )
+
+
+class _StopCut:
+    def __init__(self, stop, processor, prompt, gen_args, tool_module):
+        self.state = StopSequenceStreamState([stop] if isinstance(stop, str) else stop)
+        self.content = ""
+        self.keep_before = 0
+        self.tool_markers = (
+            (tool_module.tool_call_start, tool_module.tool_call_end)
+            if tool_module
+            else (None, None)
+        )
+        self.thinking_args = (
+            prompt_has_open_thinking(
+                prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            ),
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
+        self.new_thinking_state = lambda: make_response_stream_state(
+            processor, *self.thinking_args, prompt=prompt
+        )
+
+    @property
+    def matched(self):
+        return self.state.matched
+
+    @cached_property
+    def _states(self):
+        return self.new_thinking_state(), ToolCallStreamState(*self.tool_markers)
+
+    def cut(self, text, last=False):
+        if not self.state.stop_sequences:
+            return text
+        text = self.state.feed(text, last=last)
+        self.content += text or ""
+        return text
+
+    def feed(self, text, last=False):
+        if self.state.stop_sequences:
+            thinking_state, tool_call_state = self._states
+            delta = thinking_state.feed(text, last=last)
+            self.cut(tool_call_state.feed(delta.content, last=last))
+        return self.matched is not None
+
+    def finish(self):
+        if self.state.stop_sequences:
+            self.cut(finish_content_streams(*self._states)[1], True)
+
+    def tool_output(self, output):
+        return tool_output_before_stop(
+            output,
+            self.state,
+            *self.tool_markers,
+            self.thinking_args,
+            self.new_thinking_state,
+            self.content,
+            self.keep_before,
+        )
+
+    def tool_text(self, output, text, calls_sent):
+        start = len(output) - len(text)
+        self.keep_before = start if calls_sent else 0
+        return self.tool_output(output)[start:]
 
 
 def register_routes(app, deps):
@@ -2196,6 +2264,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     stream_prompt_tokens = 0
                     tool_calls_made = False
                     tool_delta_state = ToolCallDeltaState(tool_module, tools)
+                    stop_cut = _StopCut(
+                        request.stop, processor, formatted_prompt, gen_args, tool_module
+                    )
                     # Response templates consume structured tool regions. Split
                     # reasoning separately so the tool parser still sees their markup.
                     tool_thinking_state = ThinkingStreamState(
@@ -2264,15 +2335,21 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             )
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
-                            tool_deltas = tool_delta_state.feed(
-                                tool_thinking_state.feed(
-                                    token.text, last=bool(token.finish_reason)
-                                ).content
-                            )
 
                             # Suppress tool-call markup from content
                             delta_content = tool_call_state.feed(
                                 delta_content, last=bool(token.finish_reason)
+                            )
+                            delta_content = stop_cut.cut(delta_content)
+                            tool_text = token.text
+                            if stop_cut.matched is not None:
+                                tool_text = stop_cut.tool_text(
+                                    full_output, token.text, tool_delta_state.calls
+                                )
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    tool_text, last=bool(token.finish_reason)
+                                ).content
                             )
 
                             chunk_logprobs = None
@@ -2321,6 +2398,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
+                            if stop_cut.matched is not None:
+                                break
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
                                 break
@@ -2328,6 +2407,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         tail_reasoning, tail = finish_content_streams(
                             thinking_state, tool_call_state
                         )
+                        tail = stop_cut.cut(tail, True)
+                        if stop_cut.matched is not None:
+                            finish_reason = "stop"
                         if tail or tail_reasoning:
                             chunk_data = ChatStreamChunk(
                                 id=request_id,
@@ -2351,7 +2433,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Parse tool calls from full output and emit final chunk
                         terminal_emitted = False
                         if tool_module is not None:
-                            tc = parse_tools(full_output)
+                            tc = parse_tools(stop_cut.tool_output(full_output))
                             remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
@@ -2443,13 +2525,19 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
-                            tool_deltas = tool_delta_state.feed(
-                                tool_thinking_state.feed(
-                                    chunk.text, last=bool(chunk_finish)
-                                ).content
-                            )
                             delta_content = tool_call_state.feed(
                                 thinking_delta.content, last=bool(chunk_finish)
+                            )
+                            delta_content = stop_cut.cut(delta_content)
+                            tool_text = chunk.text
+                            if stop_cut.matched is not None:
+                                tool_text = stop_cut.tool_text(
+                                    output_text, chunk.text, tool_delta_state.calls
+                                )
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    tool_text, last=bool(chunk_finish)
+                                ).content
                             )
                             if delta_content or thinking_delta.reasoning or tool_deltas:
                                 choices = [
@@ -2475,9 +2563,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
+                            if stop_cut.matched is not None:
+                                break
+
                         tail_reasoning, tail = finish_content_streams(
                             thinking_state, tool_call_state
                         )
+                        tail = stop_cut.cut(tail, True)
+                        if stop_cut.matched is not None:
+                            finish_reason = "stop"
                         if tail or tail_reasoning:
                             chunk_data = ChatStreamChunk(
                                 id=request_id,
@@ -2499,7 +2593,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                         tc = (
-                            parse_tools(output_text)
+                            parse_tools(stop_cut.tool_output(output_text))
                             if tool_module is not None
                             else None
                         )
@@ -2659,6 +2753,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
                 ] = []
+                stop_cut = _StopCut(
+                    request.stop, processor, formatted_prompt, gen_args, tool_module
+                )
 
                 if runtime.response_generator is not None:
 
@@ -2686,6 +2783,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 logprobs.append(
                                     (token.token, token.logprobs, token.top_logprobs)
                                 )
+                            if stop_cut.feed(token.text, bool(token.finish_reason)):
+                                break
                             if token.finish_reason:
                                 fr = token.finish_reason
                                 break
@@ -2722,7 +2821,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     output_tokens = gen_result.generation_tokens
                     metrics.record_result(gen_result)
                     finish_reason = getattr(gen_result, "finish_reason", None) or "stop"
+                    stop_cut.feed(full_text, True)
 
+                stop_cut.finish()
                 mx.clear_cache()
                 gc.collect()
 
@@ -2754,7 +2855,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 # Parse tool calls from generated output
                 parsed_tool_calls = None
                 if tool_module is not None:
-                    tc = parse_tools(full_text)
+                    tc = parse_tools(stop_cut.tool_output(full_text))
                     if tc.calls:
                         parsed_tool_calls = tc.calls
                         # Reasoning was already removed before tool parsing.
@@ -2768,6 +2869,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             )
                             or None
                         )
+
+                if stop_cut.matched is not None:
+                    content = stop_cut.content.strip()
+                    finish_reason = "stop"
 
                 response_logprobs = None
                 if request.logprobs and collected_logprobs:
