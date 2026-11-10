@@ -7,17 +7,24 @@ from types import SimpleNamespace
 
 from mlx_vlm.trainer.common.config import CoreTrainingArgs
 from mlx_vlm.trainer.common.task import TrainingTask
-from mlx_vlm.trainer.vlm.config import VLMTrainingArgs
+from mlx_vlm.trainer.vlm.config import SFTTrainConfig, VLMTrainConfig
 from mlx_vlm.trainer.vlm.dpo.config import DPOTrainingArgs
 from mlx_vlm.trainer.vlm.grpo.config import GRPOTrainingArgs
 from mlx_vlm.trainer.vlm.orpo.config import ORPOTrainingArgs
 
 # Explicit supported combinations, without importing optional modality libraries.
 TASKS = {
-    ("vlm", "sft"): ("vlm.sft.runtime", VLMTrainingArgs),
+    # SFT and UFT (unsupervised fine-tuning/pretraining) share one CE runtime;
+    # train_on_completions selects completion-only or full-sequence targets.
+    ("vlm", "sft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
+    ("vlm", "uft"): ("vlm.cross_entropy.runtime", SFTTrainConfig),
     ("vlm", "dpo"): ("vlm.dpo.trainer", DPOTrainingArgs),
     ("vlm", "orpo"): ("vlm.orpo.runtime", ORPOTrainingArgs),
     ("vlm", "grpo"): ("vlm.grpo.trainer", GRPOTrainingArgs),
+    # ASR models are normalized to one training interface that names the
+    # objective, so no architecture is listed here.
+    ("asr", "sft"): ("asr.cross_entropy", SFTTrainConfig),
+    ("asr", "ctc"): ("asr.ctc", SFTTrainConfig),
 }
 
 
@@ -35,7 +42,8 @@ def task_spec(task: str, algorithm: str | None = None):
 class Trainer:
     """Train/evaluate loaded MLX models from raw rows or prepared datasets.
 
-    Provide ``processing_class`` for VLMs, and a separate frozen
+    Provide ``processing_class`` for VLMs (``task="asr"`` models prepare their
+    own examples and choose the objective), and a separate frozen
     ``reference_model`` for DPO or GRPO with KL regularization. GRPO accepts
     batched ``reward_funcs`` and optional ``reward_weights``. Configure adapters/dtype on the model before
     construction. ``prepared=True`` skips preprocessing for the low-level API.
@@ -74,12 +82,28 @@ class Trainer:
                     algorithm = "orpo"
                 elif isinstance(args, GRPOTrainingArgs):
                     algorithm = "grpo"
+            if task == "asr":
+                from mlx_vlm.trainer.asr.normalize import normalize_model
+
+                # Normalization attaches the interface and names the objective.
+                model = normalize_model(model)
+                objective = model.training_objective
+                if algorithm not in (None, objective):
+                    raise ValueError(
+                        f"This model trains with {objective!r}, not {algorithm!r}."
+                    )
+                algorithm = objective
             algorithm, (module_name, config_type) = task_spec(task, algorithm)
             args = args or config_type()
-            if not isinstance(args, config_type):
+            # SFT also accepts the shared VLM config (formerly VLMTrainingArgs).
+            accepted = VLMTrainConfig if config_type is SFTTrainConfig else config_type
+            if not isinstance(args, accepted):
                 raise TypeError(f"{task}/{algorithm} expects {config_type.__name__}.")
             args.validate()
-            if not prepared and processing_class is None:
+            if algorithm == "uft" and args.train_on_completions:
+                raise ValueError("UFT trains on full sequences; use algorithm='sft'.")
+            # ASR models prepare their own examples.
+            if task == "vlm" and not prepared and processing_class is None:
                 raise ValueError(f"{task} raw datasets require processing_class.")
             options = {}
             if algorithm in {"dpo", "grpo"}:

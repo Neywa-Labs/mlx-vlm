@@ -34,6 +34,29 @@ _AUDIO_VIDEO_FIELDS = (
 _SIGNATURE_FIELDS = ("pixel_values", "image_embeds", *_AUDIO_VIDEO_FIELDS)
 
 
+# A 2D (B, T) integer padding mask is forwarded by most models straight into
+# the decoder as ``mask``, where scaled_dot_product_attention treats it as an
+# additive/non-causal mask (wrong at B=1, an error at B>1). Padding is on the
+# right, which cannot affect earlier real-token logits under causal attention,
+# so the default is to pass no mask and let the model build its causal mask.
+# Only models that read the 2D mask themselves (rope/position ids) and turn it
+# into a proper causal+padding mask keep it.
+PADDING_MASK_MODEL_TYPES = frozenset(
+    {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen3_5",
+        "qwen3_5_moe",
+    }
+)
+
+
+def model_uses_padding_mask(model: nn.Module) -> bool:
+    return _model_type(model) in PADDING_MASK_MODEL_TYPES
+
+
 def _model_type(model: nn.Module) -> str | None:
     model_type = getattr(model, "model_type", None)
     if model_type is not None:
@@ -74,7 +97,7 @@ def _forward_vlm(model, input_ids, attention_mask, batch, **kwargs):
         key: value for key, value in batch.items() if key not in _TEXT_FIELDS
     }
     pixel_values = model_inputs.pop("pixel_values", None)
-    if _model_type(model) == "gemma4_unified":
+    if not model_uses_padding_mask(model):
         attention_mask = None
     model_inputs.update(kwargs)
     return model(input_ids, pixel_values, attention_mask, **model_inputs)
@@ -105,12 +128,15 @@ def vlm_sft_loss(
     train_on_completions: bool = False,
     assistant_id: int | None = 77091,
     mtp_loss_weight: float = 0.0,
+    forward: Callable = _forward_vlm,
 ) -> tuple[mx.array, dict[str, mx.array]]:
     """Compute masked causal cross-entropy for a VLM batch.
 
     The batch stores unshifted ``input_ids``. The model receives all but the
     last token and predicts the remaining targets. Padding and (optionally)
     prompt tokens are excluded from the shared cross-entropy objective.
+    ``forward(model, input_ids, attention_mask, batch, **kwargs)`` lets other
+    modalities reuse this objective with their own model call.
     """
     if not math.isfinite(mtp_loss_weight) or mtp_loss_weight < 0:
         raise ValueError("mtp_loss_weight must be finite and non-negative.")
@@ -143,12 +169,12 @@ def vlm_sft_loss(
             raise ValueError(
                 "MTP loss requires attach_mtp_head(model, head) before training."
             )
-        output = _forward_vlm(
+        output = forward(
             model, input_ids, model_attention_mask, batch, return_hidden=True
         )
-        logits = _logits_from_output(output).astype(mx.float32)
     else:
-        logits = forward_vlm_logits(model, input_ids, model_attention_mask, batch)
+        output = forward(model, input_ids, model_attention_mask, batch)
+    logits = _logits_from_output(output).astype(mx.float32)
     if logits.ndim != 3 or logits.shape[:-1] != targets.shape:
         raise ValueError(
             "VLM logits must align position-for-position with shifted targets; "
@@ -158,7 +184,7 @@ def vlm_sft_loss(
     loss, metrics = cross_entropy(
         logits, targets, loss_mask, vision_mask=vlm_vision_mask(model, batch)
     )
-    from .mtp import add_mtp_loss
+    from ..mtp import add_mtp_loss
 
     return add_mtp_loss(
         model,
@@ -574,7 +600,7 @@ def make_task(
     iterate_batches=iterate_vlm_batches,
 ):
     """Bind VLM preprocessing and supervised cross-entropy."""
-    from mlx_vlm.trainer.vlm.sft.dataset import VisionDataset
+    from mlx_vlm.trainer.vlm.cross_entropy.dataset import VisionDataset
 
     loss_options = dict(
         train_on_completions=args.train_on_completions,

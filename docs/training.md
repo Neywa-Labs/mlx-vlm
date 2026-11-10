@@ -309,6 +309,23 @@ The CLI constructs the optimizer separately using `--optimizer` (default
 `adamw`), `--learning-rate` (default `1e-5`), and `--weight-decay` (default
 `0.0`). These CLI options are not fields of the training argument dataclasses.
 
+Adam/AdamW are tuned with `--beta1`, `--beta2`, `--optimizer-eps` and
+`--bias-correction`. `--grad-clip N` (a training argument) clips the global
+gradient norm after accumulation and averaging, just before each update.
+
+`--lr-schedule` takes a name or a JSON/YAML object and `--warmup-steps` adds a
+linear ramp from `--warmup-init`:
+
+```bash
+--lr-schedule '{"name": "cosine_decay", "warmup": 10, "warmup_init": 1e-7, "arguments": [2e-4, 800, 2e-6]}'
+--lr-schedule cosine_decay --warmup-steps 10 --min-learning-rate 2e-6
+```
+
+A bare `cosine_decay` decays from `--learning-rate` to `--min-learning-rate`
+over the updates left after warmup. Schedule steps count optimizer updates,
+not microsteps (`iters / gradient_accumulation_steps`, rounded up), including
+`--epochs`-derived `iters`. Reported `learning_rate` follows the schedule.
+
 ## Row formats
 
 SFT rows contain chat messages and optional images:
@@ -356,12 +373,88 @@ Callbacks implement `TrainingCallback.on_train_loss_report` and
 `on_val_loss_report`. Pass a callback through `training_callback`, or use
 `--wandb project` after installing the optional `wandb` package.
 
+## ASR training
+
+`--task asr` trains speech recognition models loaded with `mlx-audio`
+(`pip install mlx-audio`). The engine, optimizer flags, LoRA/DoRA/full modes,
+and checkpoints are the ones VLM training uses. The model decides the
+objective, so there is no algorithm to choose:
+
+| Objective | Loss | Normalized families |
+|---|---|---|
+| `sft` | Next-token cross-entropy on transcript tokens | Whisper, Qwen3-ASR (and Mega-ASR, Phonon), Qwen2-Audio, Voxtral, Granite Speech, GLM-ASR, Fun-ASR Nano, Moonshine, Canary, Cohere ASR, FireRedASR2, MOSS Transcribe, VibeVoice ASR, Higgs Audio 3 |
+| `ctc` | Connectionist Temporal Classification on frame logits | Parakeet CTC and TDT-CTC, MMS, Granite Speech CTC, SenseVoice |
+
+```sh
+python -m mlx_vlm.train --task asr \
+  --model mlx-community/whisper-tiny-asr-fp16 \
+  --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --learning-rate 1e-4
+
+python -m mlx_vlm.train --task asr \
+  --model mlx-community/parakeet-tdt_ctc-110m \
+  --data Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo --batch-size 2
+```
+
+Datasets use the shared speech layout: `train.jsonl`, `validation.jsonl`, and
+`test.jsonl` beside an `audio/` folder, one object per line, with audio paths
+relative to the dataset root. `language` is optional (default
+`--dataset-config '{"language": "en"}'`).
+
+```json
+{"audio": "audio/train/000001.wav", "text": "Hello, how are you?", "language": "en"}
+```
+
+```python
+import mlx.optimizers as optim
+from mlx_audio.stt import load
+from mlx_vlm.trainer import SFTTrainConfig, Trainer, prepare_model_for_training
+from mlx_vlm.trainer.asr.normalize import normalize_model
+from mlx_vlm.trainer.datasets import load as load_rows
+
+rows = load_rows("Goekdeniz-Guelmez/mlx-omni-lora-stt-tts-demo")
+model = normalize_model(load("mlx-community/parakeet-tdt_ctc-110m"))
+model = prepare_model_for_training(model)
+Trainer(
+    model, SFTTrainConfig(batch_size=2), task="asr",
+    train_dataset=rows["train"], eval_dataset=rows["validation"],
+    optimizer=optim.AdamW(learning_rate=1e-4),
+).train()
+```
+
+### Model normalization
+
+Speech models expose different inference interfaces, so
+`trainer/asr/normalize.py` inspects a loaded model and attaches one training
+interface. The rest of the trainer only uses that interface:
+
+- `training_objective`: `"sft"` or `"ctc"`.
+- `prepare_example(audio, text, language)`: one utterance as a mapping. Model
+  inputs are named after `forward_logits` arguments (the preprocessed audio is
+  always `input_features`); supervision is `input_ids` plus `completion_mask`
+  for `sft`, or `labels` for `ctc`.
+- `forward_logits(**inputs)`: differentiable logits for one example.
+- `blank_id`: the CTC blank class.
+
+`normalize_model` also unwraps inference facades to the module that owns the
+parameters. A model class that defines this interface itself is used as is, so
+it needs no entry. Any other architecture needs one small family class in
+`normalize.py`; subclasses of a known family are covered automatically.
+
+Each example runs through the model on its own and losses are averaged over
+the batch, so padding never changes an encoder's audio representation.
+
+Not covered yet: transducer objectives (Parakeet TDT/RNN-T, Nemotron ASR),
+Voxtral Realtime, Granite Speech NAR, LASR CTC, MiMo ASR, and MOSS Music.
+Half-precision checkpoints need `--optimizer-eps 1e-4` (or SGD) for
+`--train-type full` with Adam/AdamW.
+
 ## Backend structure and compatibility
 
 `trainer/common` owns configuration, model preparation, the shared engine,
 callbacks, and the `TrainingTask` contract. `trainer/datasets/loading.py` owns
 JSONL loading and bounded caching. `trainer/vlm` owns VLM preprocessing and SFT,
-ORPO, and DPO objectives. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
+ORPO, and DPO objectives. `trainer/asr` owns the ASR objectives and model
+normalization. `trainer/peft` uses MLX-VLM's local LoRA/DoRA layers.
 The registry in `trainer/api.py` selects the supported VLM tasks; a custom
 `TrainingTask` can be passed directly to `Trainer`.
 
@@ -484,3 +577,59 @@ Custom callbacks can be defined in `--reward-functions-file rewards.py`, selecte
 with `--reward-functions first_reward,second_reward`, and weighted with
 `--reward-weights '[0.8, 0.2]'`. The CLI loads a separate base reference when
 `--beta` is positive; override it with `--reference-model` if needed.
+
+### Quantization-aware full training
+
+Use weight-only affine QAT through the same preparation and Trainer path:
+
+```python
+model = prepare_model_for_training(
+    model, train_type="full", qat=True, quantization_bits=4,
+    quantization_group_size=64,
+)
+```
+
+The equivalent CLI options are `--train-type full --qat --quantization-bits 4`.
+QAT simulates quantization on eligible standard Linear weights with straight-through
+gradients; embeddings and Linear layers whose input width is incompatible with
+the group size remain floating point. It supports 4/8 bits and groups of 32/64/128.
+Checkpoints contain floating-point master weights in the existing full checkpoint
+format. Resume with `qat=True` (or `--qat`). This uses full-training memory.
+
+Export packed inference weights after training with one call:
+
+```python
+from mlx_vlm import export_model
+
+export_model(model, processor, "qat-inference", model_path=MODEL_ID)
+# Load directly for inference:
+model, processor = load("qat-inference")
+```
+
+The output must be a new directory. `export_model` automatically packs QAT layers
+at their trained bit/group settings, preserves other layers, fuses LoRA/DoRA
+adapters when present, and saves the config and processor assets. It derives
+quantization metadata from the exported layers. The live training model is
+restored after saving. The result is a standalone inference model.
+
+For non-QAT training the same function keeps the current float/packed layout.
+Force quantization of compatible float layers with:
+
+```python
+export_model(
+    model, processor, "quantized-inference", model_path=MODEL_ID,
+    quantize=True, bits=4, group_size=64,
+)
+```
+
+With `quantize=True`, ordinary float layers default to 4 bits/group 64; QAT layers
+keep their trained settings unless `bits`/`group_size` are explicitly supplied.
+`quantize=False` saves QAT master weights without adding quantization; existing
+packed layers remain packed. Forced quantization skips incompatible float layers.
+Full QAT checkpoints now record their QAT settings, so preparation restores them
+automatically on resume. Older checkpoints need explicit QAT settings.
+
+All QAT notebooks end with `export_model(...)`. CLI training supports
+`--export-model-path inference` (the old `--export-qat-path` remains an alias).
+Add `--export-quantize` to force quantization. Float training checkpoints remain
+separate for resuming. `export_qat_model` remains a compatibility wrapper.

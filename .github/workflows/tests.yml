@@ -100,6 +100,8 @@ jobs:
             # Run the training API first so its compilation starts early.
             tests: >-
               tests/test_training_api.py
+              tests/test_training_asr.py
+              tests/test_training_asr_normalize.py
               tests/test_cache.py
               tests/test_model_ops.py
               tests/test_moe_offload.py
@@ -118,7 +120,9 @@ jobs:
               tests/test_training_model_preparation.py
               tests/test_training_mtp.py
               tests/test_training_mtp_notebook.py
+              tests/test_training_qat_export.py
               tests/test_training_notebooks.py
+              tests/test_training_padding_mask.py
               tests/test_training_vlm.py
           - group: models
             suite: Models, processors & speculation
