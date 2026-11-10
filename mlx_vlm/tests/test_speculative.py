@@ -1587,6 +1587,44 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
     equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
 
 
+@parametrize("mode,bits,size", [("affine", 4, 64), ("affine", 5, 64), ("mxfp8", 8, 32)])
+@parametrize("sharding", ["all-to-sharded", "sharded-to-all"])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("batch,width", [(1, 512), (2, 512), (1, 128)])
+def test_sharded_block_projection(
+    mode, bits, size, sharding, dtype, batch, width, monkeypatch
+):
+    from mlx.nn.layers.distributed import shard_linear
+
+    mx.random.seed(2130)
+    dense = nn.Linear(width, 32, bias=True)
+    dense.load_weights(
+        [(k, v.astype(dtype)) for k, v in tree_flatten(dense.parameters())]
+    )
+    layer = shard_linear(
+        nn.QuantizedLinear.from_linear(dense, mode=mode, bits=bits, group_size=size),
+        sharding,
+    )
+    layer.eval()
+    inputs = mx.random.normal((batch, 8, width)).astype(dtype)[:, ::2]
+    expected = mx.concatenate(
+        [layer(mx.contiguous(inputs[:, i : i + 1])) for i in range(4)], axis=1
+    )
+    mx.eval(expected)
+    if (
+        sharding == "all-to-sharded"
+        and batch == 1
+        and width == 512
+        and dtype != mx.float32
+    ):
+        # Column shards must enter the shared block kernel, not a per-token loop.
+        def fail(*args, **kwargs):
+            raise AssertionError("tokenwise fallback")
+
+        monkeypatch.setattr(type(layer), "__call__", fail)
+    equal(native_batch_linear(layer, inputs), expected)
+
+
 @parametrize("mode,bits,size", formats((32, 64, 128)))
 @parametrize("batch", [1, 4, 8, 64, 127])
 def test_quantized_moe_hyperconnection(mode, bits, size, batch, monkeypatch):
