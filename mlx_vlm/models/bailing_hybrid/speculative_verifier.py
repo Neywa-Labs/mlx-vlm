@@ -7,6 +7,23 @@ from ..base import create_attention_mask, create_ssm_mask
 from ..linear import DECODE_BLOCK_SIZE, linear, native_batch_linear, tokenwise
 
 
+@mx.compile
+def route_block(x, weight, bias, top_k, n_group, topk_group, normalize, scaling):
+    from .language import route_experts
+
+    return tokenwise(
+        lambda token: route_experts(
+            token, weight, bias, top_k, n_group, topk_group, normalize, scaling
+        ),
+        x,
+    )
+
+
+@mx.compile
+def combine_experts(experts, scores, x):
+    return (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
+
+
 class BailingHybridSpeculativeVerifier:
     """Verify blocks with decode-equivalent projections and cache visibility."""
 
@@ -33,11 +50,20 @@ class BailingHybridSpeculativeVerifier:
         if isinstance(layer, SparseMoE):
             if layer.sharding_group is not None:
                 x = sum_gradients(layer.sharding_group)(x)
-            indices, scores = tokenwise(layer.gate, x)
-            experts = layer.switch_mlp(x, indices)
-            out = (
-                (experts.astype(mx.float32) * scores[..., None]).sum(-2).astype(x.dtype)
+            gate = layer.gate
+            args = gate.args
+            indices, scores = route_block(
+                x,
+                gate.weight,
+                gate.expert_bias,
+                args.num_experts_per_tok,
+                args.n_group,
+                args.topk_group,
+                args.norm_topk_prob,
+                args.routed_scaling_factor,
             )
+            experts = layer.switch_mlp(x, indices)
+            out = combine_experts(experts, scores, x)
             if layer.shared_experts is not None:
                 out = out + self._feed_forward(layer.shared_experts, x)
         else:
@@ -185,7 +211,7 @@ class BailingHybridSpeculativeVerifier:
                 model.sharding_group is not None
                 and not model.training
                 and mx.default_device() == mx.gpu
-                and (i + 1) % 4 == 0
+                and (i + 1) % 8 == 0
             ):
                 mx.async_eval(hidden)
         return model.norm(hidden)

@@ -54,6 +54,26 @@ class MLP(nn.Module):
         return out
 
 
+def route_experts(x, weight, bias, top_k, n_group, topk_group, normalize, scaling):
+    scores = mx.sigmoid(x.astype(mx.float32) @ weight.astype(mx.float32).T)
+    routing = scores + bias
+    if n_group > 1 and topk_group < n_group:
+        grouped = mx.unflatten(routing, -1, (n_group, -1))
+        group_scores = mx.topk(grouped, 2, axis=-1).sum(-1)
+        groups = mx.argpartition(-group_scores, topk_group - 1, axis=-1)
+        keep = mx.any(
+            mx.arange(n_group) == groups[..., :topk_group, None],
+            axis=-2,
+        )
+        routing = mx.where(keep[..., None], grouped, -mx.inf).flatten(-2)
+    indices = mx.argpartition(-routing, top_k - 1, axis=-1)
+    indices = mx.stop_gradient(indices[..., :top_k])
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    if top_k > 1 and normalize:
+        weights = weights / (weights.sum(-1, keepdims=True) + 1e-20)
+    return indices, weights * scaling
+
+
 class Gate(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -63,23 +83,16 @@ class Gate(nn.Module):
 
     def __call__(self, x):
         args = self.args
-        scores = mx.sigmoid(x.astype(mx.float32) @ self.weight.astype(mx.float32).T)
-        routing = scores + self.expert_bias
-        if args.n_group > 1 and args.topk_group < args.n_group:
-            grouped = mx.unflatten(routing, -1, (args.n_group, -1))
-            group_scores = mx.topk(grouped, 2, axis=-1).sum(-1)
-            groups = mx.argpartition(-group_scores, args.topk_group - 1, axis=-1)
-            keep = mx.any(
-                mx.arange(args.n_group) == groups[..., : args.topk_group, None],
-                axis=-2,
-            )
-            routing = mx.where(keep[..., None], grouped, -mx.inf).flatten(-2)
-        indices = mx.argpartition(-routing, args.num_experts_per_tok - 1, axis=-1)
-        indices = mx.stop_gradient(indices[..., : args.num_experts_per_tok])
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        if args.num_experts_per_tok > 1 and args.norm_topk_prob:
-            weights = weights / (weights.sum(-1, keepdims=True) + 1e-20)
-        return indices, weights * args.routed_scaling_factor
+        return route_experts(
+            x,
+            self.weight,
+            self.expert_bias,
+            args.num_experts_per_tok,
+            args.n_group,
+            args.topk_group,
+            args.norm_topk_prob,
+            args.routed_scaling_factor,
+        )
 
 
 class SparseMoE(nn.Module):
