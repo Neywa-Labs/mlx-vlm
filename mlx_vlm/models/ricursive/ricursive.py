@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures

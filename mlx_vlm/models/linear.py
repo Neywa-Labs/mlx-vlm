@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Projection dispatch and dense kernels shared by model families."""
 
 from functools import lru_cache

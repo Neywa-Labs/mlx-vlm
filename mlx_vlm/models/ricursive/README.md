@@ -1,3 +1,5 @@
+<!-- Copyright © 2026 Neywa Labs Inc. -->
+
 # Ripple
 
 Native MLX support for the text-only

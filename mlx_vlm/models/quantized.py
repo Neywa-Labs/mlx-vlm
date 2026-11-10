@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Affine and NVFP4 projection kernels with native decoding arithmetic."""
 
 from functools import lru_cache

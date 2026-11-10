@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Per-request append positions for Ripple's full and sliding attention."""
 
 import mlx.core as mx

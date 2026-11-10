@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 """Ripple block verification with parallel attention and transactional caches."""
 
 from functools import partial

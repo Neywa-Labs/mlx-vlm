@@ -1,3 +1,5 @@
+# Copyright © 2026 Neywa Labs Inc.
+
 import mlx.core as mx
 import mlx.nn as nn
 
