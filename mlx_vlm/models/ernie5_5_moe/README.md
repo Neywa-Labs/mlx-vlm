@@ -101,18 +101,20 @@ After the head-promotion fix, a paired comparison on the same machine and checkp
 
 All 24 runs completed with the requested token counts and full batch occupancy. Outputs repeated exactly within each variant. Six of the ten distinct benchmark request sequences matched AR exactly; four diverged, first at output positions 0, 4, 9, or 18 (zero-based). Two additional 32-token natural-language streaming smoke tests matched exactly. A teacher-forced comparison of block verification with singleton forwards from identical initial caches found 22 top-token differences across 249 proposed positions, including rejected positions. These released mixed-precision results do not establish exact greedy parity. The FP32 reference checks above validate the implementation's equations separately. For batch 4 at 512 input tokens, ordinary decoding remains faster than the tested ECHO configurations.
 
-### Check after rebasing onto current main
+### Rerun on the current implementation
 
-A fresh strict load on the rebased implementation repeated the same eight AR/ECHO configurations once each, after warmup. The hardware, checkpoint, allocator limit, prompt tokens, and 32-token output limits were unchanged. These are single-run checks, not three-run medians:
+On November 11, 2026, commit `405b9d8b` repeated all eight AR/ECHO configurations three times after warmup and a fresh strict checkpoint load. The hardware, 174.4 GB checkpoint, 2 GiB allocator cache, saved prompt token IDs, and 32-token output limits match the earlier comparison. AR uses 128-token prefill chunks; ECHO uses full-prompt prefill and two draft tokens. The following rates are aggregate medians, including ECHO draft initialization:
 
 | Batch | Input tokens per request | AR decode tok/s | ECHO decode tok/s | ECHO / AR |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 128 | 9.41 | 19.13 | 2.03× |
-| 1 | 512 | 9.42 | 17.38 | 1.84× |
-| 4 | 128 | 41.24 | 35.84 | 0.87× |
-| 4 | 512 | 40.76 | 24.35 | 0.60× |
+| 1 | 128 | 9.40 | 18.99 | 2.02× |
+| 1 | 512 | 9.41 | 17.30 | 1.84× |
+| 4 | 128 | 41.17 | 35.59 | 0.86× |
+| 4 | 512 | 40.79 | 24.45 | 0.60× |
 
-All cases completed with the requested token counts. Both natural-language streaming smoke tests matched AR for 32 tokens; six of ten benchmark request sequences matched between AR and ECHO. Peak MLX memory reached 180.70 GB, and swap usage stayed unchanged. The current shared runtime has lower batch-4 ECHO throughput than the earlier profiling implementation; that difference has not been isolated. Prefer AR for these batch-4 workloads.
+All 24 measured runs completed with 32 tokens per request and full requested batch occupancy. Throughput varied by less than 0.5% within each configuration, and output tokens repeated exactly within each variant. Both natural-language streaming smoke tests matched AR for 32 tokens; six of ten distinct benchmark request sequences matched between AR and ECHO. Peak MLX memory reached 180.70 GB, and swap usage stayed unchanged.
+
+Compared with the earlier profiling table, AR throughput stayed within 1%, while ECHO was 3.6% slower at batch 1 and 25.3% / 20.6% slower at batch 4 for 128 / 512 input tokens. These results confirm the lower batch-4 ECHO throughput seen in the single-run check after rebasing onto the shared runtime; the cause has not been isolated. Prefer AR for these batch-4 workloads.
 
 ### Profiling findings
 
