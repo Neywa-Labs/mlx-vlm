@@ -10,6 +10,58 @@ This is opt-in: an unconfigured distributed request returns an error instead
 of silently loading the model locally. Models need an implemented `Model.shard`
 method; a large checkpoint is not automatically a shardable checkpoint.
 
+## How a request runs
+
+For a three-Mac deployment, the public server and rank 0 worker are separate
+processes on the main Mac. Ranks 1 and 2 run on the other Macs:
+
+```text
+Client -> public server (coordinator)
+            |
+            +-- distributed omitted/false -> normal local generation
+            |
+            +-- distributed true -> same request to all workers
+                                      rank 0 <-> rank 1 <-> rank 2
+                                       |   MLX collective operations
+                                       v
+                          rank 0 tokens -> coordinator -> client
+                          peer streams -> coordinator consistency checks
+```
+
+1. **Route and reserve the model.** The coordinator reads `distributed` on the
+   existing endpoint. Distributed requests for the same model share a model
+   lease, so they can run together. A request for a different model waits for
+   active requests and their streams to drain before switching the group.
+2. **Prepare the checkpoint once.** The coordinator reuses cached files or
+   downloads missing files on the main Mac, stages a snapshot, and transfers it
+   to peers that need it. Checksums must pass before workers load it. Each Mac
+   stores a full snapshot on disk; the native `Model.shard` implementation
+   determines how model parameters and computation are distributed in memory.
+3. **Admit identical batches.** All workers receive the same request ID and
+   sampling seed. Their generation threads exchange ready IDs, input hashes,
+   active rows, and cancellations at scheduling boundaries. Every rank follows
+   rank 0's ready order and admits only requests prepared identically everywhere.
+   This keeps collective operations in the same order despite HTTP timing
+   differences. The coordinator routes requests; it does not participate in
+   distributed model steps.
+4. **Generate and stream continuously.** The existing native `BatchGenerator`
+   performs prefill and decoding. New compatible requests join as slots become
+   available, and completed rows leave without waiting for the whole batch.
+   Workers verify token and completion decisions before publishing them. The
+   coordinator forwards rank 0's SSE events while consuming and comparing peer
+   streams; it releases terminal success only after all ranks agree.
+5. **Clean up together.** A client disconnect cancels its request across all
+   ranks. The model lease remains held until cleanup finishes, so a model switch
+   cannot overlap old work. A rank failure or disagreement blocks further
+   distributed requests until the group is recovered; local serving remains
+   available.
+
+For example, if two requests share a model and one finishes early, its slot can
+accept a third request while the longer request keeps generating. All ranks
+make that admission together. `--max-num-seqs` controls worker admission and
+accepts positive integers; the native batch limits and tested capacities are
+listed under [Current boundaries and recovery](#current-boundaries-and-recovery).
+
 ## Requests
 
 Send this body to `/v1/chat/completions` on the public server, using its usual

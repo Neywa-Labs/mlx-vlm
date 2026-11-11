@@ -1,3 +1,6 @@
+# Copyright © 2026 Prince Canuma
+# SPDX-License-Identifier: MIT
+
 """Rank-zero admission order for the native continuous batch scheduler.
 
 Only the generation thread uses the collective group. HTTP threads may arrive

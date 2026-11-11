@@ -1,3 +1,6 @@
+# Copyright © 2026 Prince Canuma
+# SPDX-License-Identifier: MIT
+
 """Distributed request routing and staging without GPUs, downloads or SSH."""
 
 import asyncio

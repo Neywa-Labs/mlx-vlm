@@ -1,3 +1,6 @@
+# Copyright © 2026 Prince Canuma
+# SPDX-License-Identifier: MIT
+
 """Opt-in request routing to a dedicated group of distributed HTTP workers.
 
 The coordinator never joins the collective group. Its ordinary model loader and
