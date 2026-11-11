@@ -2707,6 +2707,40 @@ def test_quantize_module(
         assert config["quantization"] == defaults
 
 
+@pytest.mark.parametrize("kind", ["linear", "embedding", "switch", "multi"])
+def test_quantize_native_modules_respects_predicate(kind):
+    from mlx_vlm.models.mla import MultiLinear
+    from mlx_vlm.quant_utils import quantize_model
+
+    factories = {
+        "linear": lambda: nn.Linear(64, 64, bias=False),
+        "embedding": lambda: nn.Embedding(32, 64),
+        "switch": lambda: SwitchLinear(64, 64, 2, bias=False),
+        "multi": lambda: MultiLinear(64, 64, 2),
+    }
+    mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    affine = dict(group_size=64, bits=4, mode="affine")
+    model = nn.Module()
+    for name in ("change", "preserve", "skip"):
+        model[name] = factories[kind]().to_quantized(**mxfp8)
+    preserved, skipped = model.preserve, model.skip
+    expected = mx.quantize(
+        mx.dequantize(model.change.weight, model.change.scales, **mxfp8), **affine
+    )
+    predicate = lambda path, _: {"change": True, "preserve": mxfp8, "skip": False}[path]
+    _, config = quantize_model(
+        model, {"quantization": mxfp8}, **affine, quant_predicate=predicate
+    )
+    assert model.preserve is preserved
+    assert model.skip is skipped
+    assert config["quantization"]["change"] == affine
+    for name, reference in zip(("weight", "scales", "biases"), expected):
+        assert mx.array_equal(getattr(model.change, name), reference).item()
+    converted = model.change
+    quantize_model(model, config, **affine, quant_predicate=predicate)
+    assert model.change is converted
+
+
 def test_mixed_recipe_finds_lfm2_down_projection():
     from mlx_vlm.convert import mixed_quant_predicate_builder
 
@@ -2758,8 +2792,8 @@ def _fp8_conversion_case(family):
         k: v.astype(mx.bfloat16) if model.cast_predicate(k) or "lm_head" in k else v
         for k, v in tree_flatten(model.parameters())
     }
-    # Native BF16 experts in block 0 exercise quantize_model's predicate; block 1
-    # uses individual released FP8 tensors, which must be converted before stacking.
+    # Block 0 has BF16 experts; block 1 loads individual FP8 tensors into stacked
+    # MXFP8 modules. The same predicate must select both for expert quantization.
     source_keys = {}
     prefix = "language_model.model.layers.1.ffn."
     for source, native in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
@@ -2829,7 +2863,9 @@ def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, m
         params = (
             target if family == "qwen3_5" or isinstance(native_key, tuple) else mxfp8
         )
-        quantized = mx.quantize(restored, **params)
+        quantized = mx.quantize(restored, **mxfp8)
+        if params != mxfp8:
+            quantized = mx.quantize(mx.dequantize(*quantized, **mxfp8), **params)
         if native_key is None:
             fused = mx.dequantize(*quantized, **params).reshape(4, 24, 64)
             prefix = "language_model.model.layers.1.attn."
@@ -2873,11 +2909,10 @@ def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, m
         assert mx.array_equal(parameters[key], reference).item()
     exported = json.loads((destination / "config.json").read_text())
     quantization = exported["quantization"]
+    assert {k: quantization[k] for k in mxfp8} == mxfp8
     if family == "qwen3_5":
-        assert {k: quantization[k] for k in target} == target
         assert all(v == target for k, v in quantization.items() if k not in target)
     else:
-        assert {k: quantization[k] for k in mxfp8} == mxfp8
         if bits is not None:
             for path, projection in modules.items():
                 if not hasattr(projection, "weight"):
