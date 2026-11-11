@@ -69,3 +69,6 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def shard(self, group=None):
+        self.language_model.shard(group)

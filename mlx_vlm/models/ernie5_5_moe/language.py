@@ -9,6 +9,8 @@ import re
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace
+from mlx.utils import tree_flatten
 
 from ...fp8 import MLX_MXFP8_QUANTIZATION, _dequantize_fp8_weight
 from ...speculative.cache_state import (
@@ -33,18 +35,27 @@ from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
+def _parallel_output(projection, x, group):
+    if group is None:
+        return projection(x)
+    # Match a full dot product's accumulation before rounding back to BF16.
+    out = projection(x.astype(mx.float32))
+    return mx.distributed.all_sum(out, group=group).astype(x.dtype)
+
+
 class SiTU(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.beta = config.activation_situ_beta
         self.linear_beta = config.activation_situ_linear_beta
+        self.output_dtype = None
 
     def __call__(self, up, gate):
         dtype = gate.dtype
         gate, up = gate.astype(mx.float32), up.astype(mx.float32)
         gate = self.beta * mx.tanh(gate / self.beta) * mx.sigmoid(gate)
         up = self.linear_beta * mx.tanh(up / self.linear_beta)
-        return (gate * up).astype(dtype)
+        return (gate * up).astype(dtype).astype(self.output_dtype or dtype)
 
 
 class MLP(nn.Module):
@@ -54,9 +65,14 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.activation = SiTU(config)
+        self.sharding_group = None
 
     def __call__(self, x):
-        return self.down_proj(self.activation(self.up_proj(x), self.gate_proj(x)))
+        return _parallel_output(
+            self.down_proj,
+            self.activation(self.up_proj(x), self.gate_proj(x)),
+            self.sharding_group,
+        )
 
 
 class MultiRouter(nn.Module):
@@ -105,12 +121,17 @@ class LatentMoE(nn.Module):
         self.shared_experts = MLP(
             config, config.n_shared_experts * config.moe_intermediate_size
         )
+        self.sharding_group = None
 
     def __call__(self, x, router_bias=None):
         bias = self.e_score_correction_bias if router_bias is None else router_bias
         ids, weights = self.gate(x, bias)
         latent = self.fc1_latent_proj(x)
         outputs = self.switch_mlp(latent, ids)
+        if self.sharding_group is not None:
+            # Reconstruct each expert before weighting and the latent RMSNorm.
+            outputs = mx.distributed.all_sum(outputs, group=self.sharding_group)
+            outputs = outputs.astype(latent.dtype)
         combined = (
             (outputs.astype(mx.float32) * weights[..., None])
             .sum(axis=-2)
@@ -149,6 +170,7 @@ class VirtualHeads(nn.Module):
         super().__init__()
         self.U = mx.zeros((heads, rank))
         self.V = mx.zeros((heads, rank))
+        self.sharding_group = None
 
     def __call__(self, x):
         # x: B, L, heads, value_dim. Fold before applying to match the
@@ -157,6 +179,13 @@ class VirtualHeads(nn.Module):
             mx.eye(self.U.shape[0])
             + self.V.astype(mx.float32) @ self.U.astype(mx.float32).T
         )
+        heads = x.shape[-2]
+        if self.sharding_group is not None:
+            x = mx.distributed.all_gather(
+                x.transpose(2, 0, 1, 3), group=self.sharding_group
+            ).transpose(1, 2, 0, 3)
+            start = self.sharding_group.rank() * heads
+            mix = mix[start : start + heads]
         return mix.astype(x.dtype) @ x
 
 
@@ -235,7 +264,9 @@ class HCAAttention(CompressedAttention):
         out = self.rope(out, offset, inverse=True).transpose(0, 2, 1, 3)
         out = self.vha(out).reshape(B, L, self.o_groups, -1).transpose(0, 2, 1, 3)
         out = self.wo_a(out).transpose(0, 2, 1, 3).flatten(-2)
-        return self.wo_b(out * mx.sigmoid(self.o_gate(qr)))
+        return _parallel_output(
+            self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
+        )
 
 
 class Indexer(nn.Module):
@@ -372,7 +403,9 @@ class MLAAttention(nn.Module):
         if L == 1:
             out = self.unembed_out(out)
         out = self.vha(out.transpose(0, 2, 1, 3)).flatten(-2)
-        return self.wo_b(out * mx.sigmoid(self.o_gate(qr)))
+        return _parallel_output(
+            self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
+        )
 
 
 class DecoderLayer(nn.Module):
@@ -464,6 +497,7 @@ class LanguageModel(nn.Module):
         self.model = ErnieModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.multimax = MultiMax()
+        self.sharding_group = None
 
     def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
         hidden_sink = [] if kwargs.get("return_hidden", False) else None
@@ -521,6 +555,77 @@ class LanguageModel(nn.Module):
             )
             for ratio in self.config.compress_ratios
         ]
+
+    def shard(self, group=None):
+        """Partition attention heads and FFN intermediate dimensions."""
+        group = group or mx.distributed.init()
+        size = group.size()
+        if size == 1:
+            return
+        if self.sharding_group is not None:
+            raise ValueError("The language model is already sharded")
+
+        partitions = []
+
+        def partition(module, axis):
+            for name, value in tree_flatten(module.parameters()):
+                # Splitting packed columns and their scales together requires
+                # each rank to own complete quantization groups.
+                if value.shape[axis] % size:
+                    raise ValueError(
+                        f"Cannot shard {type(module).__name__}.{name} "
+                        f"with shape {value.shape} on axis {axis} across {size} ranks"
+                    )
+            partitions.append((module, axis))
+
+        def partition_mlp(mlp):
+            partition(mlp.gate_proj, -2)
+            partition(mlp.up_proj, -2)
+            partition(mlp.down_proj, -1)
+
+        # Validate every dimension before mutating any weights or head counts.
+        for layer in self.layers:
+            attn = layer.attn
+            if isinstance(attn, HCAAttention):
+                if attn.o_groups % size or attn.n_heads % size:
+                    raise ValueError(
+                        "Rank count must divide HCA heads and output groups"
+                    )
+                partition(attn.wq_b, -2)
+                partition(attn.wo_a, 0)
+            else:
+                if attn.heads % size:
+                    raise ValueError("Rank count must divide MLA heads")
+                partition(attn.q_b_proj, -2)
+                partition(attn.embed_q, 0)
+                partition(attn.unembed_out, 0)
+            partition(attn.o_gate, -2)
+            partition(attn.wo_b, -1)
+            ffn = layer.ffn
+            if isinstance(ffn, LatentMoE):
+                partition_mlp(ffn.switch_mlp)
+                partition_mlp(ffn.shared_experts)
+            else:
+                partition_mlp(ffn)
+
+        for module, axis in partitions:
+            shard_inplace(module, lambda path, value, axis=axis: axis, group=group)
+        for layer in self.layers:
+            attn = layer.attn
+            attn.vha.sharding_group = group
+            attn.attn_sink = mx.split(attn.attn_sink, size)[group.rank()]
+            if isinstance(attn, HCAAttention):
+                attn.n_heads //= size
+                attn.o_groups //= size
+            else:
+                attn.heads //= size
+            layer.ffn.sharding_group = group
+            if isinstance(layer.ffn, LatentMoE):
+                layer.ffn.shared_experts.sharding_group = group
+                # Keep down-projection partial sums in FP32 until all-reduce,
+                # while retaining the activation's original BF16 rounding.
+                layer.ffn.switch_mlp.activation.output_dtype = mx.float32
+        self.sharding_group = group
 
     def sanitize(self, weights):
         weights = {k.removeprefix("language_model."): v for k, v in weights.items()}

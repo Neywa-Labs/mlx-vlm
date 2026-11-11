@@ -28,9 +28,22 @@ class Ernie55MTPSplitter(MTPSplitter):
         return extract_echo_weights(tensors, TextConfig.from_dict(text_config))
 
     def quantization_from_source(self, tensors, source_config):
-        if any(key.endswith(".scales") for key in tensors):
-            return source_config.get("quantization")
-        return None
+        if not any(key.endswith(".scales") for key in tensors):
+            return None
+        source = source_config.get("quantization")
+        if source is None:
+            return None
+        quantization = {
+            key: source[key] for key in ("group_size", "bits", "mode") if key in source
+        }
+        config = self.read_text_config(source_config)
+        prefix = f"model.layers.{config.get('num_hidden_layers', 43)}."
+        for path, value in source.items():
+            path = path.removeprefix("language_model.")
+            path = path.removeprefix("echo.").removeprefix(prefix)
+            if path in ("e_proj", "h_proj"):
+                quantization[path] = value
+        return quantization
 
     def should_quantize_key(self, key):
         # Preserve the source precision of the auxiliary projections.
