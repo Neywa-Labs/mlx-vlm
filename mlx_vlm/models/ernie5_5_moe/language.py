@@ -641,9 +641,16 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        def predicate(path, module):
+        def predicate(path, module, *, quantization=None):
             if ".switch_mlp." in path:
-                return {"group_size": 64, "bits": 4, "mode": "affine"}
+                settings = quantization or {
+                    "group_size": 64,
+                    "bits": 4,
+                    "mode": "affine",
+                }
+                if settings["bits"] == 8:
+                    return dict(MLX_MXFP8_QUANTIZATION)
+                return dict(settings)
             if (
                 ".shared_experts." in path
                 or path.endswith(("fc1_latent_proj", "fc2_latent_proj"))

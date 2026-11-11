@@ -2840,23 +2840,34 @@ def _fp8_conversion_case(family):
 
 @pytest.mark.parametrize("family", ["qwen3_5", "ernie5_5_moe"])
 @pytest.mark.parametrize(
-    "bits,group_size,mode",
-    [(4, 64, "affine"), (8, 64, "affine"), (8, 32, "mxfp8"), (None, None, None)],
+    "flags,expert_format",
+    [
+        ([], (8, 32, "mxfp8")),
+        (["-q"], (4, 64, "affine")),
+        (["-q", "--q-bits", "4"], (4, 64, "affine")),
+        (["-q", "--q-bits", "8"], (8, 32, "mxfp8")),
+        (["-q", "--q-mode", "mxfp8"], (8, 32, "mxfp8")),
+        (["-q", "--q-mode", "mxfp4"], (4, 32, "mxfp4")),
+        (["-q", "--q-mode", "nvfp4"], (4, 16, "nvfp4")),
+    ],
+    ids=["default", "quantize", "affine4", "bits8", "mxfp8", "mxfp4", "nvfp4"],
 )
 def test_convert_fp8_respects_quantization_policy(
-    tmp_path, family, bits, group_size, mode
+    tmp_path, family, flags, expert_format
 ):
-    from mlx_vlm.convert import convert
+    from mlx_vlm.convert import configure_parser, convert
+    from mlx_vlm.quant_utils import get_quantization_params
 
+    options = vars(configure_parser().parse_args(flags))
     mx.random.seed(55)
     config, weights, source_keys, preserved = _fp8_conversion_case(family)
     mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
-    target = dict(group_size=group_size, bits=bits, mode=mode) if bits else mxfp8
-    experts = (
-        dict(group_size=64, bits=4, mode="affine")
-        if family == "ernie5_5_moe" and bits is not None
-        else mxfp8
+    target = get_quantization_params(
+        options["q_group_size"], options["q_bits"], options["q_mode"]
     )
+    if not options["quantize"]:
+        target = mxfp8
+    experts = dict(zip(("bits", "group_size", "mode"), expert_format))
     expected = {}
     for source_key, native_key in source_keys.items():
         weights[source_key] = mx.to_fp8(weights[source_key])
@@ -2892,14 +2903,8 @@ def test_convert_fp8_respects_quantization_policy(
     mx.save_safetensors(str(source / "model.safetensors"), weights)
     (source / "config.json").write_text(json.dumps(config))
     with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
-        convert(
-            str(source),
-            str(destination),
-            quantize=bits is not None,
-            q_bits=bits,
-            q_group_size=group_size,
-            q_mode=mode,
-        )
+        options.update(hf_path=str(source), mlx_path=str(destination))
+        convert(**options)
     restored = load_model(destination)
     modules = dict(restored.named_modules())
     for key, (params, quantized) in expected.items():
@@ -2922,7 +2927,7 @@ def test_convert_fp8_respects_quantization_policy(
     if family == "qwen3_5":
         assert all(v == target for k, v in quantization.items() if k not in target)
     else:
-        if bits is not None:
+        if options["quantize"]:
             for path, projection in modules.items():
                 if not hasattr(projection, "weight"):
                     continue
@@ -2935,8 +2940,15 @@ def test_convert_fp8_respects_quantization_policy(
             assert all(path in modules for path in quantization if path not in mxfp8)
         assert restored.language_model.lm_head.weight.dtype == mx.bfloat16
         assert mx.isfinite(restored(mx.array([[1, 2, 3]])).logits).all().item()
+        if options["quantize"]:
+            from mlx_vlm.quant_utils import quantize_model
 
-    if bits == 4:
+            direct, direct_config = load_model(source, return_config=True)
+            direct, _ = quantize_model(direct, direct_config, **target)
+            for key, value in tree_flatten(direct.parameters()):
+                assert mx.array_equal(value, parameters[key]).item()
+
+    if target["bits"] == 4:
         expanded = tmp_path / "dequantized"
         with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
             convert(str(destination), str(expanded), dequantize=True)

@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
-from .quant_utils import get_quantization_params
+from .quant_utils import bind_quant_predicate, get_quantization_params
 from .utils import (
     MODEL_CONVERSION_DTYPES,
     create_model_card,
@@ -322,6 +322,11 @@ def convert(
     )
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
+    if quantize:
+        model_quant_predicate = bind_quant_predicate(
+            model_quant_predicate,
+            get_quantization_params(q_group_size, q_bits, q_mode),
+        )
 
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
