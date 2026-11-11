@@ -3,6 +3,8 @@ mlx_vlm.convert no longer imports mlx_lm. Pure mlx.core/mlx.nn; behaviour is
 identical. Part of the mlx-lm removal series."""
 
 import copy
+import inspect
+from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -55,6 +57,16 @@ def get_total_parameters(model):
     return sum(nparams(m) for _, m in leaf_modules)
 
 
+def bind_quant_predicate(predicate, quantization):
+    """Supply conversion settings to predicates that opt into that argument."""
+    if (
+        predicate is not None
+        and "quantization" in inspect.signature(predicate).parameters
+    ):
+        return partial(predicate, quantization=quantization)
+    return predicate
+
+
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -85,6 +97,8 @@ def quantize_model(
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
           a dict of quantization parameters to pass to `to_quantized`.
+          Predicates may also accept a `quantization` keyword with the resolved
+          group size, bits, and mode requested by the caller.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
@@ -94,6 +108,7 @@ def quantize_model(
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
     quant_params = get_quantization_params(group_size, bits, mode)
+    quant_predicate = bind_quant_predicate(quant_predicate, quant_params)
     group_size = quant_params["group_size"]
     bits = quant_params["bits"]
     if "quantization" in quantized_config:
