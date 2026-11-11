@@ -394,6 +394,8 @@ def convert(
 
         print("[INFO] Dequantizing")
         target = dequantize_model(target)
+        config.pop("quantization", None)
+        config.pop("quantization_config", None)
 
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)

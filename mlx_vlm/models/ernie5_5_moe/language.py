@@ -10,7 +10,7 @@ import re
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...fp8 import _dequantize_fp8_weight
+from ...fp8 import MLX_MXFP8_QUANTIZATION, _dequantize_fp8_weight, transform_fp8_weights
 from ...speculative.cache_state import (
     rollback_speculative_cache,
     start_speculative_cache,
@@ -522,6 +522,39 @@ class LanguageModel(nn.Module):
             for ratio in self.config.compress_ratios
         ]
 
+    def transform_fp8_weights(self, weights, config, target_quantization=None):
+        """Apply the requested expert format directly to released FP8 weights.
+
+        Other FP8 projections stay MXFP8, including ECHO and the fused MLA
+        projection that sanitize later restores to BF16. Record overrides in
+        the stacked MLX expert namespace so the exported config reloads them.
+        """
+        if target_quantization is None or target_quantization == MLX_MXFP8_QUANTIZATION:
+            return transform_fp8_weights(weights, config)
+
+        experts, other, overrides = {}, {}, {}
+        projections = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+        for key, value in weights.items():
+            match = re.fullmatch(
+                r"(?:language_model\.)?model\.layers\.(\d+)\.block_sparse_moe\."
+                r"experts\.\d+\.(w[123])\.(weight|weight_scale_inv)",
+                key,
+            )
+            if match and (key.endswith("_scale_inv") or key + "_scale_inv" in weights):
+                experts[key] = value
+                layer, projection = int(match[1]), projections[match[2]]
+                if layer < self.config.num_hidden_layers:
+                    path = f"language_model.model.layers.{layer}.ffn.switch_mlp.{projection}"
+                    overrides[path] = dict(target_quantization)
+            else:
+                other[key] = value
+
+        other, quantization = transform_fp8_weights(other, config)
+        if quantization is None:
+            return weights, None
+        experts, _ = transform_fp8_weights(experts, config, target_quantization)
+        return {**other, **experts}, {**quantization, **overrides}
+
     def sanitize(self, weights):
         weights = {k.removeprefix("language_model."): v for k, v in weights.items()}
         out = {}
@@ -642,11 +675,15 @@ class LanguageModel(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, module):
-            return (
-                ".switch_mlp." in path
-                or ".shared_experts." in path
+            if ".switch_mlp." in path:
+                return True
+            if (
+                ".shared_experts." in path
                 or path.endswith(("fc1_latent_proj", "fc2_latent_proj"))
-            )
+                or path in ("echo.e_proj", "echo.h_proj")
+            ):
+                return dict(MLX_MXFP8_QUANTIZATION)
+            return False
 
         return predicate
 
