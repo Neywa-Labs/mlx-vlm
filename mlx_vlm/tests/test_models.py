@@ -3918,7 +3918,11 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
-def test_load_model_transforms_fine_grained_fp8_by_format():
+@pytest.mark.parametrize(
+    "target",
+    [None, {"group_size": 64, "bits": 8, "mode": "affine"}],
+)
+def test_load_model_transforms_fine_grained_fp8_by_format(target):
 
     source_config = {
         "model_type": "future_compatible_model",
@@ -3936,14 +3940,14 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
             "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
         },
     ) as quantize:
-        model = load_model(Path("/tmp/model"), lazy=True)
+        model = load_model(Path("/tmp/model"), lazy=True, fp8_quantization=target)
     quantize.assert_called_once()
-    assert quantize.call_args.kwargs["group_size"] == 32
-    assert quantize.call_args.kwargs["bits"] == 8
-    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+    expected = target or {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert {k: quantize.call_args.kwargs[k] for k in expected} == expected
     loaded = dict(model.loaded_weights)
     assert loaded["proj.weight"].dtype == mx.uint32
-    assert loaded["proj.scales"].dtype == mx.uint8
+    assert loaded["proj.scales"].dtype == (mx.bfloat16 if target else mx.uint8)
+    assert ("proj.biases" in loaded) == (target is not None)
     assert "proj.weight_scale_inv" not in loaded
 
 
