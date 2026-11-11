@@ -9,8 +9,10 @@ import re
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_unflatten
 
 from ...fp8 import MLX_MXFP8_QUANTIZATION, _dequantize_fp8_weight
+from ...quant_utils import dequantize_model
 from ...speculative.cache_state import (
     rollback_speculative_cache,
     start_speculative_cache,
@@ -641,13 +643,11 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
+        expert_quantization = {"group_size": 64, "bits": 4, "mode": "affine"}
+
         def predicate(path, module):
             if ".switch_mlp." in path:
-                return {
-                    "group_size": 64,
-                    "bits": 4,
-                    "mode": "affine",
-                }
+                return dict(expert_quantization)
             if (
                 ".shared_experts." in path
                 or path.endswith(("fc1_latent_proj", "fc2_latent_proj"))
@@ -656,6 +656,39 @@ class LanguageModel(nn.Module):
                 return dict(MLX_MXFP8_QUANTIZATION)
             return False
 
+        def prepare(model, quantization):
+            nonlocal expert_quantization
+            expert_quantization = (
+                dict(quantization)
+                if quantization["mode"] == "affine" and quantization["bits"] == 4
+                else dict(MLX_MXFP8_QUANTIZATION)
+            )
+            preserved = {}
+            paths, projections = [], []
+            for path, module in model.named_modules():
+                if not hasattr(module, "scales"):
+                    continue
+                current = {key: getattr(module, key) for key in quantization}
+                preserved[path] = current
+                requested = predicate(path, module)
+                width = module.weight.shape[-1] * 32 // module.bits
+                if (
+                    requested
+                    and requested != current
+                    and width % quantization["group_size"] == 0
+                    and width % requested["group_size"] == 0
+                ):
+                    paths.append(path)
+                    projections.append(module)
+            # Restore only selected native modules; the ordinary quantizer
+            # applies the predicate and writes their new per-module metadata.
+            selected = nn.Module()
+            selected.projections = projections
+            dequantize_model(selected)
+            model.update_modules(tree_unflatten(list(zip(paths, selected.projections))))
+            return preserved
+
+        predicate.prepare = prepare
         return predicate
 
     @property

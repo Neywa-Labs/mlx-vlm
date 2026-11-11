@@ -84,6 +84,9 @@ def quantize_model(
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
           a dict of quantization parameters to pass to `to_quantized`.
+          An optional `prepare(model, quantization)` hook runs before traversal
+          with the resolved CLI settings and returns per-module metadata for
+          existing quantized weights. It may prepare modules for conversion.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
@@ -95,6 +98,12 @@ def quantize_model(
     quant_params = get_quantization_params(group_size, bits, mode)
     group_size = quant_params["group_size"]
     bits = quant_params["bits"]
+    prepare = getattr(quant_predicate, "prepare", None)
+    if prepare is not None:
+        overrides = prepare(model, dict(quant_params))
+        quantized_config.setdefault("quantization", dict(quant_params)).update(
+            overrides
+        )
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis

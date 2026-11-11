@@ -325,6 +325,7 @@ def convert(
             return model_quant_predicate(path, module)
         return True
 
+    base_quant_predicate.prepare = getattr(model_quant_predicate, "prepare", None)
     target = model
 
     if isinstance(quant_predicate, str):

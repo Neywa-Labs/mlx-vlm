@@ -12,7 +12,7 @@ python -m mlx_vlm.convert \
 
 This converts the released FP8 projections to native MLX MXFP8. The source download is about 288 GB; allow additional space for the output.
 
-Use the command above without `-q`. Converting the released checkpoint to 4-bit with `-q` is currently unsupported: existing MXFP8 weights are preserved, but the saved metadata can cause reload failures.
+Add `-q --q-bits 4` to convert routed experts to affine 4-bit, keeping other eligible projections in MXFP8. Without `-q`, the released FP8 projections stay MXFP8.
 
 ## Generate
 
