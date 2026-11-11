@@ -55,6 +55,11 @@ class Model(nn.Module):
         out.update({f"echo.{k}": v for k, v in auxiliary.items()})
         return out
 
+    def transform_fp8_weights(self, weights, config, target_quantization=None):
+        return self.language_model.transform_fp8_weights(
+            weights, config, target_quantization
+        )
+
     @property
     def layers(self):
         return self.language_model.layers

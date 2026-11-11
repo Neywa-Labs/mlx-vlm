@@ -388,8 +388,9 @@ def load_model(
     lazy: bool = False,
     *,
     fp8_quantization: Optional[dict] = None,
+    return_config: bool = False,
     **kwargs,
-) -> nn.Module:
+) -> Union[nn.Module, Tuple[nn.Module, dict]]:
     """
     Load and initialize the model from a given path.
 
@@ -400,6 +401,8 @@ def load_model(
             when needed. Default: ``False``
         fp8_quantization (dict, optional): Native target layout for supported
             block-FP8 weights. Defaults to MXFP8 when omitted.
+        return_config (bool): Also return the resolved loading configuration,
+            including any transformed quantization layouts. Default: ``False``.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -548,8 +551,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
-                weights, quantization = transform_fp8_weights(
-                    weights, config, target_quantization=fp8_quantization
+                transform = getattr(
+                    model, "transform_fp8_weights", transform_fp8_weights
+                )
+                weights, quantization = transform(
+                    weights,
+                    config,
+                    target_quantization=fp8_quantization,
                 )
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
@@ -614,7 +622,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         )
 
-    return load_model_weights(
+    model = load_model_weights(
         model,
         config,
         weights,
@@ -624,6 +632,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         is_offload_dir=(model_path / "offload_index.json").exists(),
         **kwargs,
     )
+    return (model, config) if return_config else model
 
 
 def load_model_weights(
@@ -1062,8 +1071,13 @@ def fetch_from_hub(
     fp8_quantization: Optional[dict] = None,
     **kwargs,
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
-    model = load_model(model_path, lazy, fp8_quantization=fp8_quantization, **kwargs)
-    config = load_config(model_path, **kwargs)
+    model, config = load_model(
+        model_path,
+        lazy,
+        fp8_quantization=fp8_quantization,
+        return_config=True,
+        **kwargs,
+    )
     processor = load_processor(
         model_path,
         add_detokenizer=False,

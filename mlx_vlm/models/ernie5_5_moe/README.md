@@ -12,7 +12,18 @@ python -m mlx_vlm.convert \
   --mlx-path ./ERNIE-5.5-Flash-Base-MXFP8
 ```
 
-The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. Adding `-q` does not requantize existing MXFP8 projections to 4-bit. The vocabulary head retains its checkpoint dtype (BF16 in the release); vocabulary projection and MultiMax arithmetic use FP32. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
+The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. The vocabulary head retains its checkpoint dtype (BF16 in the release); vocabulary projection and MultiMax arithmetic use FP32. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
+
+For 4-bit routed experts with MXFP8 for the other eligible projections, convert directly from the original checkpoint:
+
+```sh
+python -m mlx_vlm.convert \
+  --hf-path baidu/ERNIE-5.5-Flash-Base \
+  --mlx-path ./ERNIE-5.5-Flash-Base-4bit-MXFP8 \
+  -q --q-mode affine --q-bits 4 --q-group-size 64 --dtype bfloat16
+```
+
+The model's quantization predicate keeps shared experts, latent projections, and ECHO projections in MXFP8 with group size 32. Other source FP8 projections also stay MXFP8, including the fused MLA projection before its BF16 layout conversion. Routed experts inherit the requested quantization settings; `--q-mode mxfp8 --q-bits 8 --q-group-size 32` keeps them in MXFP8 too. Existing unquantized tensors retain their storage dtypes. Already converted projections are preserved, so use the original FP8 source when changing the expert format. Mixed quantization settings are saved per module for reloading.
 
 ```sh
 python -m mlx_vlm.generate \

@@ -2737,26 +2737,106 @@ def test_mixed_recipe_finds_lfm2_down_projection():
         assert bits[f"layers.{i}.feed_forward.w1"] == 4
 
 
-@pytest.mark.parametrize(
-    "bits,group_size,mode", [(4, 64, "affine"), (8, 64, "affine"), (8, 32, "mxfp8")]
-)
-def test_convert_fp8_uses_requested_layout(tmp_path, bits, group_size, mode):
-    from mlx_vlm.convert import convert
+def _fp8_conversion_case(family):
     from mlx_vlm.tests.test_models import model_case
 
-    config = model_case("qwen3_5")["config"]
-    config["text_config"].update(hidden_size=128, intermediate_size=128)
-    model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
-    weights = dict(tree_flatten(model.parameters()))
-    key = "language_model.model.layers.0.mlp.gate_proj.weight"
-    weights[key] = mx.to_fp8(weights[key])
-    weights[key + "_scale_inv"] = mx.array([[1.3]])
-    expected = mx.quantize(
-        mx.from_fp8(weights[key], dtype=mx.bfloat16) * weights[key + "_scale_inv"],
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-    )
+    config = model_case(family)["config"]
+    if family == "qwen3_5":
+        config["text_config"].update(hidden_size=128, intermediate_size=128)
+        model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
+        weights = dict(tree_flatten(model.parameters()))
+        key = "language_model.model.layers.0.mlp.gate_proj.weight"
+        return config, weights, {key: key}, {}
+
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+    from mlx_vlm.models.ernie5_5_moe.echo import EchoWeights
+
+    config.update(first_k_dense_replace=0, hybrid_mla_kv_lora_rank=64)
+    model = Model(ModelConfig.from_dict(config))
+    model.echo = EchoWeights(model.config)
+    weights = {
+        k: v.astype(mx.bfloat16) if model.cast_predicate(k) or "lm_head" in k else v
+        for k, v in tree_flatten(model.parameters())
+    }
+    # Native BF16 experts in block 0 exercise quantize_model's predicate; block 1
+    # uses individual released FP8 tensors, which must be converted before stacking.
+    source_keys = {}
+    prefix = "language_model.model.layers.1.ffn."
+    for source, native in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        native_key = prefix + f"switch_mlp.{native}.weight"
+        for expert, weight in enumerate(weights.pop(native_key)):
+            source_key = (
+                f"model.layers.1.block_sparse_moe.experts.{expert}.{source}.weight"
+            )
+            weights[source_key] = weight
+            source_keys[source_key] = (native_key, expert)
+    for source, native in (
+        (
+            "model.layers.0.self_attn.linear_q_down_proj.weight",
+            "language_model.model.layers.0.attn.wq_a.weight",
+        ),
+        (
+            "model.layers.1.block_sparse_moe.shared_experts.w1.weight",
+            prefix + "shared_experts.gate_proj.weight",
+        ),
+        ("model.layers.2.e_proj.weight", "echo.e_proj.weight"),
+        ("model.layers.2.h_proj.weight", "echo.h_proj.weight"),
+    ):
+        weights[source] = weights.pop(native)
+        source_keys[source] = native
+    # Fused MLA must not suffer an affine round trip before becoming BF16.
+    prefix = "language_model.model.layers.1.attn."
+    k = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+    v = weights.pop(prefix + "unembed_out.weight")
+    fused = mx.concatenate((k, v), axis=1).reshape(-1, 64)
+    key = "model.layers.1.self_attn.kv_b_proj.weight"
+    weights[key] = fused
+    source_keys[key] = None
+    preserved = {
+        "language_model.lm_head.weight": weights["language_model.lm_head.weight"],
+        "language_model.model.layers.0.ffn.gate.weight": weights[
+            "language_model.model.layers.0.ffn.gate.weight"
+        ],
+        "language_model.model.layers.0.attn.compressor.wkv.weight": weights[
+            "language_model.model.layers.0.attn.compressor.wkv.weight"
+        ],
+    }
+    return config, weights, source_keys, preserved
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "ernie5_5_moe"])
+@pytest.mark.parametrize(
+    "bits,group_size,mode",
+    [(4, 64, "affine"), (8, 64, "affine"), (8, 32, "mxfp8"), (None, None, None)],
+)
+def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, mode):
+    from mlx_vlm.convert import convert
+
+    mx.random.seed(55)
+    config, weights, source_keys, preserved = _fp8_conversion_case(family)
+    mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    target = dict(group_size=group_size, bits=bits, mode=mode) if bits else mxfp8
+    expected = {}
+    for source_key, native_key in source_keys.items():
+        weights[source_key] = mx.to_fp8(weights[source_key])
+        rows, cols = weights[source_key].shape
+        scales = mx.full(((rows + 127) // 128, (cols + 127) // 128), 1.3)
+        weights[source_key + "_scale_inv"] = scales
+        restored = (
+            mx.from_fp8(weights[source_key], dtype=mx.bfloat16)
+            * mx.repeat(mx.repeat(scales, 128, axis=0), 128, axis=1)[:rows, :cols]
+        )
+        params = (
+            target if family == "qwen3_5" or isinstance(native_key, tuple) else mxfp8
+        )
+        quantized = mx.quantize(restored, **params)
+        if native_key is None:
+            fused = mx.dequantize(*quantized, **params).reshape(4, 24, 64)
+            prefix = "language_model.model.layers.1.attn."
+            preserved[prefix + "embed_q.weight"] = fused[:, :8].swapaxes(-1, -2)
+            preserved[prefix + "unembed_out.weight"] = fused[:, 8:]
+        else:
+            expected[native_key] = (params, quantized)
     config["quantization_config"] = {
         "quant_method": "fp8",
         "fmt": "e4m3",
@@ -2770,28 +2850,61 @@ def test_convert_fp8_uses_requested_layout(tmp_path, bits, group_size, mode):
         convert(
             str(source),
             str(destination),
-            quantize=True,
+            quantize=bits is not None,
             q_bits=bits,
             q_group_size=group_size,
             q_mode=mode,
         )
     restored = load_model(destination)
-    projection = restored.language_model.model.layers[0].mlp.gate_proj
-    assert (projection.bits, projection.group_size, projection.mode) == (
-        bits,
-        group_size,
-        mode,
-    )
-    for name, reference in zip(("weight", "scales", "biases"), expected):
-        actual = getattr(projection, name)
-        assert actual.dtype == reference.dtype
-        assert mx.array_equal(actual, reference).item()
+    modules = dict(restored.named_modules())
+    for key, (params, quantized) in expected.items():
+        native_key, expert = key if isinstance(key, tuple) else (key, None)
+        projection = modules[native_key.removesuffix(".weight")]
+        assert {k: getattr(projection, k) for k in params} == params
+        for name, reference in zip(("weight", "scales", "biases"), quantized):
+            actual = getattr(projection, name)
+            if expert is not None:
+                actual = actual[expert]
+            assert actual.dtype == reference.dtype
+            assert mx.array_equal(actual, reference).item()
+    parameters = dict(tree_flatten(restored.parameters()))
+    for key, reference in preserved.items():
+        assert parameters[key].dtype == reference.dtype
+        assert mx.array_equal(parameters[key], reference).item()
     exported = json.loads((destination / "config.json").read_text())
-    assert exported["quantization"] == {
-        "bits": bits,
-        "group_size": group_size,
-        "mode": mode,
-    }
+    quantization = exported["quantization"]
+    if family == "qwen3_5":
+        assert {k: quantization[k] for k in target} == target
+        assert all(v == target for k, v in quantization.items() if k not in target)
+    else:
+        assert {k: quantization[k] for k in mxfp8} == mxfp8
+        if bits is not None:
+            for path, projection in modules.items():
+                if not hasattr(projection, "weight"):
+                    continue
+                if ".switch_mlp." in path:
+                    assert {k: getattr(projection, k) for k in target} == target
+                elif ".shared_experts." in path or path.endswith(
+                    ("fc1_latent_proj", "fc2_latent_proj")
+                ):
+                    assert {k: getattr(projection, k) for k in mxfp8} == mxfp8
+            assert all(path in modules for path in quantization if path not in mxfp8)
+        assert restored.language_model.lm_head.weight.dtype == mx.bfloat16
+        assert mx.isfinite(restored(mx.array([[1, 2, 3]])).logits).all().item()
+
+    if bits == 4:
+        expanded = tmp_path / "dequantized"
+        with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
+            convert(str(destination), str(expanded), dequantize=True)
+        dequantized = load_model(expanded)
+        parameters = dict(tree_flatten(dequantized.parameters()))
+        assert not any(key.endswith(".scales") for key in parameters)
+        for key, (params, quantized) in expected.items():
+            native_key, expert = key if isinstance(key, tuple) else (key, None)
+            actual = parameters[native_key]
+            if expert is not None:
+                actual = actual[expert]
+            assert mx.array_equal(actual, mx.dequantize(*quantized, **params)).item()
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
