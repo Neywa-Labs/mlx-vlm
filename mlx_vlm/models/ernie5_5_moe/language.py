@@ -612,11 +612,6 @@ class LanguageModel(nn.Module):
                             ]
                         )
         weights = out
-        # Every vocabulary projection runs in FP32. Promote a dense head once
-        # at loading, rather than recasting the entire BF16 matrix each call.
-        head = weights.get("lm_head.weight")
-        if head is not None and mx.issubdtype(head.dtype, mx.floating):
-            weights["lm_head.weight"] = head.astype(mx.float32)
         for i, ratio in enumerate(self.config.compress_ratios):
             key = f"model.layers.{i}.attn.kv_b_proj.weight"
             if ratio == -2 and key in weights:
