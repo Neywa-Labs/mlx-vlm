@@ -310,10 +310,18 @@ def convert(
     mtp: bool = False,
     mtp_output: Optional[str] = None,
 ):
+    if quantize and dequantize:
+        raise ValueError("Choose either quantize or dequantize, not both.")
+
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
+        model_path,
+        lazy=True,
+        trust_remote_code=trust_remote_code,
+        fp8_quantization=(
+            get_quantization_params(q_group_size, q_bits, q_mode) if quantize else None
+        ),
     )
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
@@ -349,9 +357,6 @@ def convert(
 
         target.update(tree_map_with_path(set_dtype, target.parameters()))
         _record_conversion_dtype(config, dtype)
-
-    if quantize and dequantize:
-        raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
         from .quant_utils import quantize_model

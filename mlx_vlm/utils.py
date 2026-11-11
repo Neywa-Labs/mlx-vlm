@@ -392,6 +392,8 @@ def load_model(
     model_path: Path,
     lazy: bool = False,
     sharding_group: Optional[mx.distributed.Group] = None,
+    *,
+    fp8_quantization: Optional[dict] = None,
     **kwargs,
 ) -> nn.Module:
     """
@@ -405,6 +407,8 @@ def load_model(
         sharding_group: Optional group passed to ``model.shard(group, weights=...)``
             before conversion when the architecture supports checkpoint weights.
             Call ``model.shard(group)`` afterwards to complete distributed loading.
+        fp8_quantization (dict, optional): Native target layout for supported
+            block-FP8 weights. Defaults to MXFP8 when omitted.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -563,7 +567,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
-                weights, quantization = transform_fp8_weights(weights, config)
+                weights, quantization = transform_fp8_weights(
+                    weights, config, target_quantization=fp8_quantization
+                )
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
                     from .models.deepseek_v4.language import make_quantization_config
@@ -1081,9 +1087,13 @@ def load_processor(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False, **kwargs
+    model_path: Path,
+    lazy: bool = False,
+    *,
+    fp8_quantization: Optional[dict] = None,
+    **kwargs,
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, fp8_quantization=fp8_quantization, **kwargs)
     config = load_config(model_path, **kwargs)
     processor = load_processor(
         model_path,

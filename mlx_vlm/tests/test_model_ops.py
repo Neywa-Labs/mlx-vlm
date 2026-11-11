@@ -2737,6 +2737,63 @@ def test_mixed_recipe_finds_lfm2_down_projection():
         assert bits[f"layers.{i}.feed_forward.w1"] == 4
 
 
+@pytest.mark.parametrize(
+    "bits,group_size,mode", [(4, 64, "affine"), (8, 64, "affine"), (8, 32, "mxfp8")]
+)
+def test_convert_fp8_uses_requested_layout(tmp_path, bits, group_size, mode):
+    from mlx_vlm.convert import convert
+    from mlx_vlm.tests.test_models import model_case
+
+    config = model_case("qwen3_5")["config"]
+    config["text_config"].update(hidden_size=128, intermediate_size=128)
+    model = qwen35.Model(qwen35.ModelConfig.from_dict(config))
+    weights = dict(tree_flatten(model.parameters()))
+    key = "language_model.model.layers.0.mlp.gate_proj.weight"
+    weights[key] = mx.to_fp8(weights[key])
+    weights[key + "_scale_inv"] = mx.array([[1.3]])
+    expected = mx.quantize(
+        mx.from_fp8(weights[key], dtype=mx.bfloat16) * weights[key + "_scale_inv"],
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_block_size": [128, 128],
+    }
+    source, destination = tmp_path / "source", tmp_path / "converted"
+    source.mkdir()
+    mx.save_safetensors(str(source / "model.safetensors"), weights)
+    (source / "config.json").write_text(json.dumps(config))
+    with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
+        convert(
+            str(source),
+            str(destination),
+            quantize=True,
+            q_bits=bits,
+            q_group_size=group_size,
+            q_mode=mode,
+        )
+    restored = load_model(destination)
+    projection = restored.language_model.model.layers[0].mlp.gate_proj
+    assert (projection.bits, projection.group_size, projection.mode) == (
+        bits,
+        group_size,
+        mode,
+    )
+    for name, reference in zip(("weight", "scales", "biases"), expected):
+        actual = getattr(projection, name)
+        assert actual.dtype == reference.dtype
+        assert mx.array_equal(actual, reference).item()
+    exported = json.loads((destination / "config.json").read_text())
+    assert exported["quantization"] == {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": mode,
+    }
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("quantize", [False, True])
 def test_convert_dtype_round_trip_preserves_cast_exclusions(tmp_path, dtype, quantize):
