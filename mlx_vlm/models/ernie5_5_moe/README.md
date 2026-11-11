@@ -14,26 +14,9 @@ python -m mlx_vlm.convert \
 
 The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. The vocabulary head retains its checkpoint dtype (BF16 in the release); vocabulary projection and MultiMax arithmetic use FP32. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
 
-For 4-bit routed experts with MXFP8 for the other eligible projections, convert directly from the original checkpoint:
+The standard quantizer skips modules that are already quantized. Adding `-q` therefore preserves the MXFP8 experts loaded from the released checkpoint; it does not convert them to 4-bit. This port does not add CLI precision remapping or requantization.
 
-```sh
-python -m mlx_vlm.convert \
-  --hf-path baidu/ERNIE-5.5-Flash-Base \
-  --mlx-path ./ERNIE-5.5-Flash-Base-4bit-MXFP8 \
-  -q --q-mode affine --q-bits 4 --q-group-size 64 --dtype bfloat16
-```
-
-The shared loader first prepares native MXFP8 weights. The model's `quant_predicate` selects the routed-expert format from the CLI settings:
-
-| Flags | Routed experts | Group size |
-| --- | --- | ---: |
-| `-q` or `-q --q-bits 4` | Affine 4-bit | 64 by default |
-| `-q --q-bits 8` | MXFP8 | 32 |
-| `-q --q-mode mxfp8` | MXFP8 | 32 |
-| `-q --q-mode mxfp4` | MXFP4 | 32 |
-| `-q --q-mode nvfp4` | NVFP4 | 16 |
-
-Other eligible projections, including shared experts, latent projections, and ECHO, stay MXFP8 with group size 32. The fused MLA projection stays MXFP8 before its BF16 layout conversion. Omitting `-q` retains the loader's MXFP8 weights and leaves other tensors unchanged. The predicate also applies to native quantized checkpoints; modules already in the requested format are preserved without requantization. Mixed quantization settings are saved per module for reloading.
+For eligible floating-point modules, the model's fixed `quant_predicate` selects affine 4-bit/group-64 routed experts and MXFP8/group-32 shared experts, latent projections, and ECHO projections. The vocabulary head and other excluded tensors retain their precision. These per-module settings are saved for reloading.
 
 ```sh
 python -m mlx_vlm.generate \

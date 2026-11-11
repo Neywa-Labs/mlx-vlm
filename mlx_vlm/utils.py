@@ -393,7 +393,6 @@ def load_model(
     lazy: bool = False,
     sharding_group: Optional[mx.distributed.Group] = None,
     *,
-    fp8_quantization: Optional[dict] = None,
     return_config: bool = False,
     **kwargs,
 ) -> Union[nn.Module, Tuple[nn.Module, dict]]:
@@ -408,8 +407,6 @@ def load_model(
         sharding_group: Optional group passed to ``model.shard(group, weights=...)``
             before conversion when the architecture supports checkpoint weights.
             Call ``model.shard(group)`` afterwards to complete distributed loading.
-        fp8_quantization (dict, optional): Native target layout for supported
-            block-FP8 weights. Defaults to MXFP8 when omitted.
         return_config (bool): Also return the resolved loading configuration,
             including any transformed quantization layouts. Default: ``False``.
         revision (str, optional): A revision id which can be a branch name,
@@ -570,11 +567,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
-                weights, quantization = transform_fp8_weights(
-                    weights,
-                    config,
-                    target_quantization=fp8_quantization,
-                )
+                weights, quantization = transform_fp8_weights(weights, config)
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
                     from .models.deepseek_v4.language import make_quantization_config
@@ -1093,19 +1086,9 @@ def load_processor(
 
 
 def fetch_from_hub(
-    model_path: Path,
-    lazy: bool = False,
-    *,
-    fp8_quantization: Optional[dict] = None,
-    **kwargs,
+    model_path: Path, lazy: bool = False, **kwargs
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
-    model, config = load_model(
-        model_path,
-        lazy,
-        fp8_quantization=fp8_quantization,
-        return_config=True,
-        **kwargs,
-    )
+    model, config = load_model(model_path, lazy, return_config=True, **kwargs)
     processor = load_processor(
         model_path,
         add_detokenizer=False,
