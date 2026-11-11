@@ -90,6 +90,7 @@ from mlx_vlm.speculative.common import verify_forward
 from mlx_vlm.tests.test_models import (
     DATA,
     build_config,
+    make_ernie55_model,
     model_case,
     tiny_language_model,
 )
@@ -4557,8 +4558,8 @@ def test_deepseek_v41_batch_cache_restores_all_state(abort):
     )
 
 
-def test_ernie55_chunked_decode_compression_and_sparse_attention(ernie55_learned_model):
-    model = ernie55_learned_model
+def test_ernie55_chunked_decode_compression_and_sparse_attention():
+    model = make_ernie55_model(learned=True)
     tokens = mx.arange(19)[None]
     expected = model(tokens).logits
     for chunks in ([1] * 19, [2, 2, 3, 4, 8], [7, 1, 8, 3], [8, 8, 3]):
@@ -4580,8 +4581,8 @@ def test_ernie55_chunked_decode_compression_and_sparse_attention(ernie55_learned
     )
 
 
-def test_ernie55_cache_merge_extract_filter_and_reset(ernie55_learned_model):
-    model = ernie55_learned_model
+def test_ernie55_cache_merge_extract_filter_and_reset():
+    model = make_ernie55_model(learned=True)
     caches = []
     for length in (3, 11):
         cache = model.make_cache()
