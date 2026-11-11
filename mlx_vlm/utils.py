@@ -386,10 +386,8 @@ def get_model_path(
 def load_model(
     model_path: Path,
     lazy: bool = False,
-    *,
-    return_config: bool = False,
     **kwargs,
-) -> Union[nn.Module, Tuple[nn.Module, dict]]:
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -398,8 +396,6 @@ def load_model(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
-        return_config (bool): Also return the resolved loading configuration,
-            including any transformed quantization layouts. Default: ``False``.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -612,7 +608,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         )
 
-    model = load_model_weights(
+    # Weight conversion can change the layout after model.config was created.
+    for key in ("quantization", "quantization_config"):
+        if key in config:
+            setattr(model.config, key, config[key])
+
+    return load_model_weights(
         model,
         config,
         weights,
@@ -622,7 +623,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         is_offload_dir=(model_path / "offload_index.json").exists(),
         **kwargs,
     )
-    return (model, config) if return_config else model
 
 
 def load_model_weights(
@@ -1057,7 +1057,11 @@ def load_processor(
 def fetch_from_hub(
     model_path: Path, lazy: bool = False, **kwargs
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
-    model, config = load_model(model_path, lazy, return_config=True, **kwargs)
+    model = load_model(model_path, lazy, **kwargs)
+    config = load_config(model_path, **kwargs)
+    for key in ("quantization", "quantization_config"):
+        if (value := getattr(model.config, key, None)) is not None:
+            config[key] = value
     processor = load_processor(
         model_path,
         add_detokenizer=False,
