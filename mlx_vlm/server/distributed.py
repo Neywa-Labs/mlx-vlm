@@ -1,4 +1,4 @@
-# Copyright © 2026 Prince Canuma
+# Copyright © 2026 Neywa Labs Inc.
 # SPDX-License-Identifier: MIT
 
 """Opt-in request routing to a dedicated group of distributed HTTP workers.
