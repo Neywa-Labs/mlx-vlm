@@ -1,0 +1,214 @@
+# Per-request distributed serving
+
+One public MLX-VLM server can handle both local and distributed models through
+the existing API routes. Omit `distributed`, or set it to `false`, to use the
+normal single-device loader. Set it to `true` to use a configured worker group.
+The coordinator remains outside that collective group, with a separate worker
+process on each participating Mac, including the main Mac.
+
+This is opt-in: an unconfigured distributed request returns an error instead
+of silently loading the model locally. Models need an implemented `Model.shard`
+method; a large checkpoint is not automatically a shardable checkpoint.
+
+## Requests
+
+Send this body to `/v1/chat/completions` on the public server, using its usual
+Bearer authentication. Replace the example model ID with a compatible model:
+
+```json
+{
+  "model": "organization/shardable-model",
+  "distributed": true,
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "max_tokens": 128,
+  "stream": true
+}
+```
+
+The same flag works on `/chat/completions`, `/v1/responses`,
+`/v1/responses/input_tokens`, and `/v1/responses/compact`. With an OpenAI-compatible
+SDK, put `distributed` in `extra_body`. Optional `distributed_revision` selects a
+Hub branch, tag, or commit. It applies only to distributed Hub model IDs.
+
+Each request can choose a different model. Workers load the newly selected
+checkpoint through the normal server model cache, then shard it across their
+group. A subsequent request with `distributed: false` still uses the public
+server's normal local cache. Multiple distributed models are not kept resident
+simultaneously; the group switches its active model as needed.
+
+## Cluster setup
+
+Use the same MLX-VLM checkout and dependency versions on every worker. Configure
+MLX's hostfile/backend for the machines and test that network separately. The
+server does not provision Macs, configure RDMA, install packages, or launch its
+workers automatically. A distributed request downloads and stages weights on
+an already running worker group.
+
+Requirements:
+
+- A dedicated collective group, with one worker endpoint per rank.
+- The same absolute staging directory on all machines, writable by the worker
+  and coordinator users. Each machine needs room for the full checkpoint.
+- Noninteractive SSH and `rsync` from the coordinator to the other Macs. The
+  coordinator's configured Python command must also work on every peer.
+- A shared worker API key, distinct from the public server's key if desired.
+  Keep worker endpoints private and send inference through the coordinator.
+- Identical worker settings. Health checks compare source, MLX version, runtime
+  settings, rank count, and backend before loading a model.
+
+For example, save this as `cluster.json` on the main Mac. Host names and paths
+are examples to replace with your deployment's values:
+
+```json
+{
+  "workers": [
+    {"url": "http://127.0.0.1:8283"},
+    {"url": "http://mac-two.internal:8283", "ssh": "mac-two"},
+    {"url": "http://mac-three.internal:8283", "ssh": "mac-three"}
+  ],
+  "model_dir": "/Users/Shared/mlx-vlm-distributed-models",
+  "shared_lock": "/Users/Shared/mlx-vlm-distributed.lock",
+  "python": "/Users/Shared/mlx-vlm-venv/bin/python",
+  "api_key_env": "MLX_VLM_DISTRIBUTED_API_KEY",
+  "timeout": 7200
+}
+```
+
+Omit `ssh` only for a worker sharing the coordinator's filesystem. Worker URLs
+are HTTP(S) origins reachable from the coordinator; they can also be local SSH
+tunnel endpoints. Optional `ssh_options` is an array of arguments, for example
+`["-F", "/path/to/ssh-config"]`. Use a staging path without spaces or shell
+metacharacters. Give each independent worker group its own staging root and
+lock file. All coordinators for the *same* group must share that filesystem lock;
+an API client should not acquire the coordinator's lock itself.
+
+Configure `MLX_VLM_SERVER_API_KEY` with the same worker token in each worker's
+launch environment. No preload, adapter, or draft-model environment settings
+should be inherited by workers. Then launch the worker group using your existing
+MLX hostfile and environment provisioning:
+
+```bash
+mlx.launch --hostfile /path/to/hosts.json --backend jaccl \
+  --python /Users/Shared/mlx-vlm-venv/bin/python \
+  --cwd /path/to/mlx-vlm -- \
+  -m mlx_vlm.server --distributed-worker \
+  --distributed-backend jaccl --max-num-seqs 4 \
+  --distributed-model-dir /Users/Shared/mlx-vlm-distributed-models \
+  --host 0.0.0.0 --port 8283
+```
+
+The launcher must propagate the worker environment to **every rank**; exporting
+a variable only in the coordinator's terminal is not sufficient for SSH workers.
+Use your existing protected environment file or remote launch wrapper for keys.
+Use `ring` instead of `jaccl` in both flags for an appropriately configured ring
+hostfile. There must be at least two ranks.
+
+In the public server's environment, set `MLX_VLM_SERVER_API_KEY` to its client
+token and `MLX_VLM_DISTRIBUTED_API_KEY` to the worker token. Start the public server:
+
+```bash
+python -m mlx_vlm.server --distributed-config /path/to/cluster.json \
+  --host 127.0.0.1 --port 8080
+```
+
+This server can still use ordinary local options such as `--model` to preload a
+local model. Account for the combined GPU memory used by that model and the
+main Mac's separate distributed worker. The coordinator does not automatically
+evict its local model to make room for the worker.
+
+## Download, transfer, and loading
+
+On the first distributed request for a model/revision:
+
+1. The coordinator checks that the workers form one compatible group.
+2. It resolves a local model directory or uses MLX-VLM's normal Hub download
+   path. Existing cached files are reused; missing files are downloaded on the
+   main Mac. Hub credentials stay there.
+3. It validates the architecture's sharding support and weight index, hashes
+   checkpoint files, and materializes a snapshot with a content-derived name.
+   Hub symlinks become ordinary files so peers do not need the main Mac's cache.
+4. It verifies an existing snapshot on each peer or transfers it with `rsync`.
+   Size and SHA-256 checks must pass before an atomic rename makes it loadable.
+   A partial transfer never triggers loading.
+5. It sends the same request, model path, tenant, and sampling seed concurrently
+   to all ranks. Workers use the shared native model/processor loader lazily,
+   call `Model.shard`, materialize parameters, and synchronize before generation.
+
+Workers do not resolve Hub IDs themselves. Later requests reuse the prepared
+snapshot. The coordinator resolves each model/revision once per process; pin a
+commit for reproducibility and restart the coordinator when intentionally
+refreshing a moving Hub branch or an edited local directory. Staged snapshots
+are immutable and are not automatically deleted.
+
+## Current boundaries and recovery
+
+Distributed requests support streaming and continuous batching. Set `stream:
+true` for SSE on Chat Completions or Responses; ordinary JSON responses use the
+same batch scheduler. Set the same positive `--max-num-seqs` on every worker
+(the distributed default is 4). Values such as 3, 12, or 16 are also accepted;
+4 and 8 are the tested capacities. The native decoder retains its default
+limit of 32 decoding rows per compatible group and prefills up to 8 rows at a
+time. A larger `--max-num-seqs` admits more requests but does not raise those
+internal limits. Memory use also depends on the model and context lengths.
+Compatible requests for the same model
+can join an active batch as slots become available. Different sampling settings
+use the native scheduler's separate groups. A model switch waits for current
+requests, including streams, to drain; later requests cannot starve the switch.
+
+The native generation thread gathers prepared-request identities and input
+hashes at each scheduling boundary. All ranks use rank 0's admission order,
+admit only requests prepared identically everywhere, combine cancellations,
+and verify token/completion decisions before emitting tokens. Late arrivals do
+not make workers schedule different collectives. Default requests share a
+sampler seed, with independent row keys, so random per-request seeds do not
+accidentally prevent batching.
+
+The coordinator forwards rank 0's SSE events as they arrive and drains every
+other rank concurrently. It compares normalized stream contents and withholds
+the terminal success event until all ranks finish consistently. A disconnect
+cancels that request across ranks and retains the model lease through cleanup;
+other active rows continue. Stream failures produce an SSE error and mark the
+group for recovery.
+
+Responses requests remain stateless (`store: false`); provide full history or a
+compaction capsule instead of `previous_response_id`. Resumable continuations,
+adapters, speculative drafters, diffusion models, and custom `model_file` architectures remain
+unsupported. Other modality endpoints remain local-only.
+
+Workers disable automatic prefix caching, vision caching, and the expiring
+chat-compaction cache. These independent caches could otherwise skip work on
+one rank. Normal local requests retain their existing serving behavior.
+For multimodal requests, inline data URLs ensure each worker receives the same
+media bytes; local media paths must exist identically on all workers.
+
+For compaction, configure `compaction_key_file` in `cluster.json` and set
+`MLX_VLM_COMPACTION_KEY_FILE` on every worker to a file containing the same Fernet
+key. Keep the key across restarts. The coordinator compares decrypted capsule
+contents, since encryption produces different ciphertext on each rank.
+
+The coordinator returns the primary worker's response after comparing rank
+outputs, excluding generated identifiers and timing metadata. A failed rank,
+timeout, or disagreement writes `.cluster-failed.json` in the staging directory
+and blocks further distributed requests. Local requests remain available.
+
+Inspect that marker and worker logs, stop/restart the **entire affected worker
+group**, and confirm no old request is running. Only then remove the failure
+marker and retry. Do not delete an active lock file or restart unrelated groups.
+Transfer failures occur before inference and can be retried; corrupt committed
+snapshots are preserved for diagnosis instead of silently overwritten.
+
+## Validation
+
+```bash
+python -m pytest -q mlx_vlm/tests/test_server_distributed.py mlx_vlm/tests/test_server.py
+```
+
+The distributed tests cover HTTP streaming, cancellation, overlapping model
+leases, staging integrity, input consistency, and failure handling. Two local
+MLX ring processes also exercise the native continuous batch generator at batch
+sizes 4 and 8, using a deterministic synthetic model with tensor collectives and
+KV caches. They test reversed arrival order, late admission, early completion,
+cancellation from only one rank, and sampling with deliberately different
+process RNG states. This does not establish three-Mac JACCL
+performance or released-weight model correctness; validate those separately on
+the configured hardware.

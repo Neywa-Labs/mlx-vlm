@@ -608,13 +608,18 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
-        model, processor = load(
-            model_path,
-            adapter_path,
-            trust_remote_code=trust_remote_code,
-            expert_cache_gb=get_expert_cache_gb(),
-            max_kv_size=get_configured_context_limit(),
-        )
+        if runtime.distributed_worker is not None:
+            model, processor = runtime.distributed_worker.load(
+                model_path, adapter_path, trust_remote_code=trust_remote_code
+            )
+        else:
+            model, processor = load(
+                model_path,
+                adapter_path,
+                trust_remote_code=trust_remote_code,
+                expert_cache_gb=get_expert_cache_gb(),
+                max_kv_size=get_configured_context_limit(),
+            )
         if hasattr(model, "system_one"):
             from ..models.d1_lfm3_vl.d1 import REFUSAL
 
@@ -1292,6 +1297,15 @@ class ResponseGenerator:
             )
 
         request_id = f"{id(rqueue):x}"
+        if runtime.distributed_worker is not None:
+            from .distributed_schedule import request_scope
+
+            scope = request_scope.get()
+            if scope is None:
+                raise ValueError(
+                    "Distributed generation requires a coordinator request ID"
+                )
+            request_id = scope.next_id()
         queued_request = QueuedGenerationRequest(
             rqueue=rqueue,
             raw_inputs=raw_inputs,
@@ -1553,6 +1567,18 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+        if runtime.distributed_worker is not None:
+            # Every rank draws from identical row/position keys, including
+            # special filters which otherwise use process-global RNG state.
+            return _PositionedTargetSampler(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                seed=args.seed,
+                top_n_sigma=args.top_n_sigma,
+                p_less=args.p_less,
+                typical_p=args.typical_p,
+            )
         if args.top_n_sigma > 0:
             return make_sampler(
                 temp=args.temperature,
@@ -1877,6 +1903,9 @@ class ResponseGenerator:
             )
             self._next_request_uid = batch_gen.uid_count
         except Exception as e:
+            scheduler = getattr(self, "distributed_schedule", None)
+            if scheduler is not None:
+                scheduler.fail(e)
             rqueue.put(e)
             return batch_gen
 
@@ -2032,14 +2061,31 @@ class ResponseGenerator:
         # Suspended rows own a cache snapshot and small per-request state only.
         groups, suspended = {}, {}
         max_num_seqs = get_max_num_seqs()
+        scheduler = None
+        if runtime.distributed_worker is not None:
+            from .distributed_schedule import DistributedBatchScheduler
 
-        while not (
+            scheduler = DistributedBatchScheduler(runtime.distributed_worker)
+        self.distributed_schedule = scheduler
+
+        while scheduler is not None or not (
             self._stop
             and not any(active for _, active in groups.values())
             and self.requests.empty()
         ):
-            self._schedule_continuations(groups, suspended, max_num_seqs)
-            cancelled = self._drain_cancellations()
+            if scheduler is not None:
+                try:
+                    new_items, cancelled, should_stop = scheduler.next(
+                        self, groups, max_num_seqs
+                    )
+                except Exception as error:
+                    scheduler.abort(error, self, groups)
+                    break
+                if should_stop:
+                    break
+            else:
+                self._schedule_continuations(groups, suspended, max_num_seqs)
+                cancelled = self._drain_cancellations()
             for engine, active in groups.values():
                 for uid in cancelled.intersection(active):
                     if not engine.remove(uid):
@@ -2048,15 +2094,16 @@ class ResponseGenerator:
                     active.pop(uid)["rqueue"].put(None)
             running = sum(len(active) for _, active in groups.values())
             capacity = None if max_num_seqs is None else max(0, max_num_seqs - running)
-            new_items, should_stop = self._collect_pending_requests(
-                active=bool(running),
-                capacity=capacity,
-                coalesce_s=(
-                    get_speculative_batch_coalesce_s()
-                    if not running and self.draft_model is not None
-                    else 0.0
-                ),
-            )
+            if scheduler is None:
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(running),
+                    capacity=capacity,
+                    coalesce_s=(
+                        get_speculative_batch_coalesce_s()
+                        if not running and self.draft_model is not None
+                        else 0.0
+                    ),
+                )
             if should_stop and not running:
                 break
             for request in new_items:
@@ -2068,6 +2115,8 @@ class ResponseGenerator:
                     )
                     groups[key] = (engine, active)
                 except Exception as error:
+                    if scheduler is not None:
+                        scheduler.fail(error)
                     queues = {id(request.rqueue): request.rqueue}
                     if request.session is not None:
                         queues[id(request.session)] = request.session
@@ -2083,6 +2132,8 @@ class ResponseGenerator:
                 try:
                     self._step_group(engine, active)
                 except Exception as error:
+                    if scheduler is not None:
+                        scheduler.fail(error)
                     logger.exception("Error in generation batch")
                     _notify_queues(
                         (info["rqueue"] for info in active.values()), error, None
@@ -2332,6 +2383,9 @@ class ResponseGenerator:
                 info["gen_kwargs"] = None
 
     def _emit_responses(self, responses, active):
+        scheduler = getattr(self, "distributed_schedule", None)
+        if scheduler is not None:
+            scheduler.verify_step(responses)
         for r in responses:
             if r.uid not in active:
                 continue

@@ -1,0 +1,924 @@
+"""Opt-in request routing to a dedicated group of distributed HTTP workers.
+
+The coordinator never joins the collective group. Its ordinary model loader and
+GPU thread remain independent of the workers (including the worker on this Mac).
+"""
+
+import asyncio
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+from collections import deque
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
+from urllib.parse import urlsplit
+
+from fastapi import HTTPException
+from starlette.responses import StreamingResponse
+
+logger = logging.getLogger("mlx_vlm.server.distributed")
+
+ROUTES = {
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/v1/responses",
+    "/v1/responses/input_tokens",
+    "/v1/responses/compact",
+}
+MANIFEST = ".mlx-vlm-distributed.json"
+CANCEL_ROUTE = "/internal/distributed/cancel"
+REQUEST_HEADER = "X-MLX-Distributed-Request"
+MODEL_SUFFIXES = {
+    ".json",
+    ".jsonl",
+    ".safetensors",
+    ".py",
+    ".model",
+    ".tiktoken",
+    ".txt",
+    ".jinja",
+    ".jinja2",
+    ".vocab",
+    ".merges",
+}
+
+
+def _digest_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _manifest(directory):
+    files = {}
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if not path.is_file() or path.suffix not in MODEL_SUFFIXES:
+            continue
+        name = relative.as_posix()
+        if "\n" in name or "\r" in name:
+            raise ValueError("Model filenames cannot contain newlines")
+        files[name] = {"size": path.stat().st_size, "sha256": _digest_file(path)}
+    if "config.json" not in files or not any(n.endswith(".safetensors") for n in files):
+        raise ValueError("Model must contain config.json and safetensors weights")
+    for name in files:
+        if name.endswith(".safetensors.index.json"):
+            index = json.loads((directory / name).read_text())
+            missing = set(index.get("weight_map", {}).values()) - files.keys()
+            if missing:
+                raise ValueError(f"Incomplete checkpoint: missing {sorted(missing)}")
+    return files
+
+
+# Runs with the configured Python on a worker; no MLX imports or Hub access.
+# The manifest comes over stdin, never as shell-interpolated code.
+_VERIFY = r"""
+import hashlib, json, os, pathlib, sys
+root, digest, mode = sys.argv[1:]
+files = json.load(sys.stdin)
+final = pathlib.Path(root) / digest
+path = pathlib.Path(root) / ('.partial-' + digest) if mode == 'commit' else final
+if not path.is_dir():
+    sys.exit(3)
+for name, record in files.items():
+    rel = pathlib.PurePosixPath(name)
+    if rel.is_absolute() or '..' in rel.parts:
+        raise ValueError('Invalid manifest path')
+    file = path / name
+    if not file.is_file() or file.is_symlink() or file.stat().st_size != record['size']:
+        sys.exit(3)
+    h = hashlib.sha256()
+    with file.open('rb') as f:
+        for block in iter(lambda: f.read(4 * 1024 * 1024), b''):
+            h.update(block)
+    if h.hexdigest() != record['sha256']:
+        sys.exit(3)
+if mode == 'commit':
+    (path / '.mlx-vlm-distributed.json').write_text(json.dumps(files, sort_keys=True))
+    if final.exists():
+        raise ValueError('Existing model snapshot failed verification; preserve it for diagnosis')
+    os.rename(path, final)
+"""
+
+
+@dataclass(frozen=True)
+class Worker:
+    url: str
+    ssh: str | None = None
+
+
+@dataclass(frozen=True)
+class ClusterConfig:
+    workers: tuple[Worker, ...]
+    model_dir: Path
+    shared_lock: Path
+    python: str = "python3"
+    ssh_options: tuple[str, ...] = ()
+    api_key_env: str = "MLX_VLM_DISTRIBUTED_API_KEY"
+    timeout: float = 7200
+    compaction_key_file: Path | None = None
+
+    @classmethod
+    def read(cls, filename):
+        data = json.loads(Path(filename).read_text())
+        workers = tuple(Worker(**item) for item in data["workers"])
+        if len(workers) < 2 or len({w.url for w in workers}) != len(workers):
+            raise ValueError("Configure at least two distinct worker URLs")
+        for worker in workers:
+            url = urlsplit(worker.url)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.netloc
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or url.path not in {"", "/"}
+            ):
+                raise ValueError(
+                    "Worker URLs must be HTTP(S) origins without credentials"
+                )
+            if worker.ssh is not None and not re.fullmatch(r"[\w][\w.@-]*", worker.ssh):
+                raise ValueError(
+                    "SSH destinations must be configured host names or aliases"
+                )
+        root = Path(data["model_dir"]).expanduser()
+        # rsync's remote argument is interpreted by a remote shell as well.
+        if not root.is_absolute() or not re.fullmatch(r"/[\w/.-]+", str(root)):
+            raise ValueError(
+                "model_dir must be an absolute path without shell metacharacters"
+            )
+        lock = Path(data["shared_lock"]).expanduser()
+        if not lock.is_absolute():
+            raise ValueError("shared_lock must be an absolute path")
+        timeout = float(data.get("timeout", 7200))
+        if not 0 < timeout < float("inf"):
+            raise ValueError("timeout must be a positive finite number")
+        options = data.get("ssh_options", [])
+        if not isinstance(options, list) or not all(
+            isinstance(x, str) for x in options
+        ):
+            raise ValueError("ssh_options must be an array of arguments")
+        key = data.get("compaction_key_file")
+        return cls(
+            workers,
+            root,
+            lock,
+            data.get("python", "python3"),
+            tuple(options),
+            data.get("api_key_env", "MLX_VLM_DISTRIBUTED_API_KEY"),
+            timeout,
+            Path(key).expanduser() if key else None,
+        )
+
+
+class ModelStager:
+    def __init__(self, config):
+        self.config = config
+        self.prepared = {}
+
+    def _resolve(self, model, revision):
+        from ..utils import get_model_path
+
+        local = Path(model).expanduser()
+        if local.is_dir():
+            if revision:
+                raise ValueError("distributed_revision applies to Hub model IDs only")
+            return local.resolve()
+        if model.startswith(("/", "~", ".")):
+            raise ValueError(f"Local model directory does not exist: {model}")
+        # Native snapshot_download reuses cached blobs and downloads missing files.
+        # A local-files-only snapshot lookup cannot establish that every tokenizer
+        # or weight file is present. Only this coordinator contacts the Hub.
+        return get_model_path(model, revision=revision)
+
+    def _run(self, args, **kwargs):
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=self.config.timeout, **kwargs
+        )
+
+    def _remote(self, worker, command, **kwargs):
+        result = self._run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                *self.config.ssh_options,
+                worker.ssh,
+                shlex.join(command),
+            ],
+            **kwargs,
+        )
+        if result.returncode not in (0, 3):
+            raise RuntimeError(
+                f"Worker staging failed ({worker.url}): {result.stderr[-1000:]}"
+            )
+        return result.returncode
+
+    def prepare(self, model, revision=None):
+        key = (model, revision)
+        if key in self.prepared:
+            return self.prepared[key]
+        logger.info(
+            "Resolving distributed model on coordinator: %s (revision=%s)",
+            model,
+            revision,
+        )
+        source = self._resolve(model, revision)
+        from ..utils import get_model_and_args, load_config
+
+        config = load_config(source)
+        if config.get("model_file"):
+            raise ValueError(
+                "Custom model_file checkpoints are not supported in distributed mode"
+            )
+        architecture, _ = get_model_and_args(config)
+        if not callable(getattr(architecture.Model, "shard", None)):
+            raise ValueError("This model has no distributed shard implementation")
+        files = _manifest(source)
+        manifest = json.dumps(files, sort_keys=True)
+        digest = hashlib.sha256(manifest.encode()).hexdigest()
+        root = self.config.model_dir
+        final = root / digest
+        root.mkdir(parents=True, exist_ok=True)
+        verify = [self.config.python, "-c", _VERIFY, str(root), digest]
+        result = self._run([*verify, "verify"], input=manifest)
+        if result.returncode != 0:
+            if result.returncode != 3 or final.exists():
+                raise RuntimeError("Existing coordinator snapshot failed verification")
+            temporary = root / (".partial-" + digest)
+            temporary.mkdir(exist_ok=True)
+            for name in files:
+                target = temporary / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # Dereference Hub blob symlinks; peers never need the Hub cache.
+                shutil.copyfile(source / name, target)
+            result = self._run([*verify, "commit"], input=manifest)
+            if result.returncode != 0:
+                raise RuntimeError("Coordinator model snapshot verification failed")
+        for worker in self.config.workers:
+            if worker.ssh is None:
+                continue  # Local worker shares the coordinator's filesystem.
+            if self._remote(worker, [*verify, "verify"], input=manifest) == 0:
+                continue
+            logger.info("Transferring model snapshot %s to %s", digest, worker.url)
+            temporary = root / (".partial-" + digest)
+            self._remote(worker, ["mkdir", "-p", str(temporary)])
+            result = self._run(
+                [
+                    "rsync",
+                    "-aL",
+                    "--checksum",
+                    "--partial",
+                    "--files-from=-",
+                    "-e",
+                    shlex.join(
+                        ["ssh", "-o", "BatchMode=yes", *self.config.ssh_options]
+                    ),
+                    str(final) + "/",
+                    f"{worker.ssh}:{temporary}/",
+                ],
+                input="\n".join(files) + "\n",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Model transfer failed ({worker.url}): {result.stderr[-1000:]}"
+                )
+            if self._remote(worker, [*verify, "commit"], input=manifest) != 0:
+                raise RuntimeError(f"Model checksum verification failed ({worker.url})")
+        self.prepared[key] = str(final)
+        logger.info(
+            "Model snapshot %s verified on all %s workers",
+            digest,
+            len(self.config.workers),
+        )
+        return str(final)
+
+
+@contextmanager
+def cluster_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise HTTPException(409, "The distributed cluster is busy") from exc
+        yield
+
+
+def _semantic(value, key_file):
+    if isinstance(value, list):
+        return [_semantic(item, key_file) for item in value]
+    if isinstance(value, dict):
+        if value.get("type") == "compaction":
+            from cryptography.fernet import Fernet
+
+            from .compaction import CAPSULE_PREFIX
+
+            encrypted = value.get("encrypted_content", "")
+            if key_file is None or not encrypted.startswith(CAPSULE_PREFIX):
+                raise ValueError(
+                    "Compaction requires the same key on coordinator and workers"
+                )
+            payload = Fernet(key_file.read_bytes().strip()).decrypt(
+                encrypted[len(CAPSULE_PREFIX) :].encode()
+            )
+            return {
+                "type": "compaction",
+                "context": _semantic(json.loads(payload), key_file),
+            }
+        ignored = {
+            "id",
+            "call_id",
+            "response_id",
+            "item_id",
+            "created",
+            "created_at",
+            "metrics",
+            "timings",
+        }
+        return {k: _semantic(v, key_file) for k, v in value.items() if k not in ignored}
+    return value
+
+
+class DistributedStreamingResponse(StreamingResponse):
+    def __init__(self, content, cleanup):
+        super().__init__(
+            content,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        import anyio
+
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # A disconnect can happen while sending headers, before iteration
+            # starts. Async-generator finalizers alone cannot cover that case.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+                await self.cleanup()
+
+
+class Coordinator:
+    def __init__(self, config):
+        self.config = config
+        self.stager = ModelStager(config)
+        self.condition = asyncio.Condition()
+        self.waiters = deque()
+        self.active = 0
+        self.model = None
+        self.primary = 0
+        self.seed = secrets.randbelow(2**31)
+        self.failure = config.model_dir / ".cluster-failed.json"
+
+    def failed(self, error):
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.write_text(
+            json.dumps({"error": type(error).__name__, "message": str(error)})
+        )
+        logger.error("Distributed group requires recovery: %s", error)
+
+    async def _health(self, client):
+        try:
+            checks = await asyncio.gather(
+                *[
+                    client.get(w.url.rstrip("/") + "/health")
+                    for w in self.config.workers
+                ]
+            )
+            ranks, signatures = [], []
+            for check in checks:
+                check.raise_for_status()
+                info = check.json().get("distributed_worker") or {}
+                if info.get("world_size") != len(checks):
+                    raise ValueError(
+                        "Worker group size does not match configured cluster"
+                    )
+                ranks.append(info.get("rank"))
+                signatures.append((info.get("backend"), info.get("fingerprint")))
+            if sorted(ranks) != list(range(len(checks))):
+                raise ValueError(
+                    "Configure exactly one endpoint for each distributed rank"
+                )
+            if not signatures[0][1] or len(set(signatures)) != 1:
+                raise ValueError("Distributed worker code or configuration differs")
+            self.primary = ranks.index(0)
+        except Exception as error:
+            raise HTTPException(
+                503, "Distributed worker health/group check failed"
+            ) from error
+
+    @asynccontextmanager
+    async def _lease(self, model, revision, client):
+        """Share a model lease; switch models only after every response drains.
+
+        FIFO tickets keep a waiting model switch from starving behind new rows.
+        The process lock spans all overlapping requests, including stream cleanup.
+        """
+        ticket = object()
+        key = (model, revision)
+        async with self.condition:
+            self.waiters.append(ticket)
+            acquired = False
+            try:
+                while self.waiters[0] is not ticket or (
+                    self.active and self.model != key
+                ):
+                    await self.condition.wait()
+                if self.failure.exists():
+                    raise HTTPException(
+                        503,
+                        "Distributed group needs recovery; inspect .cluster-failed.json",
+                    )
+                if not self.active:
+                    lock = cluster_lock(self.config.shared_lock)
+                    lock.__enter__()
+                    acquired = True
+                    await self._health(client)
+                    staging = asyncio.create_task(
+                        asyncio.to_thread(self.stager.prepare, model, revision)
+                    )
+                    try:
+                        self.model_path = await asyncio.shield(staging)
+                    except asyncio.CancelledError:
+                        try:
+                            await staging
+                        finally:
+                            raise
+                    except Exception as error:
+                        raise HTTPException(
+                            400, f"Model staging failed: {error}"
+                        ) from error
+                    self.model = key
+                    self.file_lock = lock
+                self.active += 1
+            except BaseException:
+                if acquired:
+                    lock.__exit__(None, None, None)
+                raise
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
+        try:
+            yield self.model_path
+        finally:
+            async with self.condition:
+                self.active -= 1
+                if not self.active:
+                    self.file_lock.__exit__(None, None, None)
+                self.condition.notify_all()
+
+    async def _cancel(self, client, request_id):
+        replies = await asyncio.gather(
+            *[
+                client.post(
+                    w.url.rstrip("/") + CANCEL_ROUTE,
+                    json={"request_id": request_id},
+                    timeout=15,
+                )
+                for w in self.config.workers
+            ],
+            return_exceptions=True,
+        )
+        if any(isinstance(r, BaseException) or r.status_code != 202 for r in replies):
+            raise RuntimeError("Could not coordinate cancellation across all ranks")
+
+    async def _cancel_and_drain(self, client, request_id, task):
+        try:
+            await self._cancel(client, request_id)
+            # Do not release the model lease while old GPU work might remain.
+            await asyncio.wait_for(asyncio.shield(task), min(60, self.config.timeout))
+        except Exception as error:
+            self.failed(error)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @staticmethod
+    def _public_payload(payload, staged, requested):
+        if isinstance(payload, dict):
+            if payload.get("model") == staged:
+                payload["model"] = requested
+            response = payload.get("response")
+            if isinstance(response, dict) and response.get("model") == staged:
+                response["model"] = requested
+        return payload
+
+    async def relay(self, path, body, tenant=None):
+        import httpx
+
+        if (
+            body.get("previous_response_id")
+            or body.get("resumable")
+            or body.get("continuation")
+        ):
+            raise HTTPException(
+                400, "Distributed requests currently require stateless input"
+            )
+        if body.get("adapter_path"):
+            raise HTTPException(400, "Distributed adapters are not supported")
+        if not isinstance(body.get("model"), str) or not body["model"].strip():
+            raise HTTPException(422, "A model identifier is required")
+        revision = body.get("distributed_revision")
+        if revision is not None and not isinstance(revision, str):
+            raise HTTPException(422, "distributed_revision must be a string")
+        if (
+            path.endswith("/compact") or body.get("context_management")
+        ) and self.config.compaction_key_file is None:
+            raise HTTPException(
+                400, "Configure a shared compaction_key_file before using compaction"
+            )
+        key = os.environ.get(self.config.api_key_env)
+        if not key:
+            raise HTTPException(
+                503, f"Set worker credentials in {self.config.api_key_env}"
+            )
+        headers = {"Authorization": f"Bearer {key}"}
+        if tenant:
+            headers["X-Tenant-ID"] = tenant
+        request_id = secrets.token_hex(16)
+        stack = AsyncExitStack()
+        client = await stack.enter_async_context(
+            httpx.AsyncClient(
+                timeout=httpx.Timeout(self.config.timeout, connect=15),
+                trust_env=False,
+                headers=headers,
+            )
+        )
+        opening = None
+        cancelled = False
+        try:
+            model_path = await stack.enter_async_context(
+                self._lease(body["model"], revision, client)
+            )
+            request = {**body, "model": model_path, "distributed": True, "store": False}
+            request.pop("distributed_revision", None)
+            if request.get("seed") is None:
+                # Native batching groups by sampler seed. One shared default allows
+                # overlapping default requests to batch; row IDs separate RNG keys.
+                request["seed"] = self.seed
+
+            async def open_worker(worker):
+                reply = await client.send(
+                    client.build_request(
+                        "POST",
+                        worker.url.rstrip("/") + path,
+                        json=request,
+                        headers={REQUEST_HEADER: request_id},
+                    ),
+                    stream=True,
+                )
+                stack.push_async_callback(reply.aclose)
+                return reply
+
+            async def open_workers():
+                tasks = [
+                    asyncio.create_task(open_worker(w)) for w in self.config.workers
+                ]
+                try:
+                    # A failed rank must not wait behind another rank blocked
+                    # in a collective until the full generation timeout expires.
+                    replies = await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                if cancelled:
+                    await asyncio.gather(*(reply.aread() for reply in replies))
+                    return replies
+                if len({reply.status_code for reply in replies}) != 1:
+                    raise RuntimeError("Distributed rank statuses differ")
+                return replies
+
+            opening = asyncio.create_task(open_workers())
+            replies = await asyncio.shield(opening)
+            streaming = bool(body.get("stream")) and replies[self.primary].is_success
+            if not streaming:
+
+                async def read_replies():
+                    await asyncio.gather(*(reply.aread() for reply in replies))
+                    if cancelled:
+                        return None
+                    payloads = [reply.json() for reply in replies]
+                    if replies[0].status_code >= 500:
+                        raise RuntimeError(
+                            "A distributed worker reported a server error"
+                        )
+                    if replies[0].is_success:
+                        values = [
+                            _semantic(p, self.config.compaction_key_file)
+                            for p in payloads
+                        ]
+                        if any(value != values[0] for value in values[1:]):
+                            raise RuntimeError("Distributed rank outputs differ")
+                    return (
+                        self._public_payload(
+                            payloads[self.primary], model_path, body["model"]
+                        ),
+                        replies[self.primary].status_code,
+                    )
+
+                reading = asyncio.create_task(read_replies())
+                try:
+                    result = await asyncio.shield(reading)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    await self._cancel_and_drain(client, request_id, reading)
+                    opening = None  # This request has already drained.
+                    raise
+                await stack.aclose()
+                return result
+
+            return self._stream(
+                replies, client, request_id, model_path, body["model"], stack
+            )
+        except asyncio.CancelledError:
+            cancelled = True
+            if opening is not None:
+
+                async def drain_opened():
+                    replies = await opening
+                    await asyncio.gather(*(reply.aread() for reply in replies))
+
+                await self._cancel_and_drain(
+                    client, request_id, asyncio.create_task(drain_opened())
+                )
+            await stack.aclose()
+            raise
+        except BaseException as error:
+            if not isinstance(error, HTTPException):
+                self.failed(error)
+                if opening is not None:
+                    try:
+                        await self._cancel(client, request_id)
+                    except Exception:
+                        logger.exception(
+                            "Cancellation after distributed failure failed"
+                        )
+            await stack.aclose()
+            if isinstance(error, HTTPException):
+                raise
+            raise HTTPException(
+                502, "Distributed request failed; group marked for recovery"
+            ) from error
+
+    def _stream(self, replies, client, request_id, staged, requested, stack):
+        queue = asyncio.Queue(maxsize=64)
+        abandoned = False
+        terminal = []
+        digests = [hashlib.sha256() for _ in replies]
+        counts = [0 for _ in replies]
+        ended = [False for _ in replies]
+
+        async def read_rank(rank, reply):
+            lines = []
+
+            async def event():
+                if not lines:
+                    return
+                data = "\n".join(
+                    line[5:].lstrip(" ") for line in lines if line.startswith("data:")
+                )
+                name = next(
+                    (line[6:].strip() for line in lines if line.startswith("event:")),
+                    "",
+                )
+                if not data:
+                    return
+                payload = json.loads(data) if data != "[DONE]" else data
+                if (
+                    not abandoned
+                    and isinstance(payload, dict)
+                    and (
+                        payload.get("error")
+                        or payload.get("type") in {"error", "response.failed"}
+                    )
+                ):
+                    raise RuntimeError("A distributed worker emitted a stream error")
+                canonical = json.dumps(
+                    [name, _semantic(payload, self.config.compaction_key_file)],
+                    sort_keys=True,
+                )
+                digests[rank].update(canonical.encode() + b"\n")
+                counts[rank] += 1
+                done = data == "[DONE]" or (
+                    isinstance(payload, dict)
+                    and payload.get("type")
+                    in {"response.completed", "response.incomplete"}
+                )
+                ended[rank] |= done
+                if rank == self.primary and not abandoned:
+                    public = self._public_payload(payload, staged, requested)
+                    outgoing = (
+                        (f"event: {name}\n" if name else "")
+                        + "data: "
+                        + ("[DONE]" if data == "[DONE]" else json.dumps(public))
+                        + "\n\n"
+                    )
+                    if done:
+                        terminal.append(outgoing)
+                    else:
+                        await queue.put(outgoing)
+
+            async for line in reply.aiter_lines():
+                if line == "":
+                    await event()
+                    lines = []
+                else:
+                    lines.append(line)
+            await event()
+
+        async def pump():
+            tasks = [
+                asyncio.create_task(read_rank(rank, reply))
+                for rank, reply in enumerate(replies)
+            ]
+            try:
+                await asyncio.gather(*tasks)
+                if not abandoned:
+                    summaries = [
+                        (digest.hexdigest(), count)
+                        for digest, count in zip(digests, counts)
+                    ]
+                    if not all(ended) or any(
+                        value != summaries[0] for value in summaries[1:]
+                    ):
+                        raise RuntimeError(
+                            "Distributed streams diverged or ended before completion"
+                        )
+                    for event in terminal:
+                        await queue.put(event)
+            except Exception as error:
+                if abandoned:
+                    raise
+                if not abandoned:
+                    self.failed(error)
+                    await queue.put(
+                        "event: error\ndata: "
+                        + json.dumps(
+                            {
+                                "error": {
+                                    "message": "Distributed stream failed; group marked for recovery",
+                                    "type": "distributed_error",
+                                }
+                            }
+                        )
+                        + "\n\n"
+                    )
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await queue.put(None)
+
+        task = asyncio.create_task(pump())
+        cleanup_lock = asyncio.Lock()
+        closed = False
+
+        async def cleanup():
+            nonlocal abandoned, closed
+            import anyio
+
+            # Starlette cancels a task group on disconnect. Shield both the
+            # collective cancellation and resource teardown from level cancellation.
+            with anyio.CancelScope(shield=True):
+                async with cleanup_lock:
+                    if closed:
+                        return
+                    abandoned = True
+                    while not queue.empty():
+                        queue.get_nowait()
+                    try:
+                        if not task.done():
+                            await self._cancel_and_drain(client, request_id, task)
+                    finally:
+                        await stack.aclose()
+                        closed = True
+
+        async def iterate():
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    yield item
+                await task
+            finally:
+                await cleanup()
+
+        return DistributedStreamingResponse(iterate(), cleanup)
+
+
+class DistributedWorker:
+    def __init__(self, backend, model_dir):
+        import mlx.core as mx
+
+        self.model_dir = Path(model_dir).expanduser().resolve()
+        self.group = mx.distributed.init(backend=backend, strict=True)
+        if self.group.size() < 2:
+            raise ValueError("Distributed workers require at least two ranks")
+        self.backend = backend
+        self._cancel_lock = Lock()
+        self._cancelled_requests = set()
+        digest = hashlib.sha256()
+        package = Path(__file__).parent.parent
+        for source in sorted(package.rglob("*.py")):
+            digest.update(source.relative_to(package).as_posix().encode())
+            digest.update(source.read_bytes())
+        digest.update(mx.__version__.encode())
+        self.source_hash = digest.hexdigest()
+
+    def remember_cancellations(self, request_ids):
+        with self._cancel_lock:
+            self._cancelled_requests.update(request_ids)
+
+    def cancelled_requests(self):
+        with self._cancel_lock:
+            return sorted(self._cancelled_requests)
+
+    def info(self):
+        from .runtime import runtime
+
+        settings = {
+            name: os.environ.get(name)
+            for name in (
+                "PREFILL_STEP_SIZE",
+                "MLX_VLM_MAX_NUM_SEQS",
+                "MLX_VLM_MAX_TOKENS",
+                "MLX_VLM_ENABLE_THINKING",
+                "MLX_VLM_THINKING_BUDGET",
+                "MLX_VLM_THINKING_START_TOKEN",
+                "MLX_VLM_THINKING_END_TOKEN",
+                "MLX_VLM_MIN_PIXELS",
+                "MLX_VLM_MAX_PIXELS",
+                "TOP_LOGPROBS_K",
+                "MLX_TRUST_REMOTE_CODE",
+            )
+        }
+        key_file = os.environ.get("MLX_VLM_COMPACTION_KEY_FILE")
+        if key_file:
+            settings["compaction_key_hash"] = _digest_file(key_file)
+        signature = json.dumps(
+            [self.source_hash, runtime.config.current(), settings], sort_keys=True
+        )
+        return {
+            "rank": self.group.rank(),
+            "world_size": self.group.size(),
+            "backend": self.backend,
+            "fingerprint": hashlib.sha256(signature.encode()).hexdigest(),
+        }
+
+    def load(self, model_path, adapter_path, trust_remote_code=False):
+        import mlx.core as mx
+
+        from ..generate.diffusion import is_diffusion_model
+        from ..utils import load
+
+        path = Path(model_path).resolve()
+        if (
+            path.parent != self.model_dir
+            or not (path / MANIFEST).is_file()
+            or adapter_path
+        ):
+            raise ValueError(
+                "Distributed workers load only coordinator-staged checkpoints without adapters"
+            )
+        # Retain native processor/config handling, including attach_processor.
+        model, processor = load(
+            str(path),
+            lazy=True,
+            trust_remote_code=trust_remote_code,
+            local_files_only=True,
+        )
+        if not callable(getattr(model, "shard", None)):
+            raise ValueError("This model does not support distributed sharding")
+        if is_diffusion_model(model):
+            raise ValueError("Distributed serving requires an autoregressive model")
+        model.shard(self.group)
+        lm = getattr(model, "language_model", model)
+        for layer in getattr(lm, "layers", []):
+            mx.eval(layer.parameters())
+            mx.clear_cache()
+        # Include vision/audio/projector parameters without assuming their names.
+        mx.eval(model.parameters())
+        model.eval()
+        mx.eval(mx.distributed.all_sum(mx.array(1.0), group=self.group, stream=mx.cpu))
+        return model, processor

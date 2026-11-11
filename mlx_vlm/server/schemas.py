@@ -443,7 +443,18 @@ class ToolResultContext(BaseModel):
     max_bytes: int = Field(8192, ge=512, le=8192)
 
 
-class OpenAIRequest(ImageProcessingRequest, ContinuationOptions):
+class DistributedOptions(FlexibleBaseModel):
+    distributed: bool = Field(
+        False,
+        strict=True,
+        description="Load and execute this model across the configured distributed workers.",
+    )
+    distributed_revision: Optional[str] = Field(
+        None, description="Hub revision to stage for a distributed request."
+    )
+
+
+class OpenAIRequest(ImageProcessingRequest, ContinuationOptions, DistributedOptions):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
@@ -810,7 +821,7 @@ StreamEvent = Union[
 # Models for /chat/completion endpoint
 
 
-class VLMRequest(ImageProcessingRequest):
+class VLMRequest(ImageProcessingRequest, DistributedOptions):
     model: str = Field(
         ...,
         description="The path to the local model directory or Hugging Face repo.",

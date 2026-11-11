@@ -5095,6 +5095,18 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
         assert "Conversation handoff" not in mocked.generate.call_args.kwargs["prompt"]
 
+    def test_distributed_chat_never_restores_rank_local_compaction_cache(
+        self, mocked, client, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime, "distributed_worker", object())
+        restore = Mock(side_effect=AssertionError("Rank-local compaction cache used"))
+        monkeypatch.setattr(compaction.chat_cache, "restore", restore)
+        monkeypatch.setitem(client.headers, "X-MLX-Distributed-Request", "a" * 32)
+        response = _post(client, distributed=True, max_tokens=64)
+        assert response.status_code == 200, response.text
+        assert mocked.generate.call_count == 1
+        restore.assert_not_called()
+
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "outcome", ["recover", "disabled", "summary-fails", "protected-too-large"]

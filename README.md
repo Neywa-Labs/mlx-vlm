@@ -636,6 +636,10 @@ mlx_vlm.server --api-key <secret-token>
 mlx_vlm.server --model-dir /Volumes/Models --model-dir ~/my-custom-model
 ```
 
+Use `distributed: true` per request to run a model across configured Macs while
+keeping ordinary requests on the local loader. See [distributed serving](docs/distributed-serving.md)
+for worker setup, automatic checkpoint transfer, and current limitations.
+
 #### Server Options
 
 - `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)

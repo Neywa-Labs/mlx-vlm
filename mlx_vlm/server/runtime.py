@@ -62,6 +62,8 @@ class ModelCacheRegistry:
 
 @dataclass
 class ServerRuntime:
+    distributed_coordinator: Optional[Any] = None
+    distributed_worker: Optional[Any] = None
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
