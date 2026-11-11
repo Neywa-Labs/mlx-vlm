@@ -648,9 +648,9 @@ class LanguageModel(nn.Module):
                     "bits": 4,
                     "mode": "affine",
                 }
-                if requested["mode"] == "affine" and requested["bits"] == 4:
-                    return dict(requested)
-                return dict(MLX_MXFP8_QUANTIZATION)
+                if requested["bits"] == 8:
+                    return dict(MLX_MXFP8_QUANTIZATION)
+                return dict(requested)
             if (
                 ".shared_experts." in path
                 or path.endswith(("fc1_latent_proj", "fc2_latent_proj"))

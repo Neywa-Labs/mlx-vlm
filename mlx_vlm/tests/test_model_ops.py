@@ -2862,21 +2862,25 @@ def _fp8_conversion_case(family):
 
 
 @pytest.mark.parametrize(
-    "family,q_bits",
+    "family,q_bits,q_mode",
     [
-        ("qwen3_5", None),
-        ("ernie5_5_moe", None),
-        ("ernie5_5_moe", 4),
-        ("ernie5_5_moe", 8),
+        ("qwen3_5", None, "affine"),
+        ("ernie5_5_moe", None, "affine"),
+        ("ernie5_5_moe", 4, "affine"),
+        ("ernie5_5_moe", 8, "affine"),
+        ("ernie5_5_moe", 8, "mxfp8"),
+        ("ernie5_5_moe", 4, "mxfp4"),
+        ("ernie5_5_moe", 4, "nvfp4"),
     ],
 )
-def test_convert_fp8_preserves_loaded_layout(tmp_path, family, q_bits):
+def test_convert_fp8_preserves_loaded_layout(tmp_path, family, q_bits, q_mode):
     from mlx_vlm.convert import convert
 
     mx.random.seed(55)
     config, weights, source_keys, preserved = _fp8_conversion_case(family)
     mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
-    experts = dict(group_size=64, bits=4, mode="affine") if q_bits == 4 else mxfp8
+    group_size = {"affine": 64, "mxfp4": 32, "nvfp4": 16, "mxfp8": 32}[q_mode]
+    experts = dict(group_size=group_size, bits=4, mode=q_mode) if q_bits == 4 else mxfp8
     expected = {}
     if q_bits is not None and family == "ernie5_5_moe":
         for key, weight in weights.items():
@@ -2914,7 +2918,12 @@ def test_convert_fp8_preserves_loaded_layout(tmp_path, family, q_bits):
     (source / "config.json").write_text(json.dumps(config))
     with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
         convert(
-            str(source), str(destination), quantize=q_bits is not None, q_bits=q_bits
+            str(source),
+            str(destination),
+            quantize=q_bits is not None,
+            q_bits=q_bits,
+            q_mode=q_mode,
+            q_group_size=None,
         )
     restored = load_model(destination)
     modules = dict(restored.named_modules())

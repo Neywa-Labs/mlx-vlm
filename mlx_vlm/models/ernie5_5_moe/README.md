@@ -14,6 +14,8 @@ This converts the released FP8 projections to native MLX MXFP8. The source downl
 
 Add `-q --q-bits 4` to convert routed experts to affine 4-bit, keeping other eligible projections in MXFP8. Without `-q`, the released FP8 projections stay MXFP8.
 
+For routed experts, `-q --q-bits 8` uses MXFP8; `-q --q-mode nvfp4` or `mxfp4` uses the requested 4-bit format. Other eligible projections stay MXFP8.
+
 ## Generate
 
 ```sh
