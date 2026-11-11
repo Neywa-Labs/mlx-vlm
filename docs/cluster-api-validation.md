@@ -24,6 +24,19 @@ of real node/disposal failures. Both continuous and fallback Responses generatio
 paths now test `timings.predicted_per_second` against measured token intervals and
 regular text events. Hardware checks below were not rerun for this follow-up.
 
+Transfer-progress follow-up — 2026-11-12: **1,920 passed, 23 skipped**, with the
+same audio-backend test excluded. Tests cover fragmented rsync output, carriage
+returns, file boundaries, reused files, throttling, timeout/process cleanup,
+bounded stderr, checksum failures, and progress visible through operation status
+and SSE before `models/prepare` or `start` finishes.
+
+A bandwidth-limited SSH/rsync copy to an existing Mac transferred **3,145,730
+bytes** and produced seven live measurements over approximately 6.16 seconds.
+The destination SHA-256 matched. Repeating the copy reported zero copied bytes
+and 3,145,730 reused bytes. Both Macs used bundled openrsync (rsync 2.6.9
+compatible); GNU-style output is also covered by parser fixtures. Temporary copy
+files were removed, and no inference services were restarted for this check.
+
 Coverage includes authenticated registration, identity-preserving address
 updates, persistence, duplicate devices, selected-only memory and freshness,
 operation serialization/idempotency, ownership, node loss, SSE replay/reset,

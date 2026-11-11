@@ -34,6 +34,7 @@ from mlx_vlm.server.distributed import (
     cluster_lock,
 )
 from mlx_vlm.server.distributed_schedule import RequestScope, request_scope, schedule
+from mlx_vlm.server.rsync_progress import RsyncProgress, run_rsync
 from mlx_vlm.server.runtime import runtime
 
 
@@ -127,6 +128,233 @@ def test_transfer_failure_never_marks_model_prepared(cluster, checkpoint, monkey
     assert not stager.prepared
     assert "--checksum" in transfers[0] and "-aL" in transfers[0]
     assert transfers[0][-1].startswith("mac-two:")
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 1024])
+def test_rsync_progress_handles_file_boundaries_reuse_and_carriage_returns(chunk_size):
+    updates = []
+    tracker = RsyncProgress(3100, lambda **data: updates.append(data), interval=0)
+    wire = (
+        b"MLX_VLM_FILE:.d..t......:4096\n"
+        b"MLX_VLM_FILE:.f         :100\n"
+        b"MLX_VLM_FILE:>f+++++++++:2000\n"
+        b"        1,000  50%  1.00MB/s 0:00:01\r"
+        b"          900  45%  1.00MB/s 0:00:01\r"
+        b"        2,000 100%  1.00MB/s 0:00:00\r"
+        b"        2,000 100%  1.00MB/s 0:00:00 (xfr#1, to-chk=1/3)\n"
+        b"MLX_VLM_FILE:>f+++++++:0\n"
+        b"            0 100%  0.00KB/s 00:00:00\n"
+        b"MLX_VLM_FILE:>f+++++++:1000\n"
+        b"          500  50%  1.00MB/s 00:00:01\r"
+        b"         1000 100%  1.00MB/s 00:00:00"
+    )
+    for offset in range(0, len(wire), chunk_size):
+        tracker.feed(wire[offset : offset + chunk_size])
+    tracker.finish()
+    assert updates[-1] == dict(
+        bytes_transferred=3000, bytes_reused=100, total_bytes=3100
+    )
+    assert [u["bytes_transferred"] for u in updates] == sorted(
+        u["bytes_transferred"] for u in updates
+    )
+    assert all(u["bytes_transferred"] + u["bytes_reused"] <= 3100 for u in updates)
+
+
+def test_rsync_progress_throttles_but_flushes_last_measurement(monkeypatch):
+    from mlx_vlm.server import rsync_progress
+
+    clock = [10.0]
+    monkeypatch.setattr(rsync_progress.time, "monotonic", lambda: clock[0])
+    updates = []
+    tracker = RsyncProgress(100, lambda **data: updates.append(data))
+    tracker.feed(b"MLX_VLM_FILE:>f+++++++++:100\n10 10% 1MB/s\r")
+    tracker.feed(b"20 20% 1MB/s\r30 30% 1MB/s\r")
+    assert len(updates) == 1
+    clock[0] += 0.5
+    tracker.feed(b"40 40% 1MB/s\r")
+    tracker.feed(b"50 50% 1MB/s\r")
+    tracker.finish()
+    assert [u["bytes_transferred"] for u in updates] == [10, 40, 50]
+    tracker.finish()
+    assert len(updates) == 3
+
+
+def test_rsync_runner_publishes_before_exit_and_drains_stderr(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    release = tmp_path / "release"
+    script = tmp_path / "rsync-fixture"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, sys, time\n"
+        "assert sys.stdin.read() == 'model.safetensors\\n'\n"
+        "sys.stderr.write('diagnostic' * 10000); sys.stderr.flush()\n"
+        "sys.stdout.write('MLX_VLM_FILE:>f+++++++++:100\\n25 25% 1MB/s\\r'); sys.stdout.flush()\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+        "sys.stdout.write('100 100% 1MB/s\\r'); sys.stdout.flush()\n"
+    )
+    script.chmod(0o700)
+    received, updates = threading.Event(), []
+
+    def progress(**data):
+        updates.append(data)
+        received.set()
+
+    with ThreadPoolExecutor(1) as pool:
+        job = pool.submit(
+            run_rsync,
+            [str(script)],
+            input="model.safetensors\n",
+            timeout=5,
+            total_bytes=100,
+            progress=progress,
+        )
+        try:
+            assert received.wait(3)
+            assert updates[0]["bytes_transferred"] == 25
+            assert (
+                not job.done()
+            )  # Child cannot exit until the consumer observes progress.
+        finally:
+            release.touch()
+        result = job.result(timeout=3)
+    assert result.returncode == 0 and len(result.stderr) == 4096
+    assert updates[-1]["bytes_transferred"] == 100
+
+
+@pytest.mark.parametrize("failure", ["timeout", "callback", "exit"])
+def test_rsync_runner_failures_do_not_invent_completion_or_leave_processes(
+    tmp_path, failure
+):
+    pid_file = tmp_path / "pid"
+    script = tmp_path / "rsync-fixture"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, sys, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "sys.stdout.write('MLX_VLM_FILE:>f+++++++++:100\\n25 25% 1MB/s\\r'); sys.stdout.flush()\n"
+        + (
+            "sys.stderr.write('copy interrupted'); sys.exit(23)\n"
+            if failure == "exit"
+            else "time.sleep(30)\n"
+        )
+    )
+    script.chmod(0o700)
+    updates = []
+
+    def progress(**data):
+        updates.append(data)
+        if failure == "callback":
+            raise ValueError("consumer failed")
+
+    options = dict(input="", timeout=1, total_bytes=100, progress=progress)
+    if failure == "exit":
+        result = run_rsync([str(script)], **options)
+        assert result.returncode == 23 and result.stderr == "copy interrupted"
+    else:
+        with pytest.raises(
+            subprocess.TimeoutExpired if failure == "timeout" else ValueError
+        ):
+            run_rsync([str(script)], **options)
+    assert updates and all(u["bytes_transferred"] == 25 for u in updates)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+def test_real_rsync_progress_reuses_existing_files_and_counts_payload(tmp_path):
+    import shutil
+
+    if not shutil.which("rsync"):
+        pytest.skip("rsync is not installed")
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "existing").write_bytes(b"same content")
+    (destination / "existing").write_bytes(b"same content")
+    (source / "new").write_bytes(b"new checkpoint" * 100)
+    total = sum(p.stat().st_size for p in source.iterdir())
+    updates = []
+    result = run_rsync(
+        [
+            "rsync",
+            "-aL",
+            "--checksum",
+            "--partial",
+            "--files-from=-",
+            str(source) + "/",
+            str(destination) + "/",
+        ],
+        input="existing\nnew\n",
+        timeout=10,
+        total_bytes=total,
+        progress=lambda **data: updates.append(data),
+    )
+    assert result.returncode == 0, result.stderr
+    assert updates[-1] == dict(
+        bytes_transferred=1400, bytes_reused=12, total_bytes=1412
+    )
+    assert (destination / "new").read_bytes() == (source / "new").read_bytes()
+
+
+@pytest.mark.parametrize("bad_checksum", [False, True])
+def test_staging_progress_is_live_per_worker_and_readiness_requires_verification(
+    cluster, checkpoint, monkeypatch, bad_checksum
+):
+    stager = ModelStager(cluster)
+    updates = []
+
+    def remote(worker, args, **kwargs):
+        if args[-1] == "verify":
+            return 3
+        if args[-1] == "commit":
+            assert updates[-1][0] == "verifying_worker"
+            return 3 if bad_checksum else 0
+        return 0
+
+    def copy(args, *, input, timeout, total_bytes, progress):
+        assert "--checksum" in args and "--partial" in args
+        assert args[-1].startswith("mac-two:")
+        for count in (total_bytes // 2, total_bytes):
+            progress(bytes_transferred=count, bytes_reused=0, total_bytes=total_bytes)
+            assert updates[-1][1]["bytes_transferred"] == count
+        assert not any(
+            phase == "worker_ready" and data["node_id"] == "b"
+            for phase, data in updates
+        )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    from dataclasses import replace
+
+    monkeypatch.setattr(
+        stager,
+        "config",
+        replace(
+            cluster,
+            workers=(
+                replace(cluster.workers[0], node_id="a"),
+                replace(cluster.workers[1], node_id="b"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(stager, "_remote", remote)
+    monkeypatch.setattr("mlx_vlm.server.distributed.run_rsync", copy)
+    if bad_checksum:
+        with pytest.raises(RuntimeError, match="checksum verification failed"):
+            stager.prepare(
+                str(checkpoint),
+                progress=lambda phase, **data: updates.append((phase, data)),
+            )
+        assert not stager.prepared and updates[-1][0] == "verifying_worker"
+    else:
+        stager.prepare(
+            str(checkpoint),
+            progress=lambda phase, **data: updates.append((phase, data)),
+        )
+        assert updates[-1][0] == "worker_ready"
+    copying = [data for phase, data in updates if phase == "transferring"]
+    assert len(copying) == 3 and all(data["node_id"] == "b" for data in copying)
+    assert copying[0]["bytes_transferred"] == 0
+    assert copying[1]["bytes_transferred"] < copying[1]["total_bytes"]
 
 
 def test_corrupt_existing_snapshot_is_not_used(cluster, checkpoint, monkeypatch):

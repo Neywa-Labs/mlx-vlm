@@ -655,17 +655,8 @@ class ClusterManager:
         # acquire an inference lease just to copy a checkpoint.
         config = replace(self.config(targets), model_dir=self.root / "delivery")
         stager = ModelStager(config)
-        loop = asyncio.get_running_loop()
-
-        async def progress(phase, data):
-            operation.result = {"progress": data}
-            await self.phase(operation, phase)
-
-        def report(phase, **data):
-            asyncio.run_coroutine_threadsafe(progress(phase, data), loop).result()
-
-        prepared = await self.stage(
-            stager, body.model, body.revision, validate_sharding=False, progress=report
+        prepared = await self.stage_model(
+            operation, stager, body.model, body.revision, validate_sharding=False
         )
         operation.result = {
             "model": body.model,
@@ -681,6 +672,18 @@ class ClusterManager:
                 for w in config.workers
             ],
         }
+
+    async def stage_model(self, operation, stager, model, revision, **options):
+        loop = asyncio.get_running_loop()
+
+        async def progress(phase, data):
+            operation.result = {"progress": data}
+            await self.phase(operation, phase)
+
+        def report(phase, **data):
+            asyncio.run_coroutine_threadsafe(progress(phase, data), loop).result()
+
+        return await self.stage(stager, model, revision, progress=report, **options)
 
     @staticmethod
     async def stage(stager, model, revision, **options):
@@ -806,7 +809,9 @@ class ClusterManager:
                 coordinator.failure.unlink()
             if body.model:
                 await self.phase(operation, "preparing_model")
-                await self.stage(coordinator.stager, body.model, body.revision)
+                await self.stage_model(
+                    operation, coordinator.stager, body.model, body.revision
+                )
                 await self.phase(operation, "loading_model")
                 _, status = await coordinator.relay(
                     "/v1/responses/input_tokens",
@@ -841,6 +846,7 @@ class ClusterManager:
         runtime.distributed_coordinator = coordinator
         self.running = list(self.selected)
         self.state = "ready"
+        operation.result = {"state": self.state, "members": self.running}
         self.save()
         await self.emit("cluster.ready", self.snapshot().model_dump())
 

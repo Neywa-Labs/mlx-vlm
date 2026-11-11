@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 import asyncio
+import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -530,6 +532,99 @@ def test_weight_delivery_operation_is_independent_of_membership(control, monkeyp
             "prepare_model", PrepareModel(model="org/model", node_ids=["b"]), "delivery"
         )
         assert retry.id == op.id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["prepare_model", "start"])
+def test_transfer_bytes_are_observable_while_copy_is_still_running(
+    control, monkeypatch, kind
+):
+    entered, release = threading.Event(), threading.Event()
+
+    def prepare(stager, model, revision, *, progress, **options):
+        for count in (25, 50):
+            progress(
+                "transferring",
+                node_id="b",
+                snapshot="digest",
+                bytes_transferred=count,
+                bytes_reused=0,
+                total_bytes=100,
+            )
+        entered.set()
+        assert release.wait(5)
+        path = str(stager.config.model_dir / "digest")
+        for worker in stager.config.workers:
+            stager.worker_paths[(path, worker.url)] = (
+                "/different/" + worker.node_id + "/models/digest"
+            )
+        return path
+
+    monkeypatch.setattr(management.ModelStager, "prepare", prepare)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    monkeypatch.setattr(
+        management.Coordinator, "relay", AsyncMock(return_value=({}, 200))
+    )
+
+    async def scenario():
+        await register_pair(control)
+        api = management.router(lambda: None)
+        endpoints = {route.path: route.endpoint for route in api.routes}
+        cursor = control.event_id
+        body = (
+            PrepareModel(model="org/model", node_ids=["b"])
+            if kind == "prepare_model"
+            else StartGroup(model="org/model")
+        )
+        operation = await control.begin(kind, body, None)
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            status = await endpoints["/v1/cluster/operations/{operation_id}"](
+                operation.id
+            )
+            assert status.status == "running" and status.phase == "transferring"
+            assert status.result["progress"] == dict(
+                node_id="b",
+                snapshot="digest",
+                bytes_transferred=50,
+                bytes_reused=0,
+                total_bytes=100,
+            )
+            response = await endpoints["/v1/cluster/events"](
+                last_event_id=cursor, interval_seconds=1
+            )
+            observed = []
+            try:
+                while len(observed) < 2:
+                    wire = await asyncio.wait_for(anext(response.body_iterator), 2)
+                    event = json.loads(
+                        next(
+                            line[6:]
+                            for line in wire.splitlines()
+                            if line.startswith("data: ")
+                        )
+                    )
+                    if (
+                        event["type"] == "operation.updated"
+                        and event["data"]["phase"] == "transferring"
+                    ):
+                        observed.append(event["data"]["result"]["progress"])
+            finally:
+                await response.body_iterator.aclose()
+            assert [data["bytes_transferred"] for data in observed] == [25, 50]
+            assert all(
+                data["node_id"] == "b" and data["total_bytes"] == 100
+                for data in observed
+            )
+            assert operation.status == "running"
+        finally:
+            release.set()
+            await asyncio.gather(*control.tasks)
+        assert operation.status == "succeeded", operation.error
+        if kind == "start":
+            assert operation.result == {"state": "ready", "members": ["a", "b"]}
 
     asyncio.run(scenario())
 

@@ -148,8 +148,30 @@ There is no HTTP checkpoint-upload endpoint or separate worker-access service.
 
 `models/prepare` accepts optional `node_ids` (one or more registered nodes), so
 weights can be delivered before selecting or starting an inference group. It
-reports resolve/hash/copy/verify phases and per-node readiness. It does not
-claim bytes transferred or percentage progress that rsync has not measured.
+reports resolve/hash/copy/verify phases and per-node readiness. During a copy,
+`operation.updated` events carry live rsync measurements in `data.result.progress`:
+
+```json
+{"node_id":"worker-b","snapshot":"sha256-digest","bytes_transferred":536870912,"bytes_reused":0,"total_bytes":2147483648}
+```
+
+The operation's `phase` is `transferring`; the same progress object is available
+from `GET /v1/cluster/operations/{operation_id}`. Updates arrive during the copy,
+at most twice per second per worker plus a final measurement. Model preparation
+inside `start` uses the same events. Counters are cumulative for that worker's
+copy attempt and reset for a new operation or worker.
+
+`bytes_transferred` sums rsync's logical file-copy progress, including blocks
+reconstructed by its delta algorithm; it is not a network-traffic counter.
+`bytes_reused` counts whole files that rsync found identical with `--checksum`,
+separately from copied bytes. `total_bytes` is the manifest's checkpoint size.
+Copy percentage is `100 * (bytes_transferred + bytes_reused) / total_bytes`;
+for a fresh destination, `bytes_reused` is zero. A previously verified snapshot
+reports zero copied bytes and all bytes reused in `worker_ready`.
+
+Copying 100% is followed by `verifying_worker`; only `worker_ready` confirms
+checksum verification and atomic publication. Nonzero exits, timeouts and checksum
+failures remain failed operations, even if the copy counter reached 100%.
 The result includes the content digest and each worker's verified local path.
 Weight delivery does not validate a sharding count; selection and inference
 startup perform that separate validation. A transfer failure does not fail an

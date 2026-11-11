@@ -30,6 +30,7 @@ from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
 from .distributed_launch import LaunchConfig
+from .rsync_progress import run_rsync
 
 logger = logging.getLogger("mlx_vlm.server.distributed")
 
@@ -307,6 +308,7 @@ class ModelStager:
             validate_model(config, len(self.config.workers))
         report("verifying_source")
         files = _manifest(source)
+        total_bytes = sum(record["size"] for record in files.values())
         manifest = json.dumps(files, sort_keys=True)
         digest = hashlib.sha256(manifest.encode()).hexdigest()
         root = self.config.model_dir
@@ -346,7 +348,14 @@ class ModelStager:
                 return self._run([*verify, mode], input=manifest).returncode
 
             if verify_worker("verify") == 0:
-                report("worker_ready", node_id=worker.node_id, snapshot=digest)
+                report(
+                    "worker_ready",
+                    node_id=worker.node_id,
+                    snapshot=digest,
+                    bytes_transferred=0,
+                    bytes_reused=total_bytes,
+                    total_bytes=total_bytes,
+                )
                 continue
             logger.info("Transferring model snapshot %s to %s", digest, worker.url)
             temporary = worker_root / (".partial-" + digest)
@@ -354,39 +363,47 @@ class ModelStager:
                 self._remote(worker, ["mkdir", "-p", str(temporary)])
             else:
                 temporary.mkdir(parents=True, exist_ok=True)
-            report(
-                "transferring",
-                node_id=worker.node_id,
-                snapshot=digest,
-                total_bytes=sum(record["size"] for record in files.values()),
-            )
-            result = self._run(
-                [
-                    "rsync",
-                    "-aL",
-                    "--checksum",
-                    "--partial",
-                    "--files-from=-",
-                    "-e",
-                    shlex.join(
-                        ["ssh", "-o", "BatchMode=yes", *self.config.ssh_options]
-                    ),
-                    str(final) + "/",
-                    (
-                        f"{worker.ssh}:{temporary}/"
-                        if worker.ssh
-                        else str(temporary) + "/"
-                    ),
-                ],
-                input="\n".join(files) + "\n",
-            )
+            counts = dict(bytes_transferred=0, bytes_reused=0, total_bytes=total_bytes)
+
+            def transfer_progress(**updates):
+                counts.update(updates)
+                report(
+                    "transferring", node_id=worker.node_id, snapshot=digest, **counts
+                )
+
+            transfer_progress()
+            args = [
+                "rsync",
+                "-aL",
+                "--checksum",
+                "--partial",
+                "--files-from=-",
+                "-e",
+                shlex.join(["ssh", "-o", "BatchMode=yes", *self.config.ssh_options]),
+                str(final) + "/",
+                (f"{worker.ssh}:{temporary}/" if worker.ssh else str(temporary) + "/"),
+            ]
+            file_list = "\n".join(files) + "\n"
+            if progress:
+                result = run_rsync(
+                    args,
+                    input=file_list,
+                    timeout=self.config.timeout,
+                    total_bytes=total_bytes,
+                    progress=transfer_progress,
+                )
+            else:
+                result = self._run(args, input=file_list)
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Model transfer failed ({worker.url}): {result.stderr[-1000:]}"
                 )
+            report(
+                "verifying_worker", node_id=worker.node_id, snapshot=digest, **counts
+            )
             if verify_worker("commit") != 0:
                 raise RuntimeError(f"Model checksum verification failed ({worker.url})")
-            report("worker_ready", node_id=worker.node_id, snapshot=digest)
+            report("worker_ready", node_id=worker.node_id, snapshot=digest, **counts)
         self.prepared[key] = str(final)
         logger.info(
             "Model snapshot %s verified on all %s workers",
