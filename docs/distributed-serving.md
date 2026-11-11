@@ -3,6 +3,8 @@
 One public MLX-VLM server can handle both local and distributed models through
 the existing API routes. Omit `distributed`, or set it to `false`, to use the
 normal single-device loader. Set it to `true` to use a configured worker group.
+The authenticated [cluster API](cluster-api.md) manages registrations, selected
+members, lifecycle, telemetry, and SSH/rsync weight preparation without a restart.
 The coordinator remains outside that collective group, with a separate worker
 process on each participating Mac, including the main Mac.
 
@@ -50,8 +52,9 @@ Client -> public server (coordinator)
    Workers verify token and completion decisions before publishing them. The
    coordinator forwards rank 0's SSE events while consuming and comparing peer
    streams; it releases terminal success only after all ranks agree.
-5. **Clean up together.** A client disconnect cancels its request across all
-   ranks. The model lease remains held until cleanup finishes, so a model switch
+5. **Clean up together.** An ordinary client disconnect cancels its request
+   across all ranks. A resumable Responses stream instead pauses the existing
+   native decoder/cache session across ranks, retaining it for continuation. The model lease remains held until cleanup finishes, so a model switch
    cannot overlap old work. A rank failure or disagreement blocks further
    distributed requests until the group is recovered; local serving remains
    available.
@@ -100,11 +103,15 @@ or install packages; those remain one-time setup steps.
 Requirements:
 
 - A dedicated collective group, with one worker endpoint per rank.
-- The same absolute staging directory on all machines, writable by the worker
-  and coordinator users. Each machine needs room for the full checkpoint.
-- Noninteractive SSH and `rsync` from the coordinator to the other Macs. The
-  coordinator's configured Python command must also work on every peer.
-- A shared worker API key, distinct from the public server's key if desired.
+- An absolute staging directory on each machine, writable by its worker and
+  transfer user. Each machine needs room for the full checkpoint. A worker can
+  specify its own `model_dir` and `python`; the legacy CLI defaults remain shared.
+- Noninteractive SSH and `rsync` from the coordinator to remote workers for
+  weights. Automatic process launch also uses SSH. MLX-VLM never configures
+  macOS Remote Login, enrolls SSH keys, or changes SSH trust.
+- Authenticated worker endpoints, independent of SSH access. API registrations
+  can supply individual worker keys; file configurations also support a shared
+  key through `api_key_env`, distinct from the public server's key if desired.
   Keep worker endpoints private and send inference through the coordinator.
 - Identical worker settings. Health checks compare source, MLX version, runtime
   settings, rank count, and backend before loading a model.
@@ -137,7 +144,9 @@ are examples to replace with your deployment's values:
 }
 ```
 
-Omit `ssh` only for a worker sharing the coordinator's filesystem. Worker URLs
+Omit `ssh` only for a worker sharing the coordinator's filesystem. Optional
+per-worker `model_dir` and `python` override staging defaults; `api_key` overrides
+the shared environment credential (keep configuration files private). Worker URLs
 are HTTP(S) origins reachable from the coordinator; they can also be local SSH
 tunnel endpoints. Optional `ssh_options` is an array of arguments, for example
 `["-F", "/path/to/ssh-config"]`. Use a staging path without spaces or shell
@@ -259,8 +268,8 @@ On the first distributed request for a model/revision:
 4. It verifies an existing snapshot on each peer or transfers it with `rsync`.
    Size and SHA-256 checks must pass before an atomic rename makes it loadable.
    A partial transfer never triggers loading.
-5. It sends the same request, model path, tenant, and sampling seed concurrently
-   to all ranks. Workers use the shared native model/processor loader lazily,
+5. It sends the same request, tenant, and sampling seed concurrently to all
+   ranks, translating the immutable snapshot to each worker's local path. Workers use the shared native model/processor loader lazily,
    call `Model.shard`, materialize parameters, and synchronize before generation.
 
 Workers do not resolve Hub IDs themselves. Later requests reuse the prepared
@@ -294,15 +303,22 @@ accidentally prevent batching.
 
 The coordinator forwards rank 0's SSE events as they arrive and drains every
 other rank concurrently. It compares normalized stream contents and withholds
-the terminal success event until all ranks finish consistently. A disconnect
-cancels that request across ranks and retains the model lease through cleanup;
-other active rows continue. Stream failures produce an SSE error and mark the
+the terminal success event until all ranks finish consistently. An ordinary
+disconnect cancels that request across ranks and retains the model lease through
+cleanup; a resumable disconnect synchronizes native checkpoint suspension.
+Other active rows continue. Measured progress events come from rank zero and
+are excluded from semantic divergence checks. Stream failures produce an SSE error and mark the
 group for recovery.
 
 Responses requests remain stateless (`store: false`); provide full history or a
-compaction capsule instead of `previous_response_id`. Resumable continuations,
-adapters, speculative drafters, diffusion models, and custom `model_file` architectures remain
-unsupported. Other modality endpoints remain local-only.
+compaction capsule instead of `previous_response_id`. Streaming Responses can
+use `resumable: true` and the existing `continuation` object; resume retains the
+native cache and replays decoder history without generating old text again.
+Close the current reader before resuming (concurrent claims return
+`continuation_busy`). Paused/completed retained sessions pin the model until
+expiry or explicit disposal with cluster stop. Stored retrieval/deletion,
+`previous_response_id`, adapters, speculative drafters, diffusion models, and
+custom `model_file` architectures remain unsupported. Other modality endpoints remain local-only.
 
 Workers disable automatic prefix caching, vision caching, and the expiring
 chat-compaction cache. These independent caches could otherwise skip work on
@@ -321,8 +337,9 @@ timeout, or disagreement writes `.cluster-failed.json` in the staging directory
 and blocks further distributed requests. Local requests remain available.
 
 Inspect that marker and worker logs, stop/restart the **entire affected worker
-group**, and confirm no old request is running. Only then remove the failure
-marker and retry. Do not delete an active lock file or restart unrelated groups.
+group**, and confirm no old request is running. The cluster start API clears a
+failure marker only after authenticating fresh worker process identities. For
+legacy manual recovery, only then remove the failure marker and retry. Do not delete an active lock file or restart unrelated groups.
 Transfer failures occur before inference and can be retried; corrupt committed
 snapshots are preserved for diagnosis instead of silently overwritten.
 
@@ -330,7 +347,8 @@ snapshots are preserved for diagnosis instead of silently overwritten.
 
 ```bash
 python -m pytest -q mlx_vlm/tests/test_server_distributed.py \
-  mlx_vlm/tests/test_server_distributed_launch.py mlx_vlm/tests/test_server.py
+  mlx_vlm/tests/test_server_distributed_launch.py mlx_vlm/tests/test_server_cluster.py \
+  mlx_vlm/tests/test_server.py
 ```
 
 Launcher tests cover startup/shutdown integration, ownership conflicts, occupied
