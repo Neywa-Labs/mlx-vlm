@@ -626,14 +626,8 @@ class ClusterManager:
                     message=str(error) or type(error).__name__,
                     retryable=True,
                 )
-            if self.launcher and operation.kind == "start":
-                if self.monitor:
-                    self.monitor.cancel()
-                    await asyncio.gather(self.monitor, return_exceptions=True)
-                await asyncio.to_thread(self.launcher.stop)
-                self.launcher = None
-            if operation.kind != "prepare_model":
-                self.state = "failed"
+            # Each transition owns its rollback. An operation rejection is not
+            # evidence that the running inference group failed.
             await self.phase(operation, "failed")
             if isinstance(error, asyncio.CancelledError):
                 raise
@@ -704,6 +698,7 @@ class ClusterManager:
                 raise
 
     async def start(self, operation, body):
+        await self.refresh()
         if self.running:
             fail(
                 "already_running",
@@ -711,120 +706,138 @@ class ClusterManager:
             )
         if len(self.selected) < 2:
             fail("members_required", "Select at least two registered workers.", 422)
-        self.state = "starting"
-        await self.phase(operation, "validating")
-        await self.refresh()
-        await self.check_model(body.model, body.revision)
-        config = self.config()
-        old = runtime.distributed_coordinator
-        if body.mode == "attach":
-            config = replace(config, launch=None)
-        elif config.launch is None:
-            fail(
-                "launcher_not_configured",
-                "SSH launch mode requires a configured launch section.",
-                422,
-            )
-        if old and (old.active or old.waiters):
-            fail(
-                "group_busy",
-                "Inference must drain before replacing the group.",
-                retryable=True,
-            )
-        coordinator = Coordinator(config)
-        if config.launch:
-            if config.launch.backend != self.backend:
+        previous_state = self.state
+        launcher = monitor = None
+        try:
+            self.state = "starting"
+            await self.phase(operation, "validating")
+            await self.check_model(body.model, body.revision)
+            config = self.config()
+            old = runtime.distributed_coordinator
+            if body.mode == "attach":
+                config = replace(config, launch=None)
+            elif config.launch is None:
                 fail(
-                    "launch_reconfiguration_required",
-                    "Selected backend differs from the configured SSH launcher topology.",
-                    action="Update the launcher configuration while stopped, or attach a compatible external group.",
+                    "launcher_not_configured",
+                    "SSH launch mode requires a configured launch section.",
+                    422,
                 )
-            configured = {w.url for w in old.config.workers}
-            if {w.url for w in config.workers} != configured:
+            if old and (old.active or old.waiters):
                 fail(
-                    "launch_reconfiguration_required",
-                    "Selected members differ from the SSH launcher hostfile.",
-                    action="Update the launcher configuration while stopped, or attach application-managed workers.",
+                    "group_busy",
+                    "Inference must drain before replacing the group.",
+                    retryable=True,
                 )
-            from .distributed_launch import WorkerLauncher
-
-            self.launcher = WorkerLauncher(coordinator)
-            await self.phase(operation, "launching")
-            # Keep the failure marker until fresh process identities are checked
-            # below; startup still refuses occupied endpoints or another owner.
-            await self.launcher.start(recover=True)
-            self.monitor = asyncio.create_task(self.launcher.monitor())
-        else:
-            for rank, node_id in enumerate(self.selected):
-                info = self.nodes[node_id].identity.worker
-                if (
-                    not info
-                    or info.get("world_size") != len(self.selected)
-                    or info.get("backend") != self.backend
-                    or info.get("rank") != rank
-                ):
-                    operation.result = {
-                        "required_action": "start_external_group",
-                        "backend": self.backend,
-                        "world_size": len(self.selected),
-                        "members": [
-                            {"id": n, "rank": i, "endpoint": self.nodes[n].endpoint}
-                            for i, n in enumerate(self.selected)
-                        ],
-                    }
+            coordinator = Coordinator(config)
+            if config.launch:
+                if config.launch.backend != self.backend:
                     fail(
-                        "external_reconfiguration_required",
-                        "External workers must join the selected collective group before attach.",
-                        action="Launch the returned rank plan in each worker's own Python environment, then retry start.",
+                        "launch_reconfiguration_required",
+                        "Selected backend differs from the configured SSH launcher topology.",
+                        action="Update the launcher configuration while stopped, or attach a compatible external group.",
                     )
-            group_ids = {
-                (self.nodes[n].identity.worker or {}).get("group_id")
-                for n in self.selected
-            }
-            if not all(group_ids) or len(group_ids) != 1:
-                fail(
-                    "group_identity_mismatch",
-                    "External ranks must present the same nonempty MLX_VLM_GROUP_ID.",
-                    action="Launch all selected workers together with a fresh shared group ID.",
+                configured = {w.url for w in old.config.workers}
+                if {w.url for w in config.workers} != configured:
+                    fail(
+                        "launch_reconfiguration_required",
+                        "Selected members differ from the SSH launcher hostfile.",
+                        action="Update the launcher configuration while stopped, or attach application-managed workers.",
+                    )
+                from .distributed_launch import WorkerLauncher
+
+                launcher = WorkerLauncher(coordinator)
+                await self.phase(operation, "launching")
+                # Keep the failure marker until fresh process identities are checked
+                # below; startup still refuses occupied endpoints or another owner.
+                await launcher.start(recover=True)
+                monitor = asyncio.create_task(launcher.monitor())
+            else:
+                for rank, node_id in enumerate(self.selected):
+                    info = self.nodes[node_id].identity.worker
+                    if (
+                        not info
+                        or info.get("world_size") != len(self.selected)
+                        or info.get("backend") != self.backend
+                        or info.get("rank") != rank
+                    ):
+                        operation.result = {
+                            "required_action": "start_external_group",
+                            "backend": self.backend,
+                            "world_size": len(self.selected),
+                            "members": [
+                                {"id": n, "rank": i, "endpoint": self.nodes[n].endpoint}
+                                for i, n in enumerate(self.selected)
+                            ],
+                        }
+                        fail(
+                            "external_reconfiguration_required",
+                            "External workers must join the selected collective group before attach.",
+                            action="Launch the returned rank plan in each worker's own Python environment, then retry start.",
+                        )
+                group_ids = {
+                    (self.nodes[n].identity.worker or {}).get("group_id")
+                    for n in self.selected
+                }
+                if not all(group_ids) or len(group_ids) != 1:
+                    fail(
+                        "group_identity_mismatch",
+                        "External ranks must present the same nonempty MLX_VLM_GROUP_ID.",
+                        action="Launch all selected workers together with a fresh shared group ID.",
+                    )
+            await self.phase(operation, "attaching")
+            async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+                await coordinator._health(client)
+            if coordinator.failure.exists():
+                # An old failure cannot be cleared by health alone: require fresh process identities.
+                old_instances = json.loads(coordinator.failure.read_text()).get(
+                    "instances"
+                ) or getattr(old, "group_instances", None)
+                instances = coordinator.group_instances
+                if (
+                    not old_instances
+                    or not instances
+                    or any(not value or value in old_instances for value in instances)
+                ):
+                    fail(
+                        "restart_required",
+                        "Failed workers must be restarted before recovery.",
+                        action="Restart the owned/external group and retry start.",
+                    )
+                coordinator.failure.unlink()
+            if body.model:
+                await self.phase(operation, "preparing_model")
+                await self.stage(coordinator.stager, body.model, body.revision)
+                await self.phase(operation, "loading_model")
+                _, status = await coordinator.relay(
+                    "/v1/responses/input_tokens",
+                    {
+                        "model": body.model,
+                        "input": ".",
+                        "distributed_revision": body.revision,
+                    },
                 )
-        await self.phase(operation, "attaching")
-        async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
-            await coordinator._health(client)
-        if coordinator.failure.exists():
-            # An old failure cannot be cleared by health alone: require fresh process identities.
-            old_instances = json.loads(coordinator.failure.read_text()).get(
-                "instances"
-            ) or getattr(old, "group_instances", None)
-            instances = coordinator.group_instances
-            if (
-                not old_instances
-                or not instances
-                or any(not value or value in old_instances for value in instances)
-            ):
-                fail(
-                    "restart_required",
-                    "Failed workers must be restarted before recovery.",
-                    action="Restart the owned/external group and retry start.",
-                )
-            coordinator.failure.unlink()
-        if body.model:
-            await self.phase(operation, "preparing_model")
-            await self.stage(coordinator.stager, body.model, body.revision)
-            await self.phase(operation, "loading_model")
-            _, status = await coordinator.relay(
-                "/v1/responses/input_tokens",
-                {
-                    "model": body.model,
-                    "input": ".",
-                    "distributed_revision": body.revision,
-                },
-            )
-            if status >= 400:
-                fail(
-                    "model_load_failed",
-                    "Worker model load failed; inspect authenticated worker health.",
-                    502,
-                )
+                if status >= 400:
+                    fail(
+                        "model_load_failed",
+                        "Worker model load failed; inspect authenticated worker health.",
+                        502,
+                    )
+        except BaseException:
+            # Only this attempt's resources are eligible for cleanup. Existing
+            # launchers (including CLI-owned groups) must remain untouched.
+            try:
+                if monitor:
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
+                if launcher:
+                    await asyncio.to_thread(launcher.stop)
+            finally:
+                if launcher or self.state == "failed":
+                    self.state = "failed"
+                else:
+                    self.state = previous_state
+            raise
+        self.launcher, self.monitor = launcher, monitor
         runtime.distributed_coordinator = coordinator
         self.running = list(self.selected)
         self.state = "ready"
@@ -833,70 +846,92 @@ class ClusterManager:
 
     async def stop(self, operation, body):
         coordinator = runtime.distributed_coordinator
-        self.state = "draining"
-        await self.phase(operation, "draining")
-        if coordinator:
-            coordinator.draining = True
-            try:
+        previous_state = self.state
+        was_draining = coordinator.draining if coordinator else False
+        destructive = False
+        try:
+            self.state = "draining"
+            await self.phase(operation, "draining")
+            if coordinator:
+                coordinator.draining = True
+                try:
 
-                async def drain():
-                    async with coordinator.condition:
-                        coordinator.condition.notify_all()
-                        while coordinator.active or coordinator.waiters:
-                            await coordinator.condition.wait()
+                    async def drain():
+                        async with coordinator.condition:
+                            coordinator.condition.notify_all()
+                            while coordinator.active or coordinator.waiters:
+                                await coordinator.condition.wait()
 
-                await asyncio.wait_for(drain(), body.drain_timeout_seconds)
-            except asyncio.TimeoutError:
-                fail(
-                    "drain_timeout",
-                    "Active inference has not drained; the group was not stopped.",
-                    action="Finish/cancel active requests and retry stop.",
-                    retryable=True,
-                )
-        if coordinator and coordinator.continuations:
-            if not body.discard_continuations:
-                coordinator.draining = False
-                fail(
-                    "retained_continuations",
-                    "Paused or completed continuation checkpoints remain.",
-                    action="Retry stop with discard_continuations=true, or resume the retained sessions.",
-                )
-            if coordinator.failure.exists():
-                # A broken collective cannot acknowledge cache disposal. Keep
-                # its failure marker and require fresh processes on restart.
-                # Owned processes are stopped below; external processes remain
-                # their owner's responsibility, explicitly reported in result.
-                coordinator.continuations.clear()
-                operation.result = {
-                    "state": "stopped",
-                    "members": [],
-                    "external_restart_required": not bool(
-                        self.launcher or getattr(coordinator, "launcher", None)
-                    ),
-                    "collective_disposal_acknowledged": False,
-                }
+                    await asyncio.wait_for(drain(), body.drain_timeout_seconds)
+                except asyncio.TimeoutError:
+                    fail(
+                        "drain_timeout",
+                        "Active inference has not drained; the group was not stopped.",
+                        action="Finish/cancel active requests and retry stop.",
+                        retryable=True,
+                    )
+            if coordinator and coordinator.continuations:
+                if not body.discard_continuations:
+                    fail(
+                        "retained_continuations",
+                        "Paused or completed continuation checkpoints remain.",
+                        action="Retry stop with discard_continuations=true, or resume the retained sessions.",
+                    )
+                destructive = True
+                if coordinator.failure.exists():
+                    # A broken collective cannot acknowledge cache disposal. Keep
+                    # its failure marker and require fresh processes on restart.
+                    # Owned processes are stopped below; external processes remain
+                    # their owner's responsibility, explicitly reported in result.
+                    coordinator.continuations.clear()
+                    operation.result = {
+                        "state": "stopped",
+                        "members": [],
+                        "external_restart_required": not bool(
+                            self.launcher or getattr(coordinator, "launcher", None)
+                        ),
+                        "collective_disposal_acknowledged": False,
+                    }
+                else:
+                    async with httpx.AsyncClient(
+                        trust_env=False,
+                        timeout=65,
+                        headers={
+                            "Authorization": "Bearer "
+                            + os.environ.get(coordinator.config.api_key_env, "")
+                        },
+                    ) as client:
+                        await coordinator.expire_continuations(
+                            client, all_sessions=True
+                        )
+            launcher = self.launcher or getattr(coordinator, "launcher", None)
+            if launcher:
+                await self.phase(operation, "stopping_owned_workers")
+                destructive = True
+                if self.monitor:
+                    self.monitor.cancel()
+                    await asyncio.gather(self.monitor, return_exceptions=True)
+                await asyncio.to_thread(launcher.stop)
+            # Detaching an external group never sends a process-stop command.
+            self.monitor = None
+            self.launcher, self.running, self.state = None, [], "stopped"
+            self.bootstrapped = True
+            self.save()
+            await self.emit("cluster.stopped", {"external_processes_stopped": False})
+        except BaseException:
+            if (
+                destructive
+                or self.state == "failed"
+                or (coordinator and coordinator.failure.exists())
+            ):
+                # Disposal or process shutdown may have partially completed;
+                # admitting inference again would be unsafe.
+                self.state = "failed"
             else:
-                async with httpx.AsyncClient(
-                    trust_env=False,
-                    timeout=65,
-                    headers={
-                        "Authorization": "Bearer "
-                        + os.environ.get(coordinator.config.api_key_env, "")
-                    },
-                ) as client:
-                    await coordinator.expire_continuations(client, all_sessions=True)
-        launcher = self.launcher or getattr(coordinator, "launcher", None)
-        if launcher:
-            await self.phase(operation, "stopping_owned_workers")
-            if self.monitor:
-                self.monitor.cancel()
-                await asyncio.gather(self.monitor, return_exceptions=True)
-            await asyncio.to_thread(launcher.stop)
-        # Detaching an external group never sends a process-stop command.
-        self.launcher, self.running, self.state = None, [], "stopped"
-        self.bootstrapped = True
-        self.save()
-        await self.emit("cluster.stopped", {"external_processes_stopped": False})
+                self.state = previous_state
+                if coordinator:
+                    coordinator.draining = was_draining
+            raise
 
     async def close(self):
         for task in self.tasks:

@@ -1493,7 +1493,7 @@ async def responses_endpoint(request: Request):
                             chunk_rate = metrics.record_chunk(token)
                             output_tokens = metrics.generated_tokens
                             timings = (
-                                {"tokens_per_second": metrics.rate}
+                                {"predicted_per_second": metrics.rate}
                                 if metrics.rate is not None
                                 else None
                             )
@@ -1574,7 +1574,7 @@ async def responses_endpoint(request: Request):
                                 response_id=response_id,
                                 output_tokens=metrics.generated_tokens,
                                 timings=(
-                                    {"tokens_per_second": metrics.rate}
+                                    {"predicted_per_second": metrics.rate}
                                     if metrics.rate is not None
                                     else None
                                 ),

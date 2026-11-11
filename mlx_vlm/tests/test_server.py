@@ -10843,6 +10843,34 @@ def test_minimax_thinking_delimiters_at_every_chunk_boundary(started):
     assert "".join(d.content or "" for d in deltas) == "answer"
 
 
+@pytest.mark.parametrize("continuous", [False, True])
+def test_responses_generation_progress_uses_native_timing_field(client, continuous):
+    chunks = [
+        NS(
+            text=text,
+            emitted_at=when,
+            generation_tokens=count,
+            prompt_tokens=3,
+            finish_reason=finish,
+        )
+        for text, when, count, finish in (
+            ("hello", 10.0, 1, None),
+            (" there", 10.5, 2, "stop"),
+        )
+    ]
+    with _endpoint(chunks=chunks, generator=_streaming(chunks) if continuous else None):
+        wire = _post(client, "responses", stream=True)
+    assert wire.status_code == 200, wire.text
+    events = _data(wire)
+    progress = [e for e in events if e["type"] == "response.generation_progress"]
+    assert [e["output_tokens"] for e in progress] == [1, 2]
+    assert "timings" not in progress[0]  # No measured interval yet.
+    assert progress[1]["timings"] == {"predicted_per_second": 2.0}
+    text = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert text[-1]["timings"] == progress[-1]["timings"]
+    assert events[-1]["type"] == "response.completed"
+
+
 def test_responses_emit_real_prefill_progress_before_first_token(client):
     tokens = [
         _token(

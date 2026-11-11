@@ -5,7 +5,7 @@ import asyncio
 import time
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -217,6 +217,180 @@ def test_operations_serialized_idempotent_and_external_stop_does_not_kill(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("imported", [False, True])
+def test_rejected_start_preserves_owned_group(control, monkeypatch, imported):
+    async def scenario():
+        await register_pair(control)
+        coordinator = management.Coordinator(control.config())
+        launcher = NS(stop=Mock())
+        coordinator.launcher = launcher
+        monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+        control.bootstrapped = not imported
+        if not imported:
+            control.state, control.running = "ready", ["a", "b"]
+            control.launcher = launcher
+        monitor = asyncio.create_task(asyncio.Event().wait())
+        control.monitor = monitor
+        try:
+            for key in ("start-again", "start-again", "new-start"):
+                operation = await control.begin("start", StartGroup(mode="launch"), key)
+                await asyncio.gather(*control.tasks)
+                assert operation.status == "failed"
+                assert operation.error.code == "already_running"
+                assert control.snapshot().state == "ready"
+                assert control.running == ["a", "b"]
+                assert runtime.distributed_coordinator is coordinator
+                assert not coordinator.draining and not coordinator.failure.exists()
+                assert control.monitor is monitor and not monitor.done()
+                launcher.stop.assert_not_called()
+            stopped = await control.begin("stop", StopGroup(), "stop")
+            await asyncio.gather(*control.tasks)
+            assert stopped.status == "succeeded"
+            launcher.stop.assert_called_once()
+        finally:
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", ["retained", "timeout", "cancel"])
+def test_rejected_stop_restores_healthy_group(control, monkeypatch, interruption):
+    async def scenario():
+        await register_pair(control)
+        coordinator = management.Coordinator(control.config())
+        monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+        launcher = NS(stop=Mock())
+        control.launcher = launcher
+        control.state, control.running = "ready", ["a", "b"]
+        coordinator.continuations["paused"] = {"session_id": "retained-session"}
+        if interruption != "retained":
+            coordinator.active = 1
+        operation = await control.begin(
+            "stop", StopGroup(drain_timeout_seconds=0.01), None
+        )
+        tasks = list(control.tasks)
+        if interruption == "cancel":
+            while not coordinator.draining:
+                await asyncio.sleep(0)
+            tasks[0].cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        assert operation.status == "failed"
+        assert (
+            operation.error.code
+            == {
+                "retained": "retained_continuations",
+                "timeout": "drain_timeout",
+                "cancel": "transition_failed",
+            }[interruption]
+        )
+        assert control.snapshot().state == "ready"
+        assert control.running == ["a", "b"] and control.launcher is launcher
+        assert not coordinator.draining and not coordinator.failure.exists()
+        assert coordinator.continuations == {
+            "paused": {"session_id": "retained-session"}
+        }
+        launcher.stop.assert_not_called()
+        # The rejected stop leaves sessions usable and a later explicit discard valid.
+        coordinator.active = 0
+        coordinator.expire_continuations = AsyncMock()
+        retry = await control.begin("stop", StopGroup(discard_continuations=True), None)
+        await asyncio.gather(*control.tasks)
+        assert retry.status == "succeeded", retry.error
+        coordinator.expire_continuations.assert_awaited_once()
+        launcher.stop.assert_called_once()
+
+    asyncio.run(scenario())
+
+
+def test_failed_checkpoint_disposal_keeps_admissions_blocked(control, monkeypatch):
+    async def scenario():
+        await register_pair(control)
+        coordinator = management.Coordinator(control.config())
+        monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+        control.state, control.running = "ready", ["a", "b"]
+        control.launcher = NS(stop=Mock())
+        coordinator.continuations["paused"] = {}
+        coordinator.expire_continuations = AsyncMock(
+            side_effect=RuntimeError("rank lost")
+        )
+        operation = await control.begin(
+            "stop", StopGroup(discard_continuations=True), None
+        )
+        await asyncio.gather(*control.tasks)
+        assert operation.status == "failed"
+        assert control.state == "failed" and coordinator.draining
+        assert control.running == ["a", "b"]
+        control.launcher.stop.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+def test_node_failure_during_drain_is_not_rolled_back(control, monkeypatch):
+    async def scenario():
+        await register_pair(control)
+        coordinator = management.Coordinator(control.config())
+        monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+        control.state, control.running = "ready", ["a", "b"]
+        coordinator.active = 1
+        operation = await control.begin(
+            "stop", StopGroup(drain_timeout_seconds=0.01), None
+        )
+        while not coordinator.draining:
+            await asyncio.sleep(0)
+        coordinator.failed(RuntimeError("worker lost while draining"))
+        await asyncio.gather(*control.tasks)
+        assert operation.status == "failed"
+        assert operation.error.code == "drain_timeout"
+        assert control.state == "failed" and coordinator.draining
+        assert coordinator.failure.exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_phase", ["launch", "health"])
+def test_failed_start_cleans_up_only_its_new_launcher(
+    control, monkeypatch, failure_phase
+):
+    from dataclasses import replace
+
+    from mlx_vlm.server import distributed_launch
+
+    async def scenario():
+        await register_pair(control)
+        prior = management.Coordinator(
+            replace(control.config(), launch=NS(backend="jaccl"))
+        )
+        monkeypatch.setattr(runtime, "distributed_coordinator", prior)
+        control.bootstrapped = True
+        previous_launcher = NS(stop=Mock())
+        control.launcher = previous_launcher
+        launched = NS(
+            start=AsyncMock(
+                side_effect=(
+                    RuntimeError("launch failed") if failure_phase == "launch" else None
+                )
+            ),
+            monitor=AsyncMock(side_effect=asyncio.Event().wait),
+            stop=Mock(),
+        )
+        monkeypatch.setattr(distributed_launch, "WorkerLauncher", lambda *_: launched)
+        monkeypatch.setattr(
+            management.Coordinator,
+            "_health",
+            AsyncMock(side_effect=RuntimeError("health failed")),
+        )
+        operation = await control.begin("start", StartGroup(mode="launch"), None)
+        await asyncio.gather(*control.tasks)
+        assert operation.status == "failed" and control.state == "failed"
+        assert runtime.distributed_coordinator is prior and not control.running
+        assert control.launcher is previous_launcher
+        previous_launcher.stop.assert_not_called()
+        launched.stop.assert_called_once()
+
+    asyncio.run(scenario())
+
+
 def test_external_attach_validates_group_then_exposes_rank_zero(control, monkeypatch):
     async def health(coordinator, client):
         coordinator.group_instances = ["a-process", "b-process"]
@@ -253,7 +427,7 @@ def test_external_reconfiguration_is_observable_without_launching(control):
         assert operation.status == "failed"
         assert operation.error.code == "external_reconfiguration_required"
         assert operation.result["members"][0]["rank"] == 0
-        assert control.launcher is None
+        assert control.launcher is None and control.state == "stopped"
 
     asyncio.run(scenario())
 

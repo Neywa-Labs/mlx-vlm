@@ -16,6 +16,14 @@ weight-upload endpoints.
   group identity, launcher/backend mismatch, and failed-group checkpoint cleanup.
 - Black, isort, autoflake and `git diff --check` passed.
 
+Lifecycle follow-up after revision `8411e7e5`: **1,907 passed, 23 skipped** with
+the same audio-backend test excluded. Added coverage for repeated start on
+API-owned and imported CLI groups, retained-continuation rejection, drain timeout
+and cancellation, cleanup of only a failed start's new launcher, and preservation
+of real node/disposal failures. Both continuous and fallback Responses generation
+paths now test `timings.predicted_per_second` against measured token intervals and
+regular text events. Hardware checks below were not rerun for this follow-up.
+
 Coverage includes authenticated registration, identity-preserving address
 updates, persistence, duplicate devices, selected-only memory and freshness,
 operation serialization/idempotency, ownership, node loss, SSE replay/reset,

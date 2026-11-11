@@ -183,6 +183,11 @@ the configured MLX backend and successfully running collectives, not discovery.
 to drain, up to `drain_timeout_seconds` (default 60). A timeout is observable and
 never silently kills active inference. Retained continuations return
 `retained_continuations` unless `discard_continuations: true` was supplied.
+A repeated `start` returns a failed operation with `already_running` without
+changing the existing group. A rejected or cancelled `stop` before checkpoint
+disposal or process shutdown restores the prior readiness/admission state; its
+operation can fail while the cluster remains healthy. Once disposal or shutdown
+begins, a failure leaves admissions blocked because ranks may have changed.
 Explicit disposal synchronizes native checkpoint/cache disposal across ranks.
 A failed collective cannot acknowledge cache disposal. Explicit discard then
 invalidates coordinator handles, preserves the failure marker, and reports
@@ -221,14 +226,15 @@ The same shared Responses generation path emits:
 
 ```json
 {"type":"response.prompt_progress","response_id":"resp_…","status":"in_progress","processed_tokens":512,"total_tokens":2048}
-{"type":"response.generation_progress","response_id":"resp_…","output_tokens":16,"timings":{"tokens_per_second":32.0}}
+{"type":"response.generation_progress","response_id":"resp_…","output_tokens":16,"timings":{"predicted_per_second":32.0}}
 ```
 
 Prefill uses `started`, `in_progress`, and `completed` with monotonic, measured
 counts, emitted while actual prefill runs and before the first generated token.
-Generation timing fields appear only when measured (the keys follow the native
-generation metrics). The coordinator forwards rank zero's measurements. Timing
-or progress frequency differences do not count as semantic divergence; token,
+Generation timing fields appear only when measured. `timings.predicted_per_second`
+uses the same field name as regular text events and native generation metrics.
+The coordinator forwards rank zero's measurements. Timing or progress frequency
+differences do not count as semantic divergence; token,
 reasoning/tool, terminal, and collective decisions still do.
 
 ## Telemetry and errors
