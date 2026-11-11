@@ -127,6 +127,7 @@ jobs:
             os: macos-15
             extras: test
             tests: >-
+              tests/test_cosmos3_edge.py
               tests/test_gated_delta.py
               tests/test_inkling_kernel_gates.py
               tests/test_interpolate.py
