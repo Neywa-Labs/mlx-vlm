@@ -59,7 +59,7 @@ def main():
     distributed_mode = parser.add_mutually_exclusive_group()
     distributed_mode.add_argument(
         "--distributed-config",
-        help="Cluster JSON for requests with distributed=true; local requests remain unchanged.",
+        help="Cluster JSON for distributed=true; an optional launch section starts workers automatically.",
     )
     distributed_mode.add_argument(
         "--distributed-worker",

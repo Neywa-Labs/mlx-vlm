@@ -476,7 +476,9 @@ def test_unsupported_distributed_options_fail_before_staging(cluster, options):
 
 def test_http_flag_and_authentication_preserve_local_routes(monkeypatch):
     relay = AsyncMock(return_value=({"answer": "distributed"}, 200))
-    monkeypatch.setattr(runtime, "distributed_coordinator", NS(relay=relay))
+    monkeypatch.setattr(
+        runtime, "distributed_coordinator", NS(relay=relay, config=NS(launch=None))
+    )
     monkeypatch.setattr(runtime, "distributed_worker", None)
     monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "coordinator-key")
     headers = {"Authorization": "Bearer coordinator-key"}

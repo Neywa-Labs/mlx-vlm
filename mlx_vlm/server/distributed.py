@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
+from .distributed_launch import LaunchConfig
+
 logger = logging.getLogger("mlx_vlm.server.distributed")
 
 ROUTES = {
@@ -133,6 +135,7 @@ class ClusterConfig:
     api_key_env: str = "MLX_VLM_DISTRIBUTED_API_KEY"
     timeout: float = 7200
     compaction_key_file: Path | None = None
+    launch: LaunchConfig | None = None
 
     @classmethod
     def read(cls, filename):
@@ -176,6 +179,15 @@ class ClusterConfig:
         ):
             raise ValueError("ssh_options must be an array of arguments")
         key = data.get("compaction_key_file")
+        launch = (
+            LaunchConfig.read(data["launch"], Path(filename).resolve().parent)
+            if "launch" in data
+            else None
+        )
+        if launch:
+            if not Path(data.get("python", "python3")).is_absolute():
+                raise ValueError("Automatic launch requires an absolute python path")
+            launch.validate_hosts(workers)
         return cls(
             workers,
             root,
@@ -185,6 +197,7 @@ class ClusterConfig:
             data.get("api_key_env", "MLX_VLM_DISTRIBUTED_API_KEY"),
             timeout,
             Path(key).expanduser() if key else None,
+            launch,
         )
 
 
@@ -390,6 +403,7 @@ class Coordinator:
         self.primary = 0
         self.seed = secrets.randbelow(2**31)
         self.failure = config.model_dir / ".cluster-failed.json"
+        self.launch_id = None
 
     def failed(self, error):
         self.failure.parent.mkdir(parents=True, exist_ok=True)
@@ -410,6 +424,11 @@ class Coordinator:
             for check in checks:
                 check.raise_for_status()
                 info = check.json().get("distributed_worker") or {}
+                if self.launch_id and (
+                    info.get("launch_id") != self.launch_id
+                    or info.get("backend") != self.config.launch.backend
+                ):
+                    raise ValueError("Worker does not belong to this server launch")
                 if info.get("world_size") != len(checks):
                     raise ValueError(
                         "Worker group size does not match configured cluster"
@@ -886,6 +905,7 @@ class DistributedWorker:
             "rank": self.group.rank(),
             "world_size": self.group.size(),
             "backend": self.backend,
+            "launch_id": os.environ.get("MLX_VLM_WORKER_LAUNCH_ID"),
             "fingerprint": hashlib.sha256(signature.encode()).hexdigest(),
         }
 

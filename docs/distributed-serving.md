@@ -91,10 +91,11 @@ simultaneously; the group switches its active model as needed.
 ## Cluster setup
 
 Use the same MLX-VLM checkout and dependency versions on every worker. Configure
-MLX's hostfile/backend for the machines and test that network separately. The
-server does not provision Macs, configure RDMA, install packages, or launch its
-workers automatically. A distributed request downloads and stages weights on
-an already running worker group.
+MLX's hostfile/backend for the machines and test that network separately. With
+a `launch` section in `cluster.json`, starting the public server also starts
+its workers through `mlx.launch` over SSH. No separate worker command or
+`cluster apply` step is needed. The server does not enroll Macs, configure RDMA,
+or install packages; those remain one-time setup steps.
 
 Requirements:
 
@@ -120,9 +121,19 @@ are examples to replace with your deployment's values:
   ],
   "model_dir": "/Users/Shared/mlx-vlm-distributed-models",
   "shared_lock": "/Users/Shared/mlx-vlm-distributed.lock",
-  "python": "/Users/Shared/mlx-vlm-venv/bin/python",
+  "python": "/Users/Shared/mlx-vlm/.venv/bin/python",
   "api_key_env": "MLX_VLM_DISTRIBUTED_API_KEY",
-  "timeout": 7200
+  "timeout": 7200,
+  "launch": {
+    "hostfile": "hosts.json",
+    "backend": "jaccl",
+    "cwd": "/Users/Shared/mlx-vlm",
+    "host": "0.0.0.0",
+    "port": 8283,
+    "max_num_seqs": 8,
+    "startup_timeout": 120,
+    "shutdown_timeout": 10
+  }
 }
 ```
 
@@ -133,6 +144,72 @@ tunnel endpoints. Optional `ssh_options` is an array of arguments, for example
 metacharacters. Give each independent worker group its own staging root and
 lock file. All coordinators for the *same* group must share that filesystem lock;
 an API client should not acquire the coordinator's lock itself.
+
+The launch hostfile is resolved relative to `cluster.json`. Its SSH entries must
+match `workers` in order, with one worker per host; use `127.0.0.1` for the local
+entry. Keep the existing MLX IP/RDMA topology in that file. `python` and
+`launch.cwd` must be absolute paths available on every Mac. The example assumes
+you have already run `uv sync` in the checkout on each machine. Automatic launch
+supports `jaccl` and `ring`.
+
+For independent groups on the same hosts, set `launch.starting_port` to a free
+collective control port (default `32323`), and use distinct worker HTTP ports.
+This forwards MLX's `--starting-port` option; it does not change `launch.port`.
+
+Start only the public server, using your existing keys:
+
+```bash
+cd /Users/Shared/mlx-vlm
+
+export MLX_VLM_DISTRIBUTED_API_KEY="$WORKER_TOKEN"
+export MLX_VLM_SERVER_API_KEY="$PUBLIC_TOKEN"
+
+uv run --no-sync python -m mlx_vlm.server \
+  --distributed-config cluster.json \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Before accepting requests, the server acquires a separate launcher ownership
+lock, checks for existing services at the worker endpoints, and launches the
+group. It waits for authenticated health responses with matching code/settings,
+the configured backend and rank count, and a unique identity for this launch.
+Startup fails if that process exits or the readiness deadline expires. Existing
+or partly running groups are never adopted or replaced: stop your previous
+group yourself, or omit `launch` to use externally managed workers.
+
+Worker credentials travel through the launcher's stdin after every supervisor
+has acknowledged startup, rather than appearing in command arguments. A scoped
+SSH wrapper applies `ssh_options` and requires noninteractive authentication
+with a previously trusted host key. Missing SSH access fails startup; it does
+not prompt for passwords or change SSH trust. Worker logs appear in the public
+server's log with an `mlx.launch` prefix.
+
+Workers do not inherit the public server's preload, draft, API-key or serving
+tuning settings. To set shared worker tuning, use an optional `launch.env`
+object, for example `{"PREFILL_STEP_SIZE": "1024", "KV_BITS": "4"}`. The worker
+key and launch identity are managed automatically. Keep this object small:
+the complete stdin setup message has a 4000-byte limit. Supervisors disable PTY
+echo and canonical input buffering before acknowledging readiness.
+
+On normal shutdown, Uvicorn finishes active requests before the server stops
+its owned worker group. Each worker has a separate stdlib supervisor, so a
+native collective cannot block its stop handler. A worker that does not exit
+within `shutdown_timeout` is killed. Supervisors also stop workers after 30
+seconds without a coordinator heartbeat, covering abrupt coordinator or
+launcher loss. Startup failure and cancellation use the same cleanup path.
+
+If the launcher exits during serving, distributed requests are marked failed;
+local serving stays available. There is no automatic restart during inference.
+Change membership by editing the configuration and restarting the public
+server after draining requests. The launcher lock is held for the owned group's
+lifetime and its file is not deleted on exit.
+
+### Externally managed workers
+
+Omit `launch` from `cluster.json` to retain the separate worker-start workflow.
+The public server then neither starts nor stops worker processes, and the
+existing request-time health checks remain in place.
 
 Configure `MLX_VLM_SERVER_API_KEY` with the same worker token in each worker's
 launch environment. No preload, adapter, or draft-model environment settings
@@ -252,8 +329,15 @@ snapshots are preserved for diagnosis instead of silently overwritten.
 ## Validation
 
 ```bash
-python -m pytest -q mlx_vlm/tests/test_server_distributed.py mlx_vlm/tests/test_server.py
+python -m pytest -q mlx_vlm/tests/test_server_distributed.py \
+  mlx_vlm/tests/test_server_distributed_launch.py mlx_vlm/tests/test_server.py
 ```
+
+Launcher tests cover startup/shutdown integration, ownership conflicts, occupied
+endpoints, launch identity/backend mismatches, startup rollback, and unexpected
+exit. They also run real supervisors (including a child ignoring SIGTERM) and
+the installed `mlx.launch` with two local test workers. These tests do not
+establish remote SSH or three-Mac JACCL operation.
 
 The distributed tests cover HTTP streaming, cancellation, overlapping model
 leases, staging integrity, input consistency, and failure handling. Two local

@@ -429,6 +429,15 @@ def load_audio_model(model_path: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    from .distributed_launch import managed_workers
+
+    async with managed_workers(runtime.distributed_coordinator):
+        async with _application_lifespan(app):
+            yield
+
+
+@asynccontextmanager
+async def _application_lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
