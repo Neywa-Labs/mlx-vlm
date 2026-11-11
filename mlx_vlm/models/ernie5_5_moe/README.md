@@ -23,7 +23,7 @@ python -m mlx_vlm.convert \
   -q --q-mode affine --q-bits 4 --q-group-size 64 --dtype bfloat16
 ```
 
-The shared loader first prepares native MXFP8 weights. The model's quantization predicate then selects routed experts for the requested format, keeping shared experts, latent projections, and ECHO projections in MXFP8 with group size 32. Other source FP8 projections also stay MXFP8, including the fused MLA projection before its BF16 layout conversion. `--q-mode mxfp8 --q-bits 8 --q-group-size 32` keeps experts in MXFP8 too. Existing unquantized tensors retain their storage dtypes. The predicate also applies to native quantized checkpoints; modules already in the requested format are preserved without requantization. Mixed quantization settings are saved per module for reloading.
+The shared loader first prepares native MXFP8 weights. The model's `quant_predicate` then explicitly selects affine 4-bit/group-64 routed experts, keeping shared experts, latent projections, and ECHO projections in MXFP8 with group size 32. Other source FP8 projections also stay MXFP8, including the fused MLA projection before its BF16 layout conversion. This fixed mixed-precision predicate overrides the CLI quantization defaults when `-q` is used. Omit `-q` to retain MXFP8 experts as well. Existing unquantized tensors retain their storage dtypes. The predicate also applies to native quantized checkpoints; modules already in the requested format are preserved without requantization. Mixed quantization settings are saved per module for reloading.
 
 ```sh
 python -m mlx_vlm.generate \

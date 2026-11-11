@@ -2843,13 +2843,20 @@ def _fp8_conversion_case(family):
     "bits,group_size,mode",
     [(4, 64, "affine"), (8, 64, "affine"), (8, 32, "mxfp8"), (None, None, None)],
 )
-def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, mode):
+def test_convert_fp8_respects_quantization_policy(
+    tmp_path, family, bits, group_size, mode
+):
     from mlx_vlm.convert import convert
 
     mx.random.seed(55)
     config, weights, source_keys, preserved = _fp8_conversion_case(family)
     mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
     target = dict(group_size=group_size, bits=bits, mode=mode) if bits else mxfp8
+    experts = (
+        dict(group_size=64, bits=4, mode="affine")
+        if family == "ernie5_5_moe" and bits is not None
+        else mxfp8
+    )
     expected = {}
     for source_key, native_key in source_keys.items():
         weights[source_key] = mx.to_fp8(weights[source_key])
@@ -2861,7 +2868,9 @@ def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, m
             * mx.repeat(mx.repeat(scales, 128, axis=0), 128, axis=1)[:rows, :cols]
         )
         params = (
-            target if family == "qwen3_5" or isinstance(native_key, tuple) else mxfp8
+            target
+            if family == "qwen3_5"
+            else experts if isinstance(native_key, tuple) else mxfp8
         )
         quantized = mx.quantize(restored, **mxfp8)
         if params != mxfp8:
@@ -2918,7 +2927,7 @@ def test_convert_fp8_uses_requested_layout(tmp_path, family, bits, group_size, m
                 if not hasattr(projection, "weight"):
                     continue
                 if ".switch_mlp." in path:
-                    assert {k: getattr(projection, k) for k in target} == target
+                    assert {k: getattr(projection, k) for k in experts} == experts
                 elif ".shared_experts." in path or path.endswith(
                     ("fc1_latent_proj", "fc2_latent_proj")
                 ):
