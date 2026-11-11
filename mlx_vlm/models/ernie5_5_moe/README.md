@@ -14,9 +14,9 @@ python -m mlx_vlm.convert \
 
 The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. The vocabulary head retains its checkpoint dtype (BF16 in the release); vocabulary projection and MultiMax arithmetic use FP32. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
 
-The standard quantizer skips modules that are already quantized. Adding `-q` therefore preserves the MXFP8 experts loaded from the released checkpoint; it does not convert them to 4-bit. This port does not add CLI precision remapping or requantization.
+Use the command above without `-q` for the released FP8 checkpoint. The standard loader recognizes its FP8 configuration when reloading the native MXFP8 export. Applying `-q` to this partially quantized model can save inconsistent format metadata and cause reload failures; that conversion path is outside this port. The shared loader, converter, and quantization utilities are unchanged.
 
-For eligible floating-point modules, the model's fixed `quant_predicate` selects affine 4-bit/group-64 routed experts and MXFP8/group-32 shared experts, latent projections, and ECHO projections. The vocabulary head and other excluded tensors retain their precision. These per-module settings are saved for reloading.
+When quantizing a floating-point checkpoint, the model's fixed `quant_predicate` selects affine 4-bit/group-64 routed experts and MXFP8/group-32 shared experts, latent projections, and ECHO projections. The vocabulary head and other excluded tensors retain their precision. These per-module settings are saved for reloading.
 
 ```sh
 python -m mlx_vlm.generate \

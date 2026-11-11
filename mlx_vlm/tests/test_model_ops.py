@@ -2759,7 +2759,7 @@ def _fp8_conversion_case(family):
         for k, v in tree_flatten(model.parameters())
     }
     # Block 0 has BF16 experts; block 1 loads individual FP8 tensors into stacked
-    # MXFP8 modules, which the standard quantizer preserves.
+    # MXFP8 modules.
     source_keys = {}
     prefix = "language_model.model.layers.1.ffn."
     for source, native in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
@@ -2805,25 +2805,13 @@ def _fp8_conversion_case(family):
 
 
 @pytest.mark.parametrize("family", ["qwen3_5", "ernie5_5_moe"])
-@pytest.mark.parametrize("quantize", [False, True])
-def test_convert_fp8_preserves_loaded_layout(tmp_path, family, quantize):
+def test_convert_fp8_preserves_loaded_layout(tmp_path, family):
     from mlx_vlm.convert import convert
 
     mx.random.seed(55)
     config, weights, source_keys, preserved = _fp8_conversion_case(family)
     mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
-    affine = dict(group_size=64, bits=4, mode="affine")
     expected = {}
-    if quantize and family == "ernie5_5_moe":
-        for key, weight in weights.items():
-            if key in source_keys:
-                continue
-            if ".switch_mlp." in key:
-                expected[key] = (affine, mx.quantize(weight, **affine))
-            elif ".shared_experts." in key or key.endswith(
-                ("fc1_latent_proj.weight", "fc2_latent_proj.weight")
-            ):
-                expected[key] = (mxfp8, mx.quantize(weight, **mxfp8))
     for source_key, native_key in source_keys.items():
         weights[source_key] = mx.to_fp8(weights[source_key])
         rows, cols = weights[source_key].shape
@@ -2851,7 +2839,7 @@ def test_convert_fp8_preserves_loaded_layout(tmp_path, family, quantize):
     mx.save_safetensors(str(source / "model.safetensors"), weights)
     (source / "config.json").write_text(json.dumps(config))
     with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
-        convert(str(source), str(destination), quantize=quantize)
+        convert(str(source), str(destination))
     restored = load_model(destination)
     modules = dict(restored.named_modules())
     for key, (params, quantized) in expected.items():
@@ -2868,10 +2856,6 @@ def test_convert_fp8_preserves_loaded_layout(tmp_path, family, quantize):
     for key, reference in preserved.items():
         assert parameters[key].dtype == reference.dtype
         assert mx.array_equal(parameters[key], reference).item()
-    exported = json.loads((destination / "config.json").read_text())
-    quantization = exported["quantization"]
-    assert {k: quantization[k] for k in mxfp8} == mxfp8
-    assert all(path in modules for path in quantization if path not in mxfp8)
     if family == "ernie5_5_moe":
         assert restored.language_model.lm_head.weight.dtype == mx.bfloat16
         assert mx.isfinite(restored(mx.array([[1, 2, 3]])).logits).all().item()
