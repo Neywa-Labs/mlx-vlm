@@ -84,7 +84,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
-from mlx_vlm.tests.test_models import DATA, build_config, model_case
+from mlx_vlm.tests.test_models import DATA, build_config, make_ernie55_model, model_case
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -4386,8 +4386,8 @@ def test_warm_rows_decode_while_cold_row_prefills(prefix_manager, model_name):
     gen.close()
 
 
-def test_ernie55_chunked_decode_compression_and_sparse_attention(ernie55_learned_model):
-    model = ernie55_learned_model
+def test_ernie55_chunked_decode_compression_and_sparse_attention():
+    model = make_ernie55_model(learned=True)
     tokens = mx.arange(19)[None]
     expected = model(tokens).logits
     for chunks in ([1] * 19, [2, 2, 3, 4, 8], [7, 1, 8, 3], [8, 8, 3]):
@@ -4409,8 +4409,8 @@ def test_ernie55_chunked_decode_compression_and_sparse_attention(ernie55_learned
     )
 
 
-def test_ernie55_cache_merge_extract_filter_and_reset(ernie55_learned_model):
-    model = ernie55_learned_model
+def test_ernie55_cache_merge_extract_filter_and_reset():
+    model = make_ernie55_model(learned=True)
     caches = []
     for length in (3, 11):
         cache = model.make_cache()

@@ -3224,8 +3224,10 @@ def test_prefill_failure_releases_reservation_after_delivering_last_decode(
         assert gen.unprocessed_prompts[0][0] == refused
 
 
-def test_ernie55_continuous_batch_matches_single_with_late_arrival(ernie55_model):
-    model = ernie55_model
+def test_ernie55_continuous_batch_matches_single_with_late_arrival():
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    model = make_ernie55_model()
     prompts = [list(range(3)), list(range(11)), list(range(7))]
     limits = [8, 8, 5]
     expected = [
@@ -3284,8 +3286,10 @@ def test_ernie55_continuous_batch_matches_single_with_late_arrival(ernie55_model
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size, ernie55_echo):
-    target, draft = ernie55_echo
+def test_ernie_echo_batch_padding_completion_and_late_arrival(batch_size):
+    from mlx_vlm.tests.test_speculative import ernie_echo_case
+
+    target, draft = ernie_echo_case()
     prompts = [list(range(5 + i * 3)) for i in range(batch_size + 1)]
     limits = [8 + i * 3 for i in range(batch_size + 1)]
     expected = [

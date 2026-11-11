@@ -3460,10 +3460,11 @@ def test_lfm3_partial_rope_preserves_pairs_in_both_halves():
     )
 
 
-def test_ernie55_situ_and_multimax_reference(ernie55_model):
+def test_ernie55_situ_and_multimax_reference():
     from mlx_vlm.models.ernie5_5_moe.language import MultiMax, SiTU
+    from mlx_vlm.tests.test_models import make_ernie55_model
 
-    config = ernie55_model.config
+    config = make_ernie55_model().config
     up = np.linspace(-100, 100, 97).astype(np.float32)
     gate = np.linspace(-30, 30, 97).astype(np.float32)
     expected = 4 * np.tanh(gate / 4) / (1 + np.exp(-gate)) * 25 * np.tanh(up / 25)
@@ -3483,10 +3484,11 @@ def test_ernie55_situ_and_multimax_reference(ernie55_model):
     np.testing.assert_allclose(head(mx.array(gate)), expected, atol=2e-5, rtol=2e-5)
 
 
-def test_ernie55_multi_router_selection_uses_bias_but_weights_do_not(ernie55_model):
+def test_ernie55_multi_router_selection_uses_bias_but_weights_do_not():
     from mlx_vlm.models.ernie5_5_moe.language import MultiRouter
+    from mlx_vlm.tests.test_models import make_ernie55_model
 
-    config = ernie55_model.config
+    config = make_ernie55_model().config
     gate = MultiRouter(config)
     gate.weight = mx.random.normal(gate.weight.shape) * 0.2
     gate.weight_1 = mx.random.normal(gate.weight_1.shape) * 0.2
@@ -3509,8 +3511,10 @@ def test_ernie55_multi_router_selection_uses_bias_but_weights_do_not(ernie55_mod
     np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
 
 
-def test_ernie55_hyper_connection_epsilon_and_sinkhorn_reference(ernie55_learned_model):
-    hc = ernie55_learned_model.layers[0].attn_hc
+def test_ernie55_hyper_connection_epsilon_and_sinkhorn_reference():
+    from mlx_vlm.tests.test_models import make_ernie55_model
+
+    hc = make_ernie55_model(learned=True).layers[0].attn_hc
     hc.norm_eps = 0.5  # Distinguishes sqrt(mean)+eps from sqrt(mean+eps).
     x = mx.random.normal((2, 3, 4, 64))
     actual, post, comb = hc(x)

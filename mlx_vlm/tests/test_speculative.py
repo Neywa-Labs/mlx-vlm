@@ -40,6 +40,7 @@ from mlx_vlm.tests.test_models import (
     TINY_DEFAULTS,
     TINY_MODELS,
     build_config,
+    make_ernie55_model,
     model_case,
     tiny_config,
 )
@@ -4306,17 +4307,27 @@ def test_speculative_lifetime_counters_survive_reset():
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
 
 
+def ernie_echo_case():
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model, ModelConfig
+
+    target = make_ernie55_model()
+    draft = Model(ModelConfig(text_config=target.config))
+    draft.eval()
+    mx.eval(target.parameters(), draft.parameters())
+    return target, draft
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("prompt_length", [7, 8, 10])
 @pytest.mark.parametrize("accepted", [0, 2, 4])
 def test_ernie_echo_rollback_matches_committed_prefix(
-    batch_size, prompt_length, accepted, ernie55_model
+    batch_size, prompt_length, accepted
 ):
     import numpy as np
 
     from mlx_vlm.generate.ar import _make_cache
 
-    target = ernie55_model
+    target = make_ernie55_model()
     lm = target.language_model
     padding = [3, 0] if batch_size == 2 else [0]
     cache = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
@@ -4362,10 +4373,10 @@ def test_ernie_echo_rollback_matches_committed_prefix(
 
 @pytest.mark.parametrize("prompt_length", [7, 8])
 @pytest.mark.parametrize("draft_behavior", ["learned", "accept_all", "reject_all"])
-def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior, ernie55_echo):
+def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
     from mlx_vlm.generate.ar import generate_step
 
-    target, draft = ernie55_echo
+    target, draft = ernie_echo_case()
     prompt = mx.arange(prompt_length)[None]
     expected = [
         int(t)
@@ -4420,16 +4431,14 @@ def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior, ernie55
             assert set(draft.accept_lens) == {0}
 
 
-def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(
-    tmp_path, ernie55_echo
-):
+def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path):
     import numpy as np
 
     from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES
     from mlx_vlm.speculative.drafters import load_drafter
     from mlx_vlm.utils import load_model
 
-    target, draft = ernie55_echo
+    target, draft = ernie_echo_case()
     original = dict(tree_flatten(draft.parameters()))
     weights = dict(tree_flatten(target.parameters()))
     prefix = f"model.layers.{target.config.num_hidden_layers}."
@@ -4464,8 +4473,8 @@ def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(
         load_drafter(str(tmp_path))
 
 
-def test_ernie_echo_shared_decoder_preserves_target_router(ernie55_echo):
-    target, draft = ernie55_echo
+def test_ernie_echo_shared_decoder_preserves_target_router():
+    target, draft = ernie_echo_case()
     original = target.layers[-1].ffn.e_score_correction_bias
     draft.e_score_correction_bias = mx.arange(
         target.config.n_routed_experts, dtype=mx.float32

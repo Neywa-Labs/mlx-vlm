@@ -6637,8 +6637,30 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
     assert not rotary.fused_apply
 
 
-def test_ernie55_fp8_tail_blocks_use_shared_decoder(ernie55_model):
-    model = ernie55_model
+def make_ernie55_model(*, learned=False):
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+
+    mx.random.seed(55)
+    model = Model(ModelConfig.from_dict(model_case("ernie5_5_moe")["config"]))
+    model.eval()
+    if learned:
+        # Exercise learned mixers/routers instead of their zero initialization.
+        for layer in model.layers:
+            for hc in (layer.attn_hc, layer.ffn_hc):
+                hc.fn = mx.random.normal(hc.fn.shape) * 0.02
+                hc.base = mx.random.normal(hc.base.shape) * 0.1
+            layer.attn.vha.U = mx.random.normal(layer.attn.vha.U.shape) * 0.1
+            layer.attn.vha.V = mx.random.normal(layer.attn.vha.V.shape) * 0.1
+            if hasattr(layer.ffn, "gate"):
+                for name in ("weight", "weight_1"):
+                    layer.ffn.gate[name] = (
+                        mx.random.normal(layer.ffn.gate[name].shape) * 0.1
+                    )
+    return model
+
+
+def test_ernie55_fp8_tail_blocks_use_shared_decoder():
+    model = make_ernie55_model()
     key = "model.layers.0.self_attn.linear_q_down_proj.weight"
     codes = mx.full((129, 131), 0x38, dtype=mx.uint8)  # E4M3 1.0
     scales = mx.array([[1.0, 2.0], [4.0, 8.0]])
