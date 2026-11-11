@@ -79,7 +79,9 @@ class Ernie55MTPDraftModel(EchoWeights):
         h = self._target.layers[-1](
             h, self._cache, router_bias=self.e_score_correction_bias
         )
-        out = self.norm(self.hc_head(h))
+        # Prefill and accepted-prefix replay need every KV update, but only the
+        # last position seeds the next proposal. Avoid a prompt-wide vocab head.
+        out = self.norm(self.hc_head(h[:, -1:]))
         logits = self._target.multimax(self._target.lm_head(out.astype(mx.float32)))
         return logits, h.flatten(-2)
 

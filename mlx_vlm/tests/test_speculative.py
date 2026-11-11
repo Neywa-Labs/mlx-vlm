@@ -4317,6 +4317,25 @@ def ernie_echo_case():
     return target, draft
 
 
+@pytest.mark.parametrize("length", [3, 16])
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_ernie_echo_projects_only_the_next_proposal(length, batch, dtype):
+    target, draft = ernie_echo_case()
+    target.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    lm = target.language_model
+    prompt = mx.broadcast_to(mx.arange(length)[None], (batch, length))
+    prefill = lm(prompt, cache=lm.make_cache(), return_hidden=True)
+    draft.reset(lm)
+    logits, hidden = draft._forward_tokens(prompt, prefill.hidden_states[-1])
+    h = hidden.reshape(batch, length, lm.config.hc_mult, lm.config.hidden_size)
+    expected = lm.multimax(lm.lm_head(draft.norm(draft.hc_head(h)).astype(mx.float32)))
+    assert logits.shape == (batch, 1, lm.config.vocab_size)
+    assert mx.allclose(logits, expected[:, -1:], atol=2e-5, rtol=2e-5).item()
+    assert all(cache.offset == length for cache in draft._cache)
+
+
 def distributed_echo_outputs(target, stage, barrier=None):
     """Real ECHO draft/verify/rollback collectives for the shared TP harness."""
     from mlx_vlm.generate.ar import _make_cache, generate_step
