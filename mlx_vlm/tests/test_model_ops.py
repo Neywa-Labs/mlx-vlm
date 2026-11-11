@@ -2707,6 +2707,63 @@ def test_quantize_module(
         assert config["quantization"] == defaults
 
 
+@pytest.mark.parametrize("kind", ["linear", "embedding", "switch", "multi"])
+@pytest.mark.parametrize("selection", ["legacy", "skip", "same", "default", "override"])
+def test_quantize_existing_module(kind, selection):
+    from mlx_vlm.models.mla import MultiLinear
+    from mlx_vlm.models.switch_layers import SwitchLinear
+    from mlx_vlm.quant_utils import quantize_model
+
+    mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    affine4 = dict(group_size=64, bits=4, mode="affine")
+    projection = {
+        "linear": lambda: nn.Linear(64, 32),
+        "embedding": lambda: nn.Embedding(32, 64),
+        "switch": lambda: SwitchLinear(64, 32, 2),
+        "multi": lambda: MultiLinear(64, 32, 2),
+    }[kind]().to_quantized(**mxfp8)
+    before = mx.dequantize(projection.weight, projection.scales, **mxfp8)
+    requested = mxfp8 if selection == "override" else affine4
+
+    def predicate(path, module, *, quantization):
+        assert path == "projection"
+        assert quantization == requested
+        return {
+            "skip": False,
+            "same": mxfp8,
+            "default": True,
+            # Dict overrides use affine mode when no mode is specified.
+            "override": {"group_size": 64, "bits": 4},
+        }[selection]
+
+    if selection == "legacy":
+        predicate = lambda path, module: True
+    model = nn.Module()
+    model.projection = projection
+    _, config = quantize_model(
+        model,
+        {"quantization": mxfp8},
+        **requested,
+        quant_predicate=predicate,
+    )
+    changed = selection in ("default", "override")
+    expected_params = affine4 if changed else mxfp8
+    actual_params = config["quantization"].get("projection", config["quantization"])
+    assert {key: actual_params[key] for key in expected_params} == expected_params
+    assert {
+        key: getattr(model.projection, key) for key in expected_params
+    } == expected_params
+    if changed:
+        for name, reference in zip(
+            ("weight", "scales", "biases"), mx.quantize(before, **affine4)
+        ):
+            assert mx.array_equal(getattr(model.projection, name), reference).item()
+        if "bias" in projection:
+            assert mx.array_equal(model.projection.bias, projection.bias).item()
+    else:
+        assert model.projection is projection
+
+
 def test_mixed_recipe_finds_lfm2_down_projection():
     from mlx_vlm.convert import mixed_quant_predicate_builder
 
