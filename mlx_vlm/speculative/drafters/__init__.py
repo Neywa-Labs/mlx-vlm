@@ -17,6 +17,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "bailing_hybrid_mtp": "mtp",
     "nemotron_h_mtp": "mtp",
     "deepseek_v4_mtp": "mtp",
+    "ernie5_5_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
     "mistral_large4_dspark": "dflash",
     "dspark": "dflash",
