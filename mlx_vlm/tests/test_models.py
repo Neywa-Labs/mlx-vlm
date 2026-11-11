@@ -3941,15 +3941,6 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
     assert quantize.call_args.kwargs["group_size"] == 32
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "mxfp8"
-    assert (
-        model.config.quantization
-        == model.config.quantization_config
-        == {
-            "group_size": 32,
-            "bits": 8,
-            "mode": "mxfp8",
-        }
-    )
     loaded = dict(model.loaded_weights)
     assert loaded["proj.weight"].dtype == mx.uint32
     assert loaded["proj.scales"].dtype == mx.uint8

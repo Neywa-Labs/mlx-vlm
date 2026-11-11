@@ -608,11 +608,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         )
 
-    # Weight conversion can change the layout after model.config was created.
-    for key in ("quantization", "quantization_config"):
-        if key in config:
-            setattr(model.config, key, config[key])
-
     return load_model_weights(
         model,
         config,
@@ -1059,9 +1054,6 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
-    for key in ("quantization", "quantization_config"):
-        if (value := getattr(model.config, key, None)) is not None:
-            config[key] = value
     processor = load_processor(
         model_path,
         add_detokenizer=False,
