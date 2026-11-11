@@ -689,6 +689,7 @@ class GenerationArguments:
     # Internal rendered boundary, never accepted as an unchecked token offset.
     cache_prefix: Optional[str] = None
     cache_checkpoint_len: int = 0
+    emit_prompt_progress: bool = False
 
     def __post_init__(self):
         self.temperature = clamp_temperature(self.temperature)
@@ -928,6 +929,7 @@ class StreamingToken:
     cached_tokens: int = 0
     token_count: int = 1
     emitted_at: Optional[float] = None
+    prompt_progress: Optional[dict] = None
 
 
 class _DiffusionBlockEmitter:
@@ -1404,10 +1406,31 @@ class ResponseGenerator:
             "queued_at": request.queued_at,
             "prefill_started_at": now,
             "prefill_processed": -1,
+            "emit_prompt_progress": request.args.emit_prompt_progress,
+            "prompt_tokens": request.prompt_tokens,
             "generated_tokens": 0,
             "decode_started_at": None,
             "last_token_at": None,
         }
+
+    @staticmethod
+    def _emit_prompt_progress(info, status, processed, total):
+        queue = info.get("rqueue")
+        if queue is not None and info.get("emit_prompt_progress", False):
+            queue.put(
+                StreamingToken(
+                    text="",
+                    token=0,
+                    logprobs=0,
+                    finish_reason=None,
+                    token_count=0,
+                    prompt_progress={
+                        "status": status,
+                        "processed_tokens": int(processed),
+                        "total_tokens": int(total),
+                    },
+                )
+            )
 
     def _log_prefill_progress(self, batch_gen, active: dict) -> None:
         """Report each chunked-prefill step without changing generation output."""
@@ -1448,6 +1471,7 @@ class ResponseGenerator:
             if processed <= int(info.get("prefill_processed", -1)):
                 continue
             info["prefill_processed"] = processed
+            self._emit_prompt_progress(info, "in_progress", processed, total)
             percent = 100.0 * processed / total if total > 0 else 100.0
             logger.info(
                 "Prefill progress: request=%s tokens=%d/%d (%.1f%%)",
@@ -1466,6 +1490,9 @@ class ResponseGenerator:
         if prompt_time <= 0 and prompt_tps > 0:
             prompt_time = prompt_tokens / prompt_tps
         info["prefill_processed"] = prompt_tokens
+        ResponseGenerator._emit_prompt_progress(
+            info, "completed", prompt_tokens, prompt_tokens
+        )
         logger.info(
             "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
             "elapsed=%.3fs rate=%.1f tok/s",
@@ -1926,6 +1953,7 @@ class ResponseGenerator:
             ),
             **log_state,
         }
+        self._emit_prompt_progress(active[uid], "started", 0, prompt_tokens)
         return batch_gen
 
     def _batch_key(self, request):
@@ -1967,7 +1995,7 @@ class ResponseGenerator:
             ]
         )
 
-    def _schedule_continuations(self, groups, suspended, capacity):
+    def _schedule_continuations(self, groups, suspended, capacity, decisions=None):
         """Detach paused rows; readmit ready checkpoints within the shared limit."""
         for key, (engine, active) in groups.items():
             for uid, info in list(active.items()):
@@ -1975,14 +2003,23 @@ class ResponseGenerator:
                 if not isinstance(session, InferenceSession):
                     continue
                 try:
-                    session.check()
-                    if not session.paused:
+                    if decisions is None:
+                        session.check()
+                        paused = session.paused
+                    else:
+                        paused, error = decisions[session]
+                        if error:
+                            raise ValueError(error)
+                    if not paused:
+                        session.distributed_state = "running"
                         continue
                     checkpoint = engine.suspend(uid)
+                    session.distributed_state = "paused"
                     suspended[session] = (key, checkpoint, uid, info)
                     del active[uid]
                 except Exception as error:
                     session.dispose(str(error))
+                    session.distributed_state = "disposed"
                     engine.remove(uid)
                     active.pop(uid, None)
 
@@ -1994,22 +2031,35 @@ class ResponseGenerator:
             for session, state in suspended.items()
         }
         resident = sum(sizes.values())
-        for session in sorted(suspended, key=lambda s: s.touched):
+        for session in sorted(
+            suspended,
+            key=(
+                (lambda s: suspended[s][2])
+                if decisions is not None
+                else (lambda s: s.touched)
+            ),
+        ):
             key, checkpoint, uid, info = suspended[session]
             try:
-                session.check()
-                if resident > budget:
+                if decisions is None:
+                    session.check()
+                    paused = session.paused
+                else:
+                    paused, error = decisions[session]
+                    if error:
+                        raise ValueError(error)
+                if decisions is None and resident > budget:
                     raise ValueError(
                         "The inference checkpoint was evicted to release cache memory. Regenerate the response."
                     )
-                if session.paused:
+                if paused:
                     continue
                 running = sum(len(active) for _, active in groups.values())
                 if capacity is not None and running >= capacity:
                     continue
                 engine, active = groups[key]
                 manager = getattr(engine, "apc_manager", None)
-                if manager is not None:
+                if manager is not None and decisions is None:
                     # Concatenation can allocate the entire merged cache before
                     # releasing either input, not just the incoming row.
                     live_cache = getattr(
@@ -2019,9 +2069,11 @@ class ResponseGenerator:
                     if not manager._make_room(merge_bytes):
                         continue
                 engine.resume(checkpoint)
+                session.distributed_state = "running"
                 active[uid] = info
             except Exception as error:
                 session.dispose(str(error))
+                session.distributed_state = "disposed"
                 BatchGenerator.discard(checkpoint)
             resident -= sizes[session]
             del suspended[session]
@@ -2075,6 +2127,7 @@ class ResponseGenerator:
         ):
             if scheduler is not None:
                 try:
+                    scheduler.continuations(self, groups, suspended, max_num_seqs)
                     new_items, cancelled, should_stop = scheduler.next(
                         self, groups, max_num_seqs
                     )

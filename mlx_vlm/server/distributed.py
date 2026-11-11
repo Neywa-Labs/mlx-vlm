@@ -18,9 +18,10 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import time
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlsplit
@@ -123,6 +124,25 @@ if mode == 'commit':
 class Worker:
     url: str
     ssh: str | None = None
+    node_id: str | None = None
+    model_dir: str | None = None
+    python: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.ssh is not None and not re.fullmatch(r"[\w][\w.@-]*", self.ssh):
+            raise ValueError(
+                "SSH destinations must be configured host names or aliases"
+            )
+        if self.model_dir is not None and not re.fullmatch(
+            r"/[\w/.-]+", self.model_dir
+        ):
+            raise ValueError(
+                "SSH model_dir must be absolute without shell metacharacters"
+            )
+
+    def headers(self):
+        return {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
 
 
 @dataclass(frozen=True)
@@ -205,6 +225,7 @@ class ModelStager:
     def __init__(self, config):
         self.config = config
         self.prepared = {}
+        self.worker_paths = {}
 
     def _resolve(self, model, revision):
         from ..utils import get_model_path
@@ -244,7 +265,22 @@ class ModelStager:
             )
         return result.returncode
 
-    def prepare(self, model, revision=None):
+    def prepare(self, model, revision=None, *, validate_sharding=True, progress=None):
+        # Management preparation and inference can target the same immutable
+        # snapshot. Serialize staging even when their coordinator caches differ.
+        staging_lock = Path(str(self.config.shared_lock) + ".staging")
+        staging_lock.parent.mkdir(parents=True, exist_ok=True)
+        with staging_lock.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self._prepare(
+                model, revision, validate_sharding=validate_sharding, progress=progress
+            )
+
+    def _prepare(self, model, revision=None, *, validate_sharding=True, progress=None):
+        def report(phase, **data):
+            if progress:
+                progress(phase, **data)
+
         key = (model, revision)
         if key in self.prepared:
             return self.prepared[key]
@@ -253,6 +289,7 @@ class ModelStager:
             model,
             revision,
         )
+        report("resolving_model")
         source = self._resolve(model, revision)
         from ..utils import get_model_and_args, load_config
 
@@ -261,15 +298,21 @@ class ModelStager:
             raise ValueError(
                 "Custom model_file checkpoints are not supported in distributed mode"
             )
-        architecture, _ = get_model_and_args(config)
-        if not callable(getattr(architecture.Model, "shard", None)):
-            raise ValueError("This model has no distributed shard implementation")
+        if validate_sharding:
+            architecture, _ = get_model_and_args(config)
+            if not callable(getattr(architecture.Model, "shard", None)):
+                raise ValueError("This model has no distributed shard implementation")
+            from .cluster import validate_model
+
+            validate_model(config, len(self.config.workers))
+        report("verifying_source")
         files = _manifest(source)
         manifest = json.dumps(files, sort_keys=True)
         digest = hashlib.sha256(manifest.encode()).hexdigest()
         root = self.config.model_dir
         final = root / digest
         root.mkdir(parents=True, exist_ok=True)
+        report("staging_coordinator", snapshot=digest)
         verify = [self.config.python, "-c", _VERIFY, str(root), digest]
         result = self._run([*verify, "verify"], input=manifest)
         if result.returncode != 0:
@@ -286,13 +329,37 @@ class ModelStager:
             if result.returncode != 0:
                 raise RuntimeError("Coordinator model snapshot verification failed")
         for worker in self.config.workers:
-            if worker.ssh is None:
-                continue  # Local worker shares the coordinator's filesystem.
-            if self._remote(worker, [*verify, "verify"], input=manifest) == 0:
+            report("preparing_worker", node_id=worker.node_id, snapshot=digest)
+            worker_root = Path(worker.model_dir) if worker.model_dir else root
+            verify = [
+                worker.python or self.config.python,
+                "-c",
+                _VERIFY,
+                str(worker_root),
+                digest,
+            ]
+            self.worker_paths[(str(final), worker.url)] = str(worker_root / digest)
+
+            def verify_worker(mode):
+                if worker.ssh:
+                    return self._remote(worker, [*verify, mode], input=manifest)
+                return self._run([*verify, mode], input=manifest).returncode
+
+            if verify_worker("verify") == 0:
+                report("worker_ready", node_id=worker.node_id, snapshot=digest)
                 continue
             logger.info("Transferring model snapshot %s to %s", digest, worker.url)
-            temporary = root / (".partial-" + digest)
-            self._remote(worker, ["mkdir", "-p", str(temporary)])
+            temporary = worker_root / (".partial-" + digest)
+            if worker.ssh:
+                self._remote(worker, ["mkdir", "-p", str(temporary)])
+            else:
+                temporary.mkdir(parents=True, exist_ok=True)
+            report(
+                "transferring",
+                node_id=worker.node_id,
+                snapshot=digest,
+                total_bytes=sum(record["size"] for record in files.values()),
+            )
             result = self._run(
                 [
                     "rsync",
@@ -305,7 +372,11 @@ class ModelStager:
                         ["ssh", "-o", "BatchMode=yes", *self.config.ssh_options]
                     ),
                     str(final) + "/",
-                    f"{worker.ssh}:{temporary}/",
+                    (
+                        f"{worker.ssh}:{temporary}/"
+                        if worker.ssh
+                        else str(temporary) + "/"
+                    ),
                 ],
                 input="\n".join(files) + "\n",
             )
@@ -313,8 +384,9 @@ class ModelStager:
                 raise RuntimeError(
                     f"Model transfer failed ({worker.url}): {result.stderr[-1000:]}"
                 )
-            if self._remote(worker, [*verify, "commit"], input=manifest) != 0:
+            if verify_worker("commit") != 0:
                 raise RuntimeError(f"Model checksum verification failed ({worker.url})")
+            report("worker_ready", node_id=worker.node_id, snapshot=digest)
         self.prepared[key] = str(final)
         logger.info(
             "Model snapshot %s verified on all %s workers",
@@ -365,6 +437,7 @@ def _semantic(value, key_file):
             "created_at",
             "metrics",
             "timings",
+            "continuation",
         }
         return {k: _semantic(v, key_file) for k, v in value.items() if k not in ignored}
     return value
@@ -404,11 +477,22 @@ class Coordinator:
         self.seed = secrets.randbelow(2**31)
         self.failure = config.model_dir / ".cluster-failed.json"
         self.launch_id = None
+        self.draining = False
+        self.group_instances = None
+        self.continuations = {}
+        self.session_protocol = False
+        self.resume_lock = asyncio.Lock()
 
     def failed(self, error):
         self.failure.parent.mkdir(parents=True, exist_ok=True)
         self.failure.write_text(
-            json.dumps({"error": type(error).__name__, "message": str(error)})
+            json.dumps(
+                {
+                    "error": type(error).__name__,
+                    "message": str(error),
+                    "instances": self.group_instances,
+                }
+            )
         )
         logger.error("Distributed group requires recovery: %s", error)
 
@@ -416,7 +500,7 @@ class Coordinator:
         try:
             checks = await asyncio.gather(
                 *[
-                    client.get(w.url.rstrip("/") + "/health")
+                    client.get(w.url.rstrip("/") + "/health", headers=w.headers())
                     for w in self.config.workers
                 ]
             )
@@ -442,6 +526,14 @@ class Coordinator:
             if not signatures[0][1] or len(set(signatures)) != 1:
                 raise ValueError("Distributed worker code or configuration differs")
             self.primary = ranks.index(0)
+            self.group_instances = [
+                c.json().get("distributed_worker", {}).get("instance_id")
+                for c in checks
+            ]
+            self.session_protocol = all(
+                c.json().get("distributed_worker", {}).get("protocol_version") == 2
+                for c in checks
+            )
         except Exception as error:
             raise HTTPException(
                 503, "Distributed worker health/group check failed"
@@ -457,6 +549,15 @@ class Coordinator:
         ticket = object()
         key = (model, revision)
         async with self.condition:
+            if self.draining:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "cluster_draining",
+                        "message": "Distributed group is draining",
+                        "retryable": True,
+                    },
+                )
             self.waiters.append(ticket)
             acquired = False
             try:
@@ -464,6 +565,8 @@ class Coordinator:
                     self.active and self.model != key
                 ):
                     await self.condition.wait()
+                if self.draining:
+                    raise HTTPException(409, "Distributed group is draining")
                 if self.failure.exists():
                     raise HTTPException(
                         503,
@@ -514,6 +617,7 @@ class Coordinator:
                     w.url.rstrip("/") + CANCEL_ROUTE,
                     json={"request_id": request_id},
                     timeout=15,
+                    headers=w.headers(),
                 )
                 for w in self.config.workers
             ],
@@ -545,14 +649,49 @@ class Coordinator:
     async def relay(self, path, body, tenant=None):
         import httpx
 
-        if (
-            body.get("previous_response_id")
-            or body.get("resumable")
-            or body.get("continuation")
-        ):
+        if body.get("previous_response_id") or body.get("store") is True:
             raise HTTPException(
-                400, "Distributed requests currently require stateless input"
+                400,
+                {
+                    "code": "unsupported_feature",
+                    "message": "Distributed stored Responses and previous_response_id are not supported",
+                    "capability": "stored_responses",
+                },
             )
+        resumable = bool(body.get("resumable") or body.get("continuation"))
+        if resumable and not body.get("stream"):
+            raise HTTPException(422, "Distributed continuation requires stream=true")
+        checkpoint = body.get("continuation")
+        if checkpoint:
+            retained = (
+                self.continuations.get(checkpoint.get("id"))
+                if isinstance(checkpoint, dict)
+                else None
+            )
+            if (
+                not retained
+                or retained["tenant"] != tenant
+                or retained["model"] != body.get("model")
+                or retained["path"] != path
+            ):
+                raise HTTPException(
+                    409,
+                    "Distributed continuation is unavailable for this tenant/model/endpoint",
+                )
+            if any(
+                record.get("active")
+                and record.get("session_id", handle)
+                == retained.get("session_id", checkpoint["id"])
+                for handle, record in self.continuations.items()
+            ):
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "continuation_busy",
+                        "message": "Close the active reader and wait for its pause before resuming.",
+                        "retryable": True,
+                    },
+                )
         if body.get("adapter_path"):
             raise HTTPException(400, "Distributed adapters are not supported")
         if not isinstance(body.get("model"), str) or not body["model"].strip():
@@ -567,11 +706,11 @@ class Coordinator:
                 400, "Configure a shared compaction_key_file before using compaction"
             )
         key = os.environ.get(self.config.api_key_env)
-        if not key:
+        if not key and not all(w.api_key for w in self.config.workers):
             raise HTTPException(
                 503, f"Set worker credentials in {self.config.api_key_env}"
             )
-        headers = {"Authorization": f"Bearer {key}"}
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
         if tenant:
             headers["X-Tenant-ID"] = tenant
         request_id = secrets.token_hex(16)
@@ -586,9 +725,28 @@ class Coordinator:
         opening = None
         cancelled = False
         try:
+            await self.expire_continuations(client)
+            if self.continuations and self.model != (body["model"], revision):
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "retained_continuations",
+                        "message": "Dispose retained continuations before switching models",
+                        "action": "POST /v1/cluster/stop with discard_continuations=true",
+                    },
+                )
             model_path = await stack.enter_async_context(
                 self._lease(body["model"], revision, client)
             )
+            if resumable and not self.session_protocol:
+                raise HTTPException(
+                    422,
+                    {
+                        "code": "unsupported_feature",
+                        "capability": "resumable",
+                        "message": "Every worker must support distributed session protocol version 2.",
+                    },
+                )
             request = {**body, "model": model_path, "distributed": True, "store": False}
             request.pop("distributed_revision", None)
             if request.get("seed") is None:
@@ -601,8 +759,13 @@ class Coordinator:
                     client.build_request(
                         "POST",
                         worker.url.rstrip("/") + path,
-                        json=request,
-                        headers={REQUEST_HEADER: request_id},
+                        json={
+                            **request,
+                            "model": self.stager.worker_paths.get(
+                                (model_path, worker.url), model_path
+                            ),
+                        },
+                        headers={REQUEST_HEADER: request_id, **worker.headers()},
                     ),
                     stream=True,
                 )
@@ -629,8 +792,36 @@ class Coordinator:
                     raise RuntimeError("Distributed rank statuses differ")
                 return replies
 
-            opening = asyncio.create_task(open_workers())
-            replies = await asyncio.shield(opening)
+            # Serialize native session claims, not decoding. Each worker must
+            # observe replacement readers in the same order.
+            if checkpoint:
+                async with self.resume_lock:
+                    if any(
+                        record.get("active")
+                        and record.get("session_id", handle)
+                        == retained.get("session_id", checkpoint["id"])
+                        for handle, record in self.continuations.items()
+                    ):
+                        raise HTTPException(
+                            409,
+                            {
+                                "code": "continuation_busy",
+                                "message": "Another reader resumed this session.",
+                                "retryable": True,
+                            },
+                        )
+                    opening = asyncio.create_task(open_workers())
+                    replies = await asyncio.shield(opening)
+                    if replies[self.primary].is_success:
+                        self.continuations[request_id] = {
+                            **retained,
+                            "session_id": retained.get("session_id", checkpoint["id"]),
+                            "active": True,
+                            "touched": time.monotonic(),
+                        }
+            else:
+                opening = asyncio.create_task(open_workers())
+                replies = await asyncio.shield(opening)
             streaming = bool(body.get("stream")) and replies[self.primary].is_success
             if not streaming:
 
@@ -638,7 +829,16 @@ class Coordinator:
                     await asyncio.gather(*(reply.aread() for reply in replies))
                     if cancelled:
                         return None
-                    payloads = [reply.json() for reply in replies]
+                    payloads = [
+                        self._public_payload(
+                            reply.json(),
+                            self.stager.worker_paths.get(
+                                (model_path, worker.url), model_path
+                            ),
+                            body["model"],
+                        )
+                        for reply, worker in zip(replies, self.config.workers)
+                    ]
                     if replies[0].status_code >= 500:
                         raise RuntimeError(
                             "A distributed worker reported a server error"
@@ -669,7 +869,15 @@ class Coordinator:
                 return result
 
             return self._stream(
-                replies, client, request_id, model_path, body["model"], stack
+                replies,
+                client,
+                request_id,
+                model_path,
+                body["model"],
+                stack,
+                resumable=resumable,
+                tenant=tenant,
+                path=path,
             )
         except asyncio.CancelledError:
             cancelled = True
@@ -701,7 +909,67 @@ class Coordinator:
                 502, "Distributed request failed; group marked for recovery"
             ) from error
 
-    def _stream(self, replies, client, request_id, staged, requested, stack):
+    async def session_action(self, client, record_id, action):
+        from .distributed_sessions import SESSION_ROUTE
+
+        replies = await asyncio.gather(
+            *[
+                client.post(
+                    worker.url.rstrip("/") + SESSION_ROUTE,
+                    json={"id": record_id, "action": action},
+                    headers=worker.headers(),
+                    timeout=65,
+                )
+                for worker in self.config.workers
+            ],
+            return_exceptions=True,
+        )
+        if any(
+            isinstance(reply, BaseException) or not reply.is_success
+            for reply in replies
+        ):
+            error = RuntimeError(
+                "Distributed session control failed; restart the group"
+            )
+            self.failed(error)
+            raise error
+        if action == "dispose":
+            family = self.continuations.get(record_id, {}).get("session_id", record_id)
+            self.continuations = {
+                handle: record
+                for handle, record in self.continuations.items()
+                if record.get("session_id", handle) != family
+            }
+
+    async def expire_continuations(self, client, *, all_sessions=False):
+        async with self.resume_lock:
+            families = {}
+            for record_id, record in self.continuations.items():
+                families.setdefault(record.get("session_id", record_id), []).append(
+                    (record_id, record)
+                )
+            for records in families.values():
+                if all_sessions or all(
+                    not record.get("active")
+                    and time.monotonic() - record["touched"] > record["ttl"]
+                    for _, record in records
+                ):
+                    record_id, _ = max(records, key=lambda pair: pair[1]["touched"])
+                    await self.session_action(client, record_id, "dispose")
+
+    def _stream(
+        self,
+        replies,
+        client,
+        request_id,
+        staged,
+        requested,
+        stack,
+        *,
+        resumable=False,
+        tenant=None,
+        path=None,
+    ):
         queue = asyncio.Queue(maxsize=64)
         abandoned = False
         terminal = []
@@ -725,6 +993,13 @@ class Coordinator:
                 if not data:
                     return
                 payload = json.loads(data) if data != "[DONE]" else data
+                payload = self._public_payload(
+                    payload,
+                    self.stager.worker_paths.get(
+                        (staged, self.config.workers[rank].url), staged
+                    ),
+                    requested,
+                )
                 if (
                     not abandoned
                     and isinstance(payload, dict)
@@ -734,12 +1009,35 @@ class Coordinator:
                     )
                 ):
                     raise RuntimeError("A distributed worker emitted a stream error")
-                canonical = json.dumps(
-                    [name, _semantic(payload, self.config.compaction_key_file)],
-                    sort_keys=True,
-                )
-                digests[rank].update(canonical.encode() + b"\n")
-                counts[rank] += 1
+                progress = isinstance(payload, dict) and payload.get("type") in {
+                    "response.prompt_progress",
+                    "response.generation_progress",
+                }
+                if not progress:
+                    canonical = json.dumps(
+                        [name, _semantic(payload, self.config.compaction_key_file)],
+                        sort_keys=True,
+                    )
+                    digests[rank].update(canonical.encode() + b"\n")
+                    counts[rank] += 1
+                if rank == self.primary and resumable:
+                    checkpoint = (
+                        payload.get("continuation", {})
+                        if isinstance(payload, dict)
+                        else {}
+                    )
+                    previous = self.continuations.get(request_id, {})
+                    self.continuations[request_id] = {
+                        "session_id": previous.get("session_id", request_id),
+                        "tenant": tenant,
+                        "model": requested,
+                        "path": path,
+                        "touched": time.monotonic(),
+                        "active": True,
+                        "ttl": checkpoint.get(
+                            "idle_timeout_seconds", previous.get("ttl", 120)
+                        ),
+                    }
                 done = data == "[DONE]" or (
                     isinstance(payload, dict)
                     and payload.get("type")
@@ -830,7 +1128,19 @@ class Coordinator:
                         queue.get_nowait()
                     try:
                         if not task.done():
-                            await self._cancel_and_drain(client, request_id, task)
+                            if resumable and not self.failure.exists():
+                                try:
+                                    await self.session_action(
+                                        client, request_id, "pause"
+                                    )
+                                finally:
+                                    task.cancel()
+                                    await asyncio.gather(task, return_exceptions=True)
+                            else:
+                                await self._cancel_and_drain(client, request_id, task)
+                        if resumable and request_id in self.continuations:
+                            self.continuations[request_id]["touched"] = time.monotonic()
+                            self.continuations[request_id]["active"] = False
                     finally:
                         await stack.aclose()
                         closed = True
@@ -858,6 +1168,7 @@ class DistributedWorker:
         if self.group.size() < 2:
             raise ValueError("Distributed workers require at least two ranks")
         self.backend = backend
+        self.instance_id = secrets.token_hex(16)
         self._cancel_lock = Lock()
         self._cancelled_requests = set()
         digest = hashlib.sha256()
@@ -902,6 +1213,11 @@ class DistributedWorker:
             [self.source_hash, runtime.config.current(), settings], sort_keys=True
         )
         return {
+            "protocol_version": 2,
+            "inference_validated_at": getattr(self, "inference_validated_at", None),
+            "instance_id": self.instance_id,
+            "group_id": os.environ.get("MLX_VLM_GROUP_ID")
+            or os.environ.get("MLX_VLM_WORKER_LAUNCH_ID"),
             "rank": self.group.rank(),
             "world_size": self.group.size(),
             "backend": self.backend,

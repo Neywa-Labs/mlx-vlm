@@ -69,7 +69,17 @@ def request_signature(request, batch_key):
             digest.update(json.dumps(value, sort_keys=True, default=str).encode())
 
     visit(request.raw_inputs)
-    visit([batch_key, request.prompt_tokens, request.args.max_tokens])
+    from .sessions import InferenceSession
+
+    visit(
+        [
+            batch_key,
+            request.prompt_tokens,
+            request.args.max_tokens,
+            getattr(request.args, "emit_prompt_progress", False),
+            isinstance(request.rqueue, InferenceSession),
+        ]
+    )
     return digest.hexdigest()
 
 
@@ -168,6 +178,83 @@ class DistributedBatchScheduler:
             time.sleep(0.005)
         return requests, cancelled, stop and not running and not self.pending
 
+    def continuations(self, generator, groups, suspended, capacity):
+        """Exchange intent, then use the existing native cache suspend/resume path.
+
+        Any rank can request pause/expiry/cancellation. Resume needs agreement
+        from every rank on the same reader lease. Wall clocks and cache budgets
+        never independently decide a collective's membership.
+        """
+        import os
+
+        from .sessions import InferenceSession
+
+        sessions = {}
+        values = {}
+        for _, (_, active) in groups.items():
+            for uid, info in active.items():
+                session = info["rqueue"]
+                if isinstance(session, InferenceSession):
+                    sessions[uid] = session
+                    values[uid] = (False, 0)
+        for session, (_, checkpoint, uid, info) in suspended.items():
+            sessions[uid] = session
+            values[uid] = (True, generator._checkpoint_bytes(checkpoint, info))
+        rows = []
+        for uid, session in sessions.items():
+            error = None
+            try:
+                session.check()
+            except Exception as exc:
+                error = str(exc)
+            rows.append(
+                [
+                    uid,
+                    session.paused,
+                    session.lease,
+                    error,
+                    values[uid][0],
+                    values[uid][1],
+                    session.touched,
+                ]
+            )
+        states = self.exchange(
+            {
+                "phase": "sessions",
+                "rows": rows,
+                "budget": max(
+                    0, int(os.environ.get("MLX_VLM_CONTINUATION_CACHE_BYTES", 1024**3))
+                ),
+            }
+        )
+        if any(state.get("phase") != "sessions" for state in states):
+            raise RuntimeError("Distributed session phases diverged")
+        mappings = [{row[0]: row for row in state["rows"]} for state in states]
+        if any(set(row) != set(mappings[0]) for row in mappings):
+            raise RuntimeError("Distributed retained sessions diverged")
+        decisions = {}
+        resident = sum(max(mapping[uid][5] for mapping in mappings) for uid in sessions)
+        budget = min(state["budget"] for state in states)
+        for uid in sorted(sessions, key=lambda value: (mappings[0][value][6], value)):
+            peers = [mapping[uid] for mapping in mappings]
+            error = next((row[3] for row in peers if row[3]), None)
+            if any(row[4] != peers[0][4] for row in peers):
+                raise RuntimeError("Distributed cache suspension diverged")
+            if peers[0][4] and resident > budget:
+                error = "The inference checkpoint was evicted to release cache memory."
+                resident -= max(row[5] for row in peers)
+            paused = any(row[1] for row in peers) or len({row[2] for row in peers}) != 1
+            decisions[sessions[uid]] = (paused, error)
+        generator._schedule_continuations(
+            groups, suspended, capacity, decisions=decisions
+        )
+        result = [[uid, session.distributed_state] for uid, session in sessions.items()]
+        confirmed = self.exchange({"phase": "session_results", "rows": result})
+        if any(state != confirmed[0] for state in confirmed):
+            raise RuntimeError("Distributed session transitions diverged")
+        for session in sessions.values():
+            session.distributed_ack = session.distributed_state
+
     def verify_step(self, responses):
         values = [
             [
@@ -182,6 +269,8 @@ class DistributedBatchScheduler:
             state.get("phase") != "tokens" or state != states[0] for state in states
         ):
             raise RuntimeError("Distributed token or completion decisions diverged")
+        if values:
+            self.worker.inference_validated_at = time.time()
 
     def abort(self, error, generator, groups):
         generator._load_error = error

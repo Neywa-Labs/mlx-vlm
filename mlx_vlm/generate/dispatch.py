@@ -1088,6 +1088,18 @@ def stream_generate(
                     extra_hash=apc_extra_hash,
                 )
 
+        progress_callback = kwargs.pop("prompt_progress_callback", None)
+        if progress_callback is not None:
+
+            def report_progress(processed, total, status):
+                # Report full prompt token counts, including reused APC tokens.
+                progress_callback(
+                    min(total_prompt_tokens, reused_prefix_len + processed),
+                    total_prompt_tokens,
+                    status,
+                )
+
+            kwargs["prompt_progress_callback"] = report_progress
         gen = generate_step(
             input_ids,
             model,

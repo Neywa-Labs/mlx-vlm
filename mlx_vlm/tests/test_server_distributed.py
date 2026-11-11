@@ -211,6 +211,7 @@ def _health(rank):
         "distributed_worker": {
             "rank": rank,
             "world_size": 2,
+            "protocol_version": 2,
             "backend": "jaccl",
             "fingerprint": "matching-code-settings",
         }
@@ -357,6 +358,7 @@ def test_cancelled_transfer_keeps_lock_until_thread_finishes(cluster, monkeypatc
 def test_worker_fingerprint_includes_context_limit(cluster, monkeypatch):
     worker = DistributedWorker.__new__(DistributedWorker)
     worker.source_hash = "same-source"
+    worker.instance_id = "test-worker-instance"
     worker.backend = "jaccl"
     worker.group = NS(rank=lambda: 0, size=lambda: 2)
     monkeypatch.delenv("MLX_VLM_COMPACTION_KEY_FILE", raising=False)
@@ -1245,3 +1247,218 @@ def test_distributed_native_continuous_batching(limit):
     assert len(records) == 2 and all(
         r["passed"] and r["batch"] == limit for r in records
     ), output
+
+
+def test_progress_cadence_is_not_semantic_rank_divergence(cluster, monkeypatch):
+    async def scenario():
+        coordinator = Coordinator(cluster)
+        monkeypatch.setenv(cluster.api_key_env, "key")
+        monkeypatch.setattr(
+            coordinator.stager, "prepare", lambda *_: "/models/snapshot"
+        )
+
+        async def handler(request):
+            rank = int(request.url.host[-1])
+            if request.method == "GET":
+                return httpx.Response(200, json=_health(rank))
+
+            async def events():
+                for processed in ([0, 2, 4] if rank == 0 else [0, 1, 2, 3, 4]):
+                    yield "event: response.prompt_progress\ndata: " + json.dumps(
+                        {
+                            "type": "response.prompt_progress",
+                            "response_id": str(rank),
+                            "processed_tokens": processed,
+                            "total_tokens": 4,
+                            "status": "completed" if processed == 4 else "in_progress",
+                        }
+                    ) + "\n\n"
+                yield _sse(rank, "answer")
+                yield "data: [DONE]\n\n"
+
+            return httpx.Response(200, stream=EventStream(events))
+
+        _transport(monkeypatch, handler)
+        result = await coordinator.relay(
+            "/v1/responses", {"model": "org/model", "stream": True}
+        )
+        output = "".join([value async for value in result.body_iterator])
+        assert output.count('"type": "response.prompt_progress"') == 3
+        assert output.index("response.prompt_progress") < output.index("answer")
+        assert "[DONE]" in output and not coordinator.failure.exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_resumable_disconnect_pauses_all_ranks_without_cancelling_decoder(
+    cluster, monkeypatch, phase
+):
+    from mlx_vlm.server.distributed_sessions import SESSION_ROUTE
+
+    async def scenario():
+        coordinator = Coordinator(cluster)
+        monkeypatch.setenv(cluster.api_key_env, "key")
+        monkeypatch.setattr(
+            coordinator.stager, "prepare", lambda *_: "/models/snapshot"
+        )
+        paused = set()
+
+        async def handler(request):
+            rank = int(request.url.host[-1])
+            if request.method == "GET":
+                return httpx.Response(200, json=_health(rank))
+            assert request.url.path != CANCEL_ROUTE
+            if request.url.path == SESSION_ROUTE:
+                assert json.loads(request.content)["action"] == "pause"
+                assert coordinator.active == 1
+                paused.add(rank)
+                return httpx.Response(200, json={"state": "paused"})
+
+            async def events():
+                if phase == "prefill":
+                    yield 'event: response.prompt_progress\ndata: {"type":"response.prompt_progress","status":"started","processed_tokens":0,"total_tokens":100}\n\n'
+                else:
+                    yield _sse(rank, "first")
+                await asyncio.Event().wait()
+
+            return httpx.Response(200, stream=EventStream(events))
+
+        _transport(monkeypatch, handler)
+        response = await coordinator.relay(
+            "/v1/responses",
+            {"model": "org/model", "stream": True, "resumable": True},
+            "tenant",
+        )
+        await asyncio.wait_for(anext(response.body_iterator), 2)
+        await asyncio.wait_for(response.body_iterator.aclose(), 2)
+        assert paused == {0, 1} and not coordinator.failure.exists()
+        assert coordinator.active == 0 and coordinator.continuations
+        assert all(
+            not record["active"] for record in coordinator.continuations.values()
+        )
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_coordinated_session_pause_resume_and_expiry_use_existing_cache_engine(
+    monkeypatch,
+):
+    from copy import deepcopy
+
+    from mlx_vlm.server.distributed_schedule import DistributedBatchScheduler
+    from mlx_vlm.server.sessions import InferenceSession
+
+    generator = generation.ResponseGenerator.__new__(generation.ResponseGenerator)
+    session = InferenceSession()
+    engine = NS(
+        suspend=Mock(return_value=NS(prompt_cache=[])),
+        resume=Mock(),
+        remove=Mock(),
+        apc_manager=None,
+    )
+    active = {1: {"rqueue": session, "request_id": "request:1"}}
+    groups, suspended = {0: (engine, active)}, {}
+    other_paused = True
+    other_error = None
+
+    def exchange(value):
+        other = deepcopy(value)
+        if value["phase"] == "sessions":
+            other["rows"][0][1] = other_paused
+            other["rows"][0][3] = other_error
+        return [value, other]
+
+    scheduler = DistributedBatchScheduler(NS(), exchange=exchange)
+    scheduler.continuations(generator, groups, suspended, 4)
+    assert session in suspended and not active
+    assert session.distributed_ack == "paused"
+    other_paused = False
+    scheduler.continuations(generator, groups, suspended, 4)
+    assert 1 in active and not suspended
+    assert session.distributed_ack == "running"
+    engine.resume.assert_called_once()
+    other_error = "Checkpoint expired on peer"
+    scheduler.continuations(generator, groups, suspended, 4)
+    assert not active and session.distributed_ack == "disposed"
+    with pytest.raises(ValueError, match="expired"):
+        session.claim()
+
+
+def test_resume_uses_synchronized_decoder_history_when_http_consumer_lags():
+    from mlx_vlm.server.continuation import Checkpoints, Generation
+    from mlx_vlm.server.sessions import InferenceSession
+
+    session = InferenceSession()
+    for text in ("one", "two", "three"):
+        session.put(
+            generation.StreamingToken(
+                text=text, token=1, logprobs=0, finish_reason=None
+            )
+        )
+    store = Checkpoints()
+    record = Generation(
+        body={},
+        tenant="t",
+        path="/v1/responses",
+        prompt="p",
+        session=session,
+        parts=["one"],
+    )
+    store.add(record)
+    resumed = store.resume(
+        {"id": record.id, "cursor": 2, "content": 6, "reasoning": 0},
+        "t",
+        "/v1/responses",
+        record_id="a" * 32,
+    )
+    assert resumed.id == "a" * 32 and resumed.parts == ["one", "two"]
+    assert resumed.session is session
+    assert next(session.reader(2, resumed.lease)).text == "three"
+
+
+def test_expiry_of_old_handle_does_not_dispose_active_resumed_session(cluster):
+    async def scenario():
+        coordinator = Coordinator(cluster)
+        coordinator.continuations = {
+            "old": {"session_id": "session", "active": False, "touched": 0, "ttl": 1},
+            "new": {"session_id": "session", "active": True, "touched": 1, "ttl": 1},
+        }
+        coordinator.session_action = AsyncMock()
+        await coordinator.expire_continuations(None)
+        coordinator.session_action.assert_not_awaited()
+        coordinator.continuations["new"]["active"] = False
+        await coordinator.expire_continuations(None)
+        coordinator.session_action.assert_awaited_once_with(None, "new", "dispose")
+
+    asyncio.run(scenario())
+
+
+def test_management_and_inference_staging_cannot_write_same_peer_concurrently(cluster):
+    from concurrent.futures import ThreadPoolExecutor
+
+    first, second = ModelStager(cluster), ModelStager(cluster)
+    entered, release, peer_entered = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def prepare_first(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return "first"
+
+    def prepare_second(*args, **kwargs):
+        peer_entered.set()
+        return "second"
+
+    first._prepare, second._prepare = prepare_first, prepare_second
+    with ThreadPoolExecutor(2) as pool:
+        a = pool.submit(first.prepare, "same-model")
+        assert entered.wait(1)
+        b = pool.submit(second.prepare, "same-model")
+        assert not peer_entered.wait(0.05)
+        release.set()
+        assert a.result() == "first" and b.result() == "second"

@@ -37,12 +37,14 @@ from ..tools import (
 from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs
 from . import compaction, continuation
+from .cluster_types import GenerationProgress, PromptProgress
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .progress import ProgressChannel
 from .request_normalization import (
     _chat_message_to_prompt,
     _normalize_instruction_messages,
@@ -1223,6 +1225,7 @@ async def responses_endpoint(request: Request):
         message_id = f"msg_{uuid.uuid4().hex}"
 
         if openai_request.stream:
+            gen_args.emit_prompt_progress = True
             # Streaming response
             runtime.metrics.begin_request(
                 endpoint="/responses",
@@ -1476,10 +1479,32 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
+                            progress = getattr(token, "prompt_progress", None)
+                            if progress is not None:
+                                event = PromptProgress(
+                                    response_id=response_id, **progress
+                                )
+                                yield _response_sse_event(
+                                    event.type, event.model_dump()
+                                )
+                                continue
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
                             output_tokens = metrics.generated_tokens
+                            timings = (
+                                {"tokens_per_second": metrics.rate}
+                                if metrics.rate is not None
+                                else None
+                            )
+                            event = GenerationProgress(
+                                response_id=response_id,
+                                output_tokens=output_tokens,
+                                timings=timings,
+                            )
+                            yield _response_sse_event(
+                                event.type, event.model_dump(exclude_none=True)
+                            )
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(token.finish_reason)
                             )
@@ -1513,7 +1538,9 @@ async def responses_endpoint(request: Request):
                                 finish_reason = token.finish_reason
                                 break
                     else:
-                        # Fallback to stream_generate
+                        # Fallback uses the same producer measurements, with
+                        # prefill callbacks delivered before next() yields a token.
+                        progress_channel = ProgressChannel()
                         token_iterator = continuation.stream_generation(
                             stream_generate,
                             model=model,
@@ -1523,16 +1550,38 @@ async def responses_endpoint(request: Request):
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             args=gen_args,
+                            prompt_progress_callback=progress_channel,
                             **kwargs,
                         )
 
-                        for chunk in token_iterator:
+                        async for chunk in progress_channel.consume(token_iterator):
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
+                            progress = getattr(chunk, "prompt_progress", None)
+                            if progress is not None:
+                                event = PromptProgress(
+                                    response_id=response_id, **progress
+                                )
+                                yield _response_sse_event(
+                                    event.type, event.model_dump()
+                                )
+                                continue
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
+                            event = GenerationProgress(
+                                response_id=response_id,
+                                output_tokens=metrics.generated_tokens,
+                                timings=(
+                                    {"tokens_per_second": metrics.rate}
+                                    if metrics.rate is not None
+                                    else None
+                                ),
+                            )
+                            yield _response_sse_event(
+                                event.type, event.model_dump(exclude_none=True)
+                            )
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             thinking_delta = thinking_state.feed(
                                 raw_delta, last=bool(chunk_finish)
@@ -2254,6 +2303,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
+                            if getattr(token, "prompt_progress", None) is not None:
+                                continue
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
                             output_tokens = metrics.generated_tokens

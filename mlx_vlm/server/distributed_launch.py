@@ -239,12 +239,12 @@ class WorkerLauncher:
             except (OSError, ValueError):
                 return  # Supervisors expire their leases if transport is lost.
 
-    async def start(self):
+    async def start(self, *, recover=False):
         import httpx
 
         payload = self._payload()
         self.launch.validate_hosts(self.config.workers)
-        if self.coordinator.failure.exists():
+        if self.coordinator.failure.exists() and not recover:
             raise RuntimeError("Inspect .cluster-failed.json before restarting workers")
         path = Path(str(self.config.shared_lock) + ".launcher")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,6 +329,8 @@ class WorkerLauncher:
     async def monitor(self):
         while self.process.poll() is None:
             await asyncio.sleep(0.5)
+        if self.stopping.is_set():
+            return  # An explicit API stop is not an unexpected worker failure.
         try:
             self.coordinator.failed(
                 RuntimeError("Owned mlx.launch worker group exited")
@@ -394,6 +396,7 @@ async def managed_workers(coordinator):
         yield
         return
     launcher = WorkerLauncher(coordinator)
+    coordinator.launcher = launcher
     monitor = None
     try:
         await launcher.start()

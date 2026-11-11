@@ -433,7 +433,12 @@ async def lifespan(app):
 
     async with managed_workers(runtime.distributed_coordinator):
         async with _application_lifespan(app):
-            yield
+
+            try:
+                yield
+            finally:
+                if runtime.cluster_manager is not None:
+                    await runtime.cluster_manager.close()
 
 
 @asynccontextmanager
@@ -1239,6 +1244,8 @@ async def route_distributed_request(request: Request, call_next):
 
     path = request.url.path
     worker = runtime.distributed_worker
+    if path == "/internal/distributed/session":
+        return await call_next(request)
     if path == CANCEL_ROUTE and request.method == "POST" and worker is not None:
         try:
             _require_management_api_key(request)
@@ -1251,6 +1258,16 @@ async def route_distributed_request(request: Request, call_next):
             ):
                 raise HTTPException(422, "Invalid distributed request ID")
             worker.remember_cancellations([request_id])
+            from . import continuation
+
+            with continuation.CHECKPOINTS.lock:
+                record = continuation.CHECKPOINTS.records.get(request_id)
+            if (
+                record is not None
+                and record.session is not None
+                and record.lease == record.session.lease
+            ):
+                record.session.dispose("Distributed request cancelled")
             return JSONResponse({"cancelled": request_id}, 202)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return JSONResponse({"detail": "Invalid cancellation body"}, 422)
@@ -1466,3 +1483,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _require_cluster_api_key(request: HTTPConnection) -> None:
+    # Mutation and worker identity must never silently become unauthenticated.
+    if _server_api_key() is None:
+        raise HTTPException(
+            503, "Set MLX_VLM_SERVER_API_KEY to enable cluster management"
+        )
+    _require_management_api_key(request)
+
+
+from .cluster import router as _cluster_router
+
+app.include_router(_cluster_router(_require_cluster_api_key))
+
+from .distributed_sessions import router as _session_router
+
+app.include_router(_session_router(_require_cluster_api_key))
+
+
+_cluster_openapi = app.openapi
+
+
+def _openapi_with_stream_events():
+    schema = _cluster_openapi()
+    from .cluster_types import ClusterEvent, GenerationProgress, PromptProgress
+
+    for event in (ClusterEvent, GenerationProgress, PromptProgress):
+        schema["components"]["schemas"][event.__name__] = event.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+    return schema
+
+
+app.openapi = _openapi_with_stream_events

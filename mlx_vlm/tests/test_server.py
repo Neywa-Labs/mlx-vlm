@@ -10825,3 +10825,47 @@ def test_diffusion_http_checkpoint_replays_without_regeneration(
         assert resumed.status_code == 200
         assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
         worker.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_minimax_thinking_delimiters_at_every_chunk_boundary(started):
+    from mlx_vlm.server.responses_state import ThinkingStreamState
+
+    text = ("" if started else "<mm:think>") + "reasoning" + "</mm:think>\nanswer"
+    for split in range(len(text) + 1):
+        parser = ThinkingStreamState(started)
+        deltas = [parser.feed(text[:split]), parser.feed(text[split:], last=True)]
+        assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+        assert "".join(d.content or "" for d in deltas) == "answer"
+    parser = ThinkingStreamState(started)
+    deltas = [parser.feed(ch) for ch in text] + [parser.feed("", last=True)]
+    assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+    assert "".join(d.content or "" for d in deltas) == "answer"
+
+
+def test_responses_emit_real_prefill_progress_before_first_token(client):
+    tokens = [
+        _token(
+            token_count=0,
+            prompt_progress={
+                "status": status,
+                "processed_tokens": count,
+                "total_tokens": 16,
+            },
+        )
+        for status, count in (("started", 0), ("in_progress", 8), ("completed", 16))
+    ]
+    tokens.append(_token("answer", finish_reason="stop"))
+    with _endpoint(generator=_streaming(tokens, prompt_tokens=16)):
+        response = _post(client, "responses", stream=True)
+    events = _data(response)
+    prompt = [e for e in events if e.get("type") == "response.prompt_progress"]
+    assert [e["processed_tokens"] for e in prompt] == [0, 8, 16]
+    assert all(e["response_id"].startswith("resp_") for e in prompt)
+    first_text = next(
+        i for i, e in enumerate(events) if e.get("type") == "response.output_text.delta"
+    )
+    assert all(events.index(e) < first_text for e in prompt)
+    progress = [e for e in events if e.get("type") == "response.generation_progress"]
+    assert progress[-1]["output_tokens"] == 1
+    assert events[-1]["response"]["usage"]["output_tokens"] == 1

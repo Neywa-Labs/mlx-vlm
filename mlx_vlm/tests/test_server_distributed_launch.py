@@ -513,3 +513,17 @@ def test_supervisor_accepts_long_pty_messages_without_echo_and_expires_lease(
                 os.kill(child["pid"], signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_monitor_does_not_fail_group_after_explicit_stop():
+    from threading import Event
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    launcher = WorkerLauncher.__new__(WorkerLauncher)
+    launcher.process = SimpleNamespace(poll=lambda: 0)
+    launcher.stopping = Event()
+    launcher.stopping.set()
+    launcher.coordinator = SimpleNamespace(failed=Mock())
+    asyncio.run(launcher.monitor())
+    launcher.coordinator.failed.assert_not_called()
