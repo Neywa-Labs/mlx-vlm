@@ -1,10 +1,8 @@
 # ERNIE 5.5 Flash Base
 
-MLX implementation of [`baidu/ERNIE-5.5-Flash-Base`](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base), a text-only base language model with approximately 280B parameters and 14B active per token. It completes text; the released checkpoint has no instruction/chat template.
+MLX support for [baidu/ERNIE-5.5-Flash-Base](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base). This is a text completion model; use plain prompts rather than chat messages.
 
-## Use
-
-Convert the released FP8 checkpoint with the standard converter on a machine with sufficient disk and memory:
+## Convert
 
 ```sh
 python -m mlx_vlm.convert \
@@ -12,11 +10,11 @@ python -m mlx_vlm.convert \
   --mlx-path ./ERNIE-5.5-Flash-Base-MXFP8
 ```
 
-The shared FP8 loader converts block-FP8 projections to native MLX MXFP8. The grouped HCA output and fused MLA KV projection are reconstructed for their model-specific layouts. The vocabulary head retains its checkpoint dtype (BF16 in the release); vocabulary projection and MultiMax arithmetic use FP32. The original download alone is approximately 288 GB; conversion also needs space for the output checkpoint.
+This converts the released FP8 projections to native MLX MXFP8. The source download is about 288 GB; allow additional space for the output.
 
-Use the command above without `-q` for the released FP8 checkpoint. The standard loader recognizes its FP8 configuration when reloading the native MXFP8 export. Applying `-q` to this partially quantized model can save inconsistent format metadata and cause reload failures; that conversion path is outside this port. The shared loader, converter, and quantization utilities are unchanged.
+Use the command above without `-q`. Converting the released checkpoint to 4-bit with `-q` is currently unsupported: existing MXFP8 weights are preserved, but the saved metadata can cause reload failures.
 
-When quantizing a floating-point checkpoint, the model's fixed `quant_predicate` selects affine 4-bit/group-64 routed experts and MXFP8/group-32 shared experts, latent projections, and ECHO projections. The vocabulary head and other excluded tensors retain their precision. These per-module settings are saved for reloading.
+## Generate
 
 ```sh
 python -m mlx_vlm.generate \
@@ -25,11 +23,9 @@ python -m mlx_vlm.generate \
   --max-tokens 128 --temperature 0
 ```
 
-The ordinary `load`, `generate`, `stream_generate`, and continuous batching paths apply. Use plain completion prompts with the released tokenizer.
+## ECHO (experimental)
 
-### ECHO speculative decoding (experimental)
-
-ECHO uses the prediction weights bundled in the Base checkpoint. Point both arguments at the same checkpoint; a separate draft-model download is unnecessary:
+ECHO uses the draft weights bundled in the same checkpoint:
 
 ```sh
 python -m mlx_vlm.generate \
@@ -40,97 +36,6 @@ python -m mlx_vlm.generate \
   --max-tokens 128 --temperature 0
 ```
 
-The block size includes the target bonus token: `3` proposes two draft tokens. The loader automatically identifies ECHO as an MTP drafter. Standard conversion preserves its auxiliary weights; older conversions that discarded them must be regenerated from a checkpoint containing those tensors.
+Block size `3` proposes two draft tokens. ECHO requires full-prompt prefill and a fresh cache. Outputs can differ from ordinary decoding, and speedups depend on the workload. Distributed execution is not supported.
 
-ECHO is opt-in. The historical checkpoint comparisons below showed improved throughput at batch 1 and faster ordinary decoding in both batch-4 cases; those ECHO measurements used FP32 head storage. Mixed-precision block evaluation can still change greedy outputs relative to ordinary decoding.
-
-ECHO shares the final MLA/MoE decoder layer, token embeddings, and vocabulary projection with the target. Its own projections, normalization, residual head, and expert-routing bias add approximately 67 MB of parameters. It maintains a separate latent KV cache. Verification uses shared cache transactions to retain accepted HCA pooling history and rewind rejected KV entries. Accepted draft cache entries are rebuilt using the verified target hidden states.
-
-Single-request streaming and continuous batching are supported, including left padding, finished requests, and queued arrivals. Batches use the shortest accepted draft prefix across active rows. ECHO currently requires full-prompt prefill, so speculative runs disable chunked prefill and retain the prompt's final residual states for draft initialization. This can increase prefill memory at long contexts. Use a fresh prompt cache: suffix-only prefix reuse does not supply the residual history needed by the drafter. Distributed execution is not implemented.
-
-## Implementation
-
-- Heavily Compressed Attention (HCA), with a local window and learned 128-token compression, per-head query normalization, YaRN, and inverse output RoPE.
-- MLA with a latent KV cache and a DSA indexer. Decode gathers selected older tokens plus the recent window. Prefill uses a masked attention reference path; it does not provide a fused sparse-attention kernel.
-- Virtual head mixing and gates computed from the query latent.
-- Two sigmoid routers, bias-corrected expert selection, learned expert scales, SiTU-GLU, latent output normalization, and a full-width shared expert.
-- Manifold-constrained hyper-connections and the learned MultiMax vocabulary transform.
-- Released BF16/block-FP8 weight mapping and native MLX quantized checkpoint loading.
-
-The indexer stores its cache in the backbone dtype, without the FP8/FP4 activation and index-cache quantization used by GPU serving engines. Exact token agreement with those kernels is not guaranteed. Tensor/pipeline parallel execution is not integrated.
-
-## Validation
-
-Tiny configurations live in the shared model test catalog, with shared pytest fixtures for the target and ECHO drafter. Regressions cover compression boundaries, chunked prefill, sparse decode, causal masking, cache merging/extraction/filtering, padding, state restoration, and continuous batching with late arrivals and cancellation. Cache checks live in `test_cache.py`; component equations are compared with independent NumPy references in `test_model_ops.py`.
-
-The released checkpoint also passes strict loading and text-generation smoke tests. Independent PyTorch FP32 checks cover a complete tiny model and the released first layer across a compression boundary; these are separate from full-checkpoint generation checks.
-
-ECHO regressions cover forced acceptance/rejection, compressor rollback across boundaries, repeated generation, padded batches, early completion, and auxiliary-weight conversion/loading. An independent PyTorch check of ECHO's equations matched full prefill and token-by-token decode with maximum FP32 logit error below `1e-6` and no top-token disagreements across 38 comparisons.
-
-```sh
-python -m pytest \
-  mlx_vlm/tests/test_models.py mlx_vlm/tests/test_model_ops.py \
-  mlx_vlm/tests/test_cache.py mlx_vlm/tests/test_generate.py \
-  mlx_vlm/tests/test_speculative.py -k 'ernie55 or ernie5_5 or ernie_echo'
-```
-
-## Measured performance
-
-The first table and initial ECHO comparison were collected before rebasing onto the shared cache-transaction implementation. The first table used BF16 head storage; both ECHO comparison tables used an earlier optimization that stored the head in FP32. The current loader preserves the checkpoint head dtype and has not been benchmarked since removing that optimization. All tables used a 2 GiB MLX allocator-cache limit.
-
-Measured on November 10, 2026, on one Apple M3 Ultra with 512 GiB of unified memory, using MLX 0.32.4 and the shared `BatchGenerator`. This checkpoint uses 4-bit affine quantization with group size 64 for routed experts only; remaining tensors retain BF16/FP32 precision. It occupies approximately 174.4 GB on disk. These measurements use a separately prepared checkpoint; the converter command above produces MXFP8 projections and has not been benchmarked here.
-
-Each request generated exactly 32 tokens with greedy sampling and EOS stopping disabled for the throughput measurement. Results are medians of three runs after model/kernel warmup at each batch size. Every run used a fresh KV cache, no prefix reuse or draft model, and a prefill chunk size of 128. Both throughput columns are aggregate rates across the batch; batch 1 is the latency baseline. TTFT is measured in-process. Memory is the maximum MLX allocator peak across the three runs, including model weights, in decimal GB.
-
-| Batch | Input tokens per request | Prefill tok/s | Decode tok/s | TTFT (s) | Peak memory (GB) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 128 | 221.6 | 4.28 | 0.80 | 174.30 |
-| 1 | 512 | 275.9 | 4.26 | 2.11 | 174.20 |
-| 1 | 2,048 | 288.8 | 4.25 | 7.34 | 174.22 |
-| 4 | 128 | 440.7 | 17.68 | 1.37 | 175.72 |
-| 4 | 512 | 511.9 | 17.59 | 4.22 | 175.76 |
-| 4 | 2,048 | 516.8 | 17.48 | 16.06 | 175.86 |
-
-All 18 measured runs completed with the requested token counts, full decode batch occupancy, zero prefix-cache hits, and identical output tokens across repetitions of each case. A separate batch-4 smoke test with 2,304 input tokens and 8 output tokens per request exercised the sparse-indexer path beyond its 2,048 + 128 threshold; its peak was 176.14 GB. The largest tested input was therefore 2,048 tokens for batch 1 and 2,304 for batch 4. These measurements do not establish maximum context capacity or long-context answer quality. Another model remained resident but idle, and system swap usage stayed unchanged.
-
-### ECHO comparison with FP32 head storage (historical)
-
-With the earlier head-promotion optimization, a paired comparison on the same machine and checkpoint used two draft tokens, 32 generated tokens per request, batch sizes 1 and 4, and three repetitions per configuration. The model file was unchanged; the dense head was held in FP32 for this experiment. The MLX allocator-cache limit was 2 GiB. Both variants used fresh caches, greedy sampling, and disabled EOS stopping. AR used 128-token prefill chunks; ECHO used full-prompt prefill. Decode timing includes ECHO's draft initialization after the first target token. Rates are aggregate medians.
-
-| Batch | Input tokens per request | AR decode tok/s | ECHO decode tok/s | ECHO / AR | Draft acceptance |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 128 | 9.34 | 19.70 | 2.11× | 58.6% |
-| 1 | 512 | 9.32 | 17.95 | 1.93× | 53.3% |
-| 4 | 128 | 41.19 | 47.63 | 1.16× | 41.2% |
-| 4 | 512 | 40.39 | 30.80 | 0.76× | 20.5% |
-
-All 24 runs completed with the requested token counts and full batch occupancy. Outputs repeated exactly within each variant. Six of the ten distinct benchmark request sequences matched AR exactly; four diverged, first at output positions 0, 4, 9, or 18 (zero-based). Two additional 32-token natural-language streaming smoke tests matched exactly. A teacher-forced comparison of block verification with singleton forwards from identical initial caches found 22 top-token differences across 249 proposed positions, including rejected positions. These released mixed-precision results do not establish exact greedy parity. The FP32 reference checks above validate the implementation's equations separately. For batch 4 at 512 input tokens, ordinary decoding remains faster than the tested ECHO configurations.
-
-### Rerun before removing head promotion
-
-On November 11, 2026, commit `405b9d8b` repeated all eight AR/ECHO configurations three times after warmup and a fresh strict checkpoint load, with the head stored in FP32. The hardware, 174.4 GB checkpoint, 2 GiB allocator cache, saved prompt token IDs, and 32-token output limits match the earlier comparison. AR uses 128-token prefill chunks; ECHO uses full-prompt prefill and two draft tokens. The following rates are aggregate medians, including ECHO draft initialization:
-
-| Batch | Input tokens per request | AR decode tok/s | ECHO decode tok/s | ECHO / AR |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 128 | 9.40 | 18.99 | 2.02× |
-| 1 | 512 | 9.41 | 17.30 | 1.84× |
-| 4 | 128 | 41.17 | 35.59 | 0.86× |
-| 4 | 512 | 40.79 | 24.45 | 0.60× |
-
-All 24 measured runs completed with 32 tokens per request and full requested batch occupancy. Throughput varied by less than 0.5% within each configuration, and output tokens repeated exactly within each variant. Both natural-language streaming smoke tests matched AR for 32 tokens; six of ten distinct benchmark request sequences matched between AR and ECHO. Peak MLX memory reached 180.70 GB, and swap usage stayed unchanged.
-
-Compared with the earlier profiling table, AR throughput stayed within 1%, while ECHO was 3.6% slower at batch 1 and 25.3% / 20.6% slower at batch 4 for 128 / 512 input tokens. These results confirm the lower batch-4 ECHO throughput seen in the single-run check after rebasing onto the shared runtime; the cause has not been isolated. Prefer AR for these batch-4 workloads.
-
-### Profiling findings
-
-The released vocabulary matrix is BF16 with shape `[201216, 4096]`, while vocabulary projection arithmetic uses FP32. Repeated implicit promotion creates a roughly 3.30 GB temporary. In synchronized phase measurements with the original 2 GiB allocator cache, the vocabulary head took about 128 ms per verification, versus 103 ms for the full target backbone at batch 1. The earlier FP32 head-storage optimization reduced its phase time to about 7 ms and preserved the tested logits and generated tokens exactly, at the cost of 1.65 GB of additional persistent parameter storage. That optimization has been removed; the current loader preserves BF16 head storage. Raising the allocator cache to 8 GiB also mitigates the allocation cost; persistent head promotion still improved ECHO throughput by 18–34% against that better-configured baseline.
-
-With FP32 head storage, target verification accounted for most measured decode time. That profiling configuration identified these further opportunities:
-
-- **Draft length by workload:** one draft token (`--draft-block-size 2`) reached 36.42 aggregate tok/s at batch 4 / 512 input tokens, versus 30.80 for two drafts. At batch 1 / 128, one and two drafts were similar (19.58 versus 19.70 tok/s); three drafts were slower. These settings can change outputs because verification block shapes change mixed-precision arithmetic.
-- **Independent row acceptance:** at batch 4 / 512, rows individually accepted 43.2% of proposed tokens, but the uniform acceptance rule retained only 20.5%. Per-row HCA rollback and draft-cache positions are required before removing this constraint. The observed acceptance gap is not a measured speedup for such an implementation.
-- **Only project consumed draft logits:** prefill and cache reconditioning use only the final prediction. A prototype that projects only that position improved 512-token-prompt throughput by 4.9% at batch 1 and 8.4% at batch 4, with identical tokens in those tests. This prototype is not part of the runtime implementation.
-
-Phase timings explicitly synchronize lazy MLX work and add 6–15% overhead, depending on the configuration; throughput figures come from separate uninstrumented runs. Representative attention/MoE probes used actual inputs from layers 1 and 42, and are not a complete GPU kernel profile. In the initial Python profile, scheduler functions were a small fraction of wall time. The earlier short-block absorbed-attention experiment had no consistent throughput benefit.
-
-Architecture and checkpoint mapping follow [Baidu's reference implementation](https://github.com/baidu/vLLM-ERNIE/tree/main/src/vllm_ernie/models/ernie5_5). Model weights remain subject to the [upstream model license](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base/blob/main/LICENSE).
+[Reference implementation](https://github.com/baidu/vLLM-ERNIE/tree/main/src/vllm_ernie/models/ernie5_5) · [Model license](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base/blob/main/LICENSE)
