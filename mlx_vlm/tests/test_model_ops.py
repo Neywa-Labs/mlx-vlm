@@ -2804,14 +2804,27 @@ def _fp8_conversion_case(family):
     return config, weights, source_keys, preserved
 
 
-@pytest.mark.parametrize("family", ["qwen3_5", "ernie5_5_moe"])
-def test_convert_fp8_preserves_loaded_layout(tmp_path, family):
+@pytest.mark.parametrize(
+    "family,q_bits",
+    [
+        ("qwen3_5", None),
+        ("ernie5_5_moe", None),
+        ("ernie5_5_moe", 4),
+        ("ernie5_5_moe", 8),
+    ],
+)
+def test_convert_fp8_preserves_loaded_layout(tmp_path, family, q_bits):
     from mlx_vlm.convert import convert
 
     mx.random.seed(55)
     config, weights, source_keys, preserved = _fp8_conversion_case(family)
     mxfp8 = dict(group_size=32, bits=8, mode="mxfp8")
+    experts = dict(group_size=64, bits=4, mode="affine") if q_bits == 4 else mxfp8
     expected = {}
+    if q_bits is not None and family == "ernie5_5_moe":
+        for key, weight in weights.items():
+            if ".switch_mlp." in key:
+                expected[key] = (experts, mx.quantize(weight, **experts))
     for source_key, native_key in source_keys.items():
         weights[source_key] = mx.to_fp8(weights[source_key])
         rows, cols = weights[source_key].shape
@@ -2828,7 +2841,11 @@ def test_convert_fp8_preserves_loaded_layout(tmp_path, family):
             preserved[prefix + "embed_q.weight"] = fused[:, :8].swapaxes(-1, -2)
             preserved[prefix + "unembed_out.weight"] = fused[:, 8:]
         else:
-            expected[native_key] = (mxfp8, quantized)
+            params = mxfp8
+            if q_bits == 4 and isinstance(native_key, tuple):
+                params = experts
+                quantized = mx.quantize(mx.dequantize(*quantized, **mxfp8), **params)
+            expected[native_key] = (params, quantized)
     config["quantization_config"] = {
         "quant_method": "fp8",
         "fmt": "e4m3",
@@ -2839,9 +2856,19 @@ def test_convert_fp8_preserves_loaded_layout(tmp_path, family):
     mx.save_safetensors(str(source / "model.safetensors"), weights)
     (source / "config.json").write_text(json.dumps(config))
     with patch("mlx_vlm.utils.load_processor", return_value=SimpleNamespace()):
-        convert(str(source), str(destination))
+        convert(
+            str(source), str(destination), quantize=q_bits is not None, q_bits=q_bits
+        )
     restored = load_model(destination)
     modules = dict(restored.named_modules())
+    if q_bits is not None:
+        exported = json.loads((destination / "config.json").read_text())["quantization"]
+        for path, module in modules.items():
+            if hasattr(module, "scales"):
+                params = exported.get(path, exported)
+                assert {k: params[k] for k in mxfp8} == {
+                    k: getattr(module, k) for k in mxfp8
+                }
     for key, (params, quantized) in expected.items():
         native_key, expert = key if isinstance(key, tuple) else (key, None)
         projection = modules[native_key.removesuffix(".weight")]
