@@ -551,10 +551,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
-                transform = getattr(
-                    model, "transform_fp8_weights", transform_fp8_weights
-                )
-                weights, quantization = transform(
+                weights, quantization = transform_fp8_weights(
                     weights,
                     config,
                     target_quantization=fp8_quantization,

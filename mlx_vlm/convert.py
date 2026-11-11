@@ -319,9 +319,6 @@ def convert(
         model_path,
         lazy=True,
         trust_remote_code=trust_remote_code,
-        fp8_quantization=(
-            get_quantization_params(q_group_size, q_bits, q_mode) if quantize else None
-        ),
     )
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
