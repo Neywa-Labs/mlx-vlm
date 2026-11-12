@@ -529,3 +529,279 @@ def test_auto_falls_back_only_on_classified_connection_errors(
         assert not any(phase == "transport_fallback" for phase, _ in updates)
         assert not pool.pairs
         assert not (Path(worker.model_dir) / store.snapshot_id(manifest)).exists()
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_hub_blob_checksum_is_verified_before_publication(tmp_path, corrupt):
+    data = b"published Hugging Face weight" * 200
+    digest = hashlib.sha256(data).hexdigest()
+    repo = tmp_path / "models--org--model"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    blob = blobs / digest
+    blob.write_bytes(b"X" * len(data) if corrupt else data)
+    source = repo / "snapshots" / ("a" * 40)
+    source.mkdir(parents=True)
+    (source / "weights.safetensors").symlink_to(blob)
+    root = tmp_path / "cache"
+    if corrupt:
+        with pytest.raises(ValueError, match="Hugging Face checksum mismatch"):
+            store.prepare_snapshot(source, ["weights.safetensors"], root, chunk=1024)
+        assert not list(root.glob("*/weights.safetensors"))
+        assert not list(root.glob(".building-*"))
+    else:
+        _, manifest = store.prepare_snapshot(
+            source, ["weights.safetensors"], root, chunk=1024
+        )
+        assert manifest["files"]["weights.safetensors"]["sha256"] == digest
+    # A Git blob ID is not a SHA-256 checksum, nor is an arbitrary local filename.
+    assert store._hub_sha256(blobs / ("a" * 40)) is None
+    assert store._hub_sha256(tmp_path / digest) is None
+
+
+def test_multiple_files_hash_concurrently_with_monotonic_progress(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    names = ["one.safetensors", "two.safetensors"]
+    for n in names:
+        (source / n).write_bytes(n.encode() * 300)
+    monkeypatch.setattr(store.os, "cpu_count", lambda: 2)
+    barrier = threading.Barrier(2)
+    clone = store._clone
+
+    def synchronized_clone(src, dst):
+        barrier.wait(timeout=5)
+        return clone(src, dst)
+
+    monkeypatch.setattr(store, "_clone", synchronized_clone)
+    updates = []
+    _, manifest = store.prepare_snapshot(
+        source,
+        names,
+        tmp_path / "cache",
+        chunk=1024,
+        progress=lambda **data: updates.append(data["bytes_verified"]),
+    )
+    assert list(manifest["files"]) == names
+    assert updates == sorted(updates)
+    assert updates[-1] == sum((source / n).stat().st_size for n in names)
+    for n in names:
+        assert (
+            manifest["files"][n]["sha256"]
+            == hashlib.sha256((source / n).read_bytes()).hexdigest()
+        )
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_receiver_pipeline_preserves_tail_and_resumed_chunks(
+    snapshot, tmp_path, monkeypatch, corrupt
+):
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_vlm.server import _checkpoint_worker as worker
+
+    _, _, _, final, manifest = snapshot
+    destination = store.SnapshotStore(tmp_path / "received")
+    partial = destination.partial(manifest)
+    original = (final / "weights.safetensors").read_bytes()
+    (partial / "weights.safetensors").write_bytes(original[:1024])
+    missing, reused = destination.missing(manifest)
+    assert reused == 1024
+    payloads = []
+    for name, record in manifest["files"].items():
+        data = (final / name).read_bytes()
+        for index in missing[name]:
+            payloads.append(data[index * 1024 : (index + 1) * 1024])
+    if corrupt:
+        payloads[-1] = b"X" * len(payloads[-1])
+    chunks = iter(payloads)
+    monkeypatch.setattr(
+        mx.distributed,
+        "recv",
+        lambda *a, **k: mx.array(np.frombuffer(next(chunks), dtype=np.uint8)),
+    )
+    command = {"manifest": manifest, "path": str(partial), "missing": missing}
+    group = SimpleNamespace(rank=lambda: 1)
+    if corrupt:
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            worker.copy_chunks(group, command, lambda **data: None)
+        assert not (destination.root / store.snapshot_id(manifest)).exists()
+    else:
+        signatures = worker.copy_chunks(group, command, lambda **data: None)
+        published = destination.publish(manifest, signatures)
+        assert (published / "weights.safetensors").read_bytes() == original
+
+
+def test_parallel_preparation_cancellation_leaves_no_snapshot(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    names = ["one.safetensors", "two.safetensors"]
+    for name in names:
+        (source / name).write_bytes(b"w" * 8192)
+    stop = threading.Event()
+    root = tmp_path / "cache"
+    with pytest.raises(InterruptedError):
+        store.prepare_snapshot(
+            source,
+            names,
+            root,
+            chunk=1024,
+            stop=stop,
+            progress=lambda **data: stop.set(),
+        )
+    assert not list(root.glob(".building-*"))
+    assert not list(root.glob("*/one.safetensors"))
+
+
+@pytest.mark.parametrize("mutation", [False, True])
+def test_file_pipeline_starts_before_all_hashes_and_checks_source_before_publish(
+    tmp_path, monkeypatch, mutation
+):
+    source, root = tmp_path / "source", tmp_path / "cache"
+    source.mkdir()
+    names = ["first.safetensors", "second.safetensors"]
+    for name in names:
+        (source / name).write_bytes(name.encode() * 100)
+    delivered = threading.Event()
+    monkeypatch.setattr(store.os, "cpu_count", lambda: 2)
+    clone = store._clone
+    staged = []
+
+    def wait_for_delivery(src, dst):
+        if src.name == names[1]:
+            assert delivered.wait(5), "Hashing must not block the first file's delivery"
+        return clone(src, dst)
+
+    def file_ready(path, manifest):
+        name = next(iter(manifest["files"]))
+        assert (path / name).is_file()
+        store.verify_chunks(path / name, manifest["files"][name], 1024)
+        assert not list(root.glob("*/.mlx-vlm-distributed.json"))
+        staged.append(path)
+        delivered.set()
+
+    def before_publish():
+        if mutation:
+            (staged[0] / names[0]).write_bytes(b"modified after sending")
+
+    monkeypatch.setattr(store, "_clone", wait_for_delivery)
+    kwargs = dict(chunk=1024, file_ready=file_ready, before_publish=before_publish)
+    if mutation:
+        with pytest.raises(ValueError, match="changed before publication"):
+            store.prepare_snapshot(source, names, root, **kwargs)
+        assert not list(root.glob("*/.mlx-vlm-distributed.json"))
+    else:
+        final, _ = store.prepare_snapshot(source, names, root, **kwargs)
+        assert (final / names[1]).read_bytes() == (source / names[1]).read_bytes()
+    assert not list(root.glob(".building-*"))
+
+
+@pytest.mark.parametrize(
+    "transport,connection_error,fallback",
+    [
+        ("auto", TransferUnavailable("link unavailable"), True),
+        ("jaccl_rdma", TransferUnavailable("link unavailable"), False),
+        ("auto", ValueError("backend defect"), False),
+    ],
+)
+def test_pipeline_fallback_only_for_auto_connection_failure(
+    snapshot, tmp_path, pool, monkeypatch, transport, connection_error, fallback
+):
+    source, names, _, _, _ = snapshot
+    config = ClusterConfig((), tmp_path / "fresh", tmp_path / "lock")
+    worker = Worker("http://peer")
+    pair = Mock()
+    pair.connect.side_effect = connection_error
+    monkeypatch.setattr(transfer, "Pair", lambda *args: pair)
+    result = {"transport": "ssh_rsync", "path": "prepared"}
+    pool.deliver = Mock(return_value=result)
+    call = lambda: pool.prepare_and_deliver(
+        config,
+        worker,
+        source,
+        names,
+        transport,
+        lambda *a, **kw: None,
+        lambda **kw: None,
+    )
+    if fallback:
+        final, manifest, actual = call()
+        assert store.SnapshotStore(config.model_dir).existing(manifest) == final
+        assert actual["fallback_reason"] == "link unavailable"
+        assert pool.deliver.call_args.args[4] == "ssh_rsync"
+    else:
+        with pytest.raises(type(connection_error), match=str(connection_error)):
+            call()
+        pool.deliver.assert_not_called()
+        assert not list(config.model_dir.glob("*/.mlx-vlm-distributed.json"))
+    pair.close.assert_called()
+    assert not pool.pairs
+    assert not list(config.model_dir.glob(".building-*"))
+
+
+def test_pipeline_helper_rejects_commit_until_every_file_is_received(
+    snapshot, tmp_path
+):
+    helper = Helper([sys.executable, "-u", "-c", bootstrap()], timeout=5)
+    try:
+        helper.call(
+            "begin_pipeline", root=str(tmp_path / "receiver"), partial_id="a" * 64
+        )
+        helper.call(
+            "file",
+            manifest=snapshot[-1]
+            | {"files": {"config.json": snapshot[-1]["files"]["config.json"]}},
+        )
+        with pytest.raises(RuntimeError, match="Incomplete or changed"):
+            helper.call("commit", manifest=snapshot[-1])
+        assert not list((tmp_path / "receiver").glob("*/.mlx-vlm-distributed.json"))
+    finally:
+        helper.close()
+
+
+def test_pipeline_warm_source_resumes_legacy_partial(snapshot, tmp_path):
+    _, _, _, final, manifest = snapshot
+    destination = store.SnapshotStore(tmp_path / "receiver")
+    partial = destination.partial(manifest)
+    (partial / "config.json").write_bytes((final / "config.json").read_bytes())
+    helper = Helper([sys.executable, "-u", "-c", bootstrap()], timeout=5)
+    try:
+        state = helper.call(
+            "begin", root=str(destination.root), manifest=manifest, partial_id="b" * 64
+        )
+        assert state["path"] == str(partial)
+        assert state["bytes_reused"] == manifest["files"]["config.json"]["size"]
+    finally:
+        helper.close()
+
+
+def test_stager_pipelines_remote_peer_when_local_rank_is_first(
+    snapshot, tmp_path, pool
+):
+    source, _, root, final, manifest = snapshot
+    local = Worker("http://local", node_id="local")
+    remote = Worker(
+        "http://remote",
+        node_id="remote",
+        rdma={
+            "local_address": "192.0.2.1",
+            "local_device": "rdma_en1",
+            "remote_device": "rdma_en2",
+        },
+    )
+    config = ClusterConfig((local, remote), root, tmp_path / "lock")
+    remote_result = {"transport": "jaccl_rdma", "path": "/remote/snapshot"}
+    pool.prepare_and_deliver = Mock(return_value=(final, manifest, remote_result))
+    pool.deliver = Mock(
+        return_value={"transport": "verified_cache", "path": str(final)}
+    )
+    stager = ModelStager(config, transfers=pool)
+    assert stager.prepare(
+        str(source), validate_sharding=False, transport="auto"
+    ) == str(final)
+    assert pool.prepare_and_deliver.call_args.args[1] is remote
+    assert pool.deliver.call_args.args[1] is local
+    assert stager.worker_transfers[remote.url] == remote_result

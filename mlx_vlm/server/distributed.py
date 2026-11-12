@@ -259,19 +259,41 @@ class ModelStager:
                 last[0] = now
                 report("verifying_source", **data)
 
-        final, manifest = prepare_snapshot(
-            source, names, self.config.model_dir, stop=stop, progress=verifying
-        )
         pool = self.transfers or TransferPool()
         try:
+            first_result = None
+            first = next((w for w in self.config.workers if w.rdma), None)
+            if first is not None and transport != "ssh_rsync":
+                final, manifest, first_result = pool.prepare_and_deliver(
+                    self.config,
+                    first,
+                    source,
+                    names,
+                    transport,
+                    lambda phase, **data: report(phase, node_id=first.node_id, **data),
+                    verifying,
+                    stop,
+                )
+            else:
+                final, manifest = prepare_snapshot(
+                    source, names, self.config.model_dir, stop=stop, progress=verifying
+                )
             for worker in self.config.workers:
 
                 def worker_report(phase, **data):
                     report(phase, node_id=worker.node_id, snapshot=final.name, **data)
 
-                result = pool.deliver(
-                    self.config, worker, final, manifest, transport, worker_report, stop
-                )
+                result = first_result if worker is first else None
+                if result is None:
+                    result = pool.deliver(
+                        self.config,
+                        worker,
+                        final,
+                        manifest,
+                        transport,
+                        worker_report,
+                        stop,
+                    )
                 self.worker_paths[(str(final), worker.url)] = result["path"]
                 self.worker_transfers[worker.url] = result
             return str(final)

@@ -4,6 +4,7 @@
 import atexit
 import concurrent.futures
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -301,33 +302,249 @@ class TransferPool:
             self.pairs.clear()
         atexit.unregister(self.close)
 
-    def deliver(self, config, worker, source, manifest, transport, report, stop=None):
+    def _pair(self, config, worker):
+        key = (
+            worker.url,
+            worker.ssh,
+            worker.python,
+            worker.physical_id,
+            json.dumps(worker.rdma, sort_keys=True),
+            tuple(config.ssh_options),
+            str(worker.model_dir),
+        )
+        pair = self.pairs.get(key)
+        if pair and pair.remote.process.poll() is not None:
+            self.pairs.pop(key).close()
+            pair = None
+        if pair is None:
+            if len(self.pairs) >= 8:
+                oldest = min(self.pairs, key=lambda k: self.pairs[k].last_used)
+                self.pairs.pop(oldest).close()
+            pair = self.pairs[key] = Pair(config, worker)
+        return key, pair
+
+    def prepare_and_deliver(
+        self, config, worker, source, names, transport, report, verifying, stop=None
+    ):
+        """Overlap verified-file preparation with the first peer's RDMA delivery.
+
+        Only hashes/manifests cross the queue. Private source files stay in place
+        until every send finishes; neither endpoint publishes on an error.
+        """
+        inputs = {n: store.signature((source / n).resolve()) for n in names}
+        partial_id = hashlib.sha256(
+            json.dumps(
+                [str(source.resolve()), inputs, store.CHUNK_BYTES], sort_keys=True
+            ).encode()
+        ).hexdigest()
+        ready = queue.Queue()
+        release, failed = threading.Event(), threading.Event()
+        progress_lock = threading.Lock()
+
+        class Stopping:
+            def is_set(self):
+                return failed.is_set() or (stop is not None and stop.is_set())
+
+        stopping = Stopping()
+
+        def before_publish():
+            ready.put(None)
+            while not release.wait(0.1):
+                store.cancelled(stopping)
+
+        started = time.monotonic()
+        counters = dict(
+            bytes_read=0,
+            bytes_received=0,
+            bytes_verified=0,
+            bytes_reused=0,
+            bytes_transferred=0,
+            total_bytes=sum(s[2] for s in inputs.values()),
+        )
+
+        def update(phase, *, snapshot=None, **data):
+            # Sender and receiver report from different threads. Serialize the
+            # counter snapshot and callback so clients never see counts regress.
+            with progress_lock:
+                counters.update(data)
+                elapsed = time.monotonic() - started
+                report(
+                    phase,
+                    transport="jaccl_rdma",
+                    **counters,
+                    elapsed_seconds=elapsed,
+                    throughput_bytes_per_second=counters["bytes_transferred"]
+                    / max(elapsed, 1e-9),
+                    rate_kind="logical_payload",
+                    **({"snapshot": snapshot} if snapshot is not None else {}),
+                )
+
+        pair = key = None
+        fallback = None
+        checked = 0
+        with self.lock:
+            if self.closed.is_set():
+                raise RuntimeError("Checkpoint transfer pool is closed")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                prepared = executor.submit(
+                    store.prepare_snapshot,
+                    source,
+                    names,
+                    config.model_dir,
+                    stop=stopping,
+                    progress=verifying,
+                    file_ready=lambda path, manifest: ready.put((path, manifest)),
+                    before_publish=before_publish,
+                )
+                prepared.add_done_callback(lambda future: ready.put(None))
+                try:
+                    while True:
+                        store.cancelled(stopping)
+                        try:
+                            item = ready.get(timeout=0.1)
+                        except queue.Empty:
+                            if prepared.done():
+                                break  # Warm source receipt, or preparation failed.
+                            continue
+                        if item is None:
+                            break
+                        # Stop promptly on a hashing failure, even with queued files.
+                        if prepared.done():
+                            prepared.result()
+                        path, manifest = item
+                        if fallback is not None:
+                            continue
+                        if pair is None:
+                            key, pair = self._pair(config, worker)
+                            update("connecting")
+                            try:
+                                pair.connect(stop)
+                            except TransferUnavailable as error:
+                                self.pairs.pop(key).close()
+                                pair = None
+                                if transport != "auto":
+                                    raise
+                                fallback = str(error)
+                                report(
+                                    "transport_fallback",
+                                    transport="ssh_rsync",
+                                    fallback_reason=fallback,
+                                )
+                                continue
+                            update("connected")
+                            pair.remote.call(
+                                "begin_pipeline",
+                                root=worker.model_dir or str(config.model_dir),
+                                partial_id=partial_id,
+                                stop=stop,
+                            )
+                        before_checked = checked
+
+                        def checking(data):
+                            nonlocal checked
+                            checked = before_checked + data["bytes_checked"]
+                            report(
+                                "checking_partial",
+                                transport="jaccl_rdma",
+                                bytes_checked=checked,
+                                total_bytes=counters["total_bytes"],
+                            )
+
+                        state = pair.remote.call(
+                            "file",
+                            manifest=manifest,
+                            stop=stop,
+                            progress=checking,
+                        )
+                        counters["bytes_reused"] += state["bytes_reused"]
+                        counters["bytes_verified"] += state["bytes_reused"]
+                        previous = counters.copy()
+
+                        def file_update(phase="transferring", **data):
+                            update(
+                                phase, **{k: previous[k] + v for k, v in data.items()}
+                            )
+
+                        self._copy_pair(
+                            pair,
+                            path,
+                            manifest,
+                            state,
+                            {},
+                            file_update,
+                            stopping,
+                            streaming=True,
+                        )
+                    release.set()
+                    final, manifest = prepared.result()
+                    store.cancelled(stop)
+                    if pair is not None:
+                        update("publishing", snapshot=final.name)
+                        store.cancelled(stop)
+                        published = pair.remote.call("commit", manifest=manifest)
+                        update(
+                            "worker_ready",
+                            snapshot=final.name,
+                            bytes_verified=counters["total_bytes"],
+                        )
+                        pair.last_used = time.monotonic()
+                        return (
+                            final,
+                            manifest,
+                            {
+                                "transport": "jaccl_rdma",
+                                "verified": True,
+                                "path": published["path"],
+                                "rdma_validated": pair.validated,
+                                "helper_pids": [
+                                    p.pid for p in (pair.local, pair.remote)
+                                ],
+                            },
+                        )
+                except BaseException:
+                    failed.set()
+                    if pair is not None:
+                        self.pairs.pop(key).close()
+                    raise
+                finally:
+                    release.set()
+        # Warm source receipts need no file pipeline. Only a recognized connection
+        # failure in auto mode may select SSH; data/verification failures propagate.
+        result = self.deliver(
+            config,
+            worker,
+            final,
+            manifest,
+            "ssh_rsync" if fallback is not None else transport,
+            report,
+            stop,
+            partial_id=partial_id,
+        )
+        if fallback is not None:
+            result["fallback_reason"] = fallback
+        return final, manifest, result
+
+    def deliver(
+        self,
+        config,
+        worker,
+        source,
+        manifest,
+        transport,
+        report,
+        stop=None,
+        *,
+        partial_id=None,
+    ):
         with self.lock:
             started = time.monotonic()
             store.cancelled(stop)
             if self.closed.is_set():
                 raise RuntimeError("Checkpoint transfer pool is closed")
-            key = (
-                worker.url,
-                worker.ssh,
-                worker.python,
-                worker.physical_id,
-                json.dumps(worker.rdma, sort_keys=True),
-                tuple(config.ssh_options),
-                str(worker.model_dir),
-            )
-            pair = self.pairs.get(key)
-            if pair and pair.remote.process.poll() is not None:
-                self.pairs.pop(key).close()
-                pair = None
-            if pair is None:
-                if len(self.pairs) >= 8:
-                    oldest = min(self.pairs, key=lambda k: self.pairs[k].last_used)
-                    self.pairs.pop(oldest).close()
-                pair = self.pairs[key] = Pair(config, worker)
+            key, pair = self._pair(config, worker)
             try:
                 result = self._deliver(
-                    pair, source, manifest, transport, report, stop, started
+                    pair, source, manifest, transport, report, stop, started, partial_id
                 )
                 pair.last_used = time.monotonic()
                 return result
@@ -343,7 +560,14 @@ class TransferPool:
                 pair = self.pairs[key] = Pair(config, worker)
                 try:
                     result = self._deliver(
-                        pair, source, manifest, "ssh_rsync", report, stop, started
+                        pair,
+                        source,
+                        manifest,
+                        "ssh_rsync",
+                        report,
+                        stop,
+                        started,
+                        partial_id,
                     )
                     result["fallback_reason"] = str(error)
                     return result
@@ -354,7 +578,9 @@ class TransferPool:
                 self.pairs.pop(key).close()
                 raise
 
-    def _deliver(self, pair, source, manifest, transport, report, stop, started):
+    def _deliver(
+        self, pair, source, manifest, transport, report, stop, started, partial_id=None
+    ):
         worker, config = pair.worker, pair.config
         total = sum(r["size"] for r in manifest["files"].values())
         counters = dict(
@@ -405,7 +631,12 @@ class TransferPool:
             )
 
         state = pair.remote.call(
-            "begin", root=root, manifest=manifest, stop=stop, progress=checking
+            "begin",
+            root=root,
+            manifest=manifest,
+            stop=stop,
+            progress=checking,
+            partial_id=partial_id,
         )
         if state["ready"]:
             selected = "verified_cache"
@@ -437,10 +668,30 @@ class TransferPool:
         update("connecting")
         pair.connect(stop)
         update("connected")
+        TransferPool._copy_pair(pair, source, manifest, state, counters, update, stop)
+
+    @staticmethod
+    def _copy_pair(
+        pair, source, manifest, state, counters, update, stop, *, streaming=False
+    ):
         common = dict(manifest=manifest, missing=state["missing"])
-        receiver = pair.remote.submit("receive", path=state["path"], **common)
+        receiver = pair.remote.submit(
+            "receive_file" if streaming else "receive", path=state["path"], **common
+        )
         sender = pair.local.submit(
-            "send", root=str(Path(source).parent), path=str(source), **common
+            "send_file" if streaming else "send",
+            root=str(Path(source).parent),
+            path=str(source),
+            **(
+                {
+                    "signatures": {
+                        n: store.signature(source / n) for n in manifest["files"]
+                    }
+                }
+                if streaming
+                else {}
+            ),
+            **common,
         )
 
         # Drain both streams while the file is in flight; never buffer a
@@ -448,12 +699,16 @@ class TransferPool:
         def receiving(data):
             update(
                 bytes_received=data["bytes_received"],
-                bytes_verified=state["bytes_reused"] + data["bytes_verified"],
+                bytes_verified=(0 if streaming else state["bytes_reused"])
+                + data["bytes_verified"],
                 bytes_transferred=data["bytes_received"],
             )
 
         def sending(data):
-            counters["bytes_read"] = data["bytes_read"]
+            if streaming:
+                update("transferring", bytes_read=data["bytes_read"])
+            else:
+                counters["bytes_read"] = data["bytes_read"]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             sent = pool.submit(pair.local.wait, sender, progress=sending, stop=stop)

@@ -14,6 +14,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -171,6 +172,10 @@ def copy_chunks(group, command, report):
                     with path.open(
                         "r+b" if path.exists() else "xb", buffering=0
                     ) as destination:
+                        if sys.platform == "darwin":
+                            # Streaming checkpoints should not evict the active model
+                            # or accumulate hundreds of GB in the receiver's file cache.
+                            fcntl.fcntl(destination.fileno(), fcntl.F_NOCACHE, 1)
                         destination.truncate(record["size"])
                         for index in command["missing"][name]:
                             value, view = get(ready)
@@ -244,6 +249,27 @@ def copy_chunks(group, command, report):
         halted.set()
 
 
+def check_partial(current, manifest, report):
+    checked, last_report = 0, 0
+
+    def checking(n):
+        nonlocal checked, last_report
+        checked += n
+        now = time.monotonic()
+        if now - last_report >= 0.2:
+            report(bytes_checked=checked)
+            last_report = now
+
+    missing, reused = current.missing(manifest, progress=checking)
+    report(bytes_checked=checked)
+    return {
+        "ready": False,
+        "missing": missing,
+        "bytes_reused": reused,
+        "path": str(current.partial(manifest)),
+    }
+
+
 def main():
     commands = queue.Queue()
     renewed = [time.monotonic()]
@@ -273,6 +299,8 @@ def main():
     lock = None
     current = None
     signatures = None
+    pipeline = None
+    file_manifest = None
     emit("hello", physical_id=physical_id(), pid=os.getpid(), protocol=1)
     with tempfile.TemporaryDirectory(prefix="mlx-transfer-") as scratch:
         while True:
@@ -319,15 +347,38 @@ def main():
                     if not np.array_equal(np.asarray(probe), token * 2):
                         raise ValueError("RDMA connection challenge mismatch")
                     result = {"rdma_validated": True, "mlx_version": mx.__version__}
-                elif op == "begin":
+                elif op in {"begin", "begin_pipeline"}:
                     if lock is not None:
                         raise ValueError("A checkpoint transaction is already active")
-                    current = store.SnapshotStore(command["root"])
-                    manifest = store.validate(command["manifest"])
-                    lock = (
-                        current.receipts / (store.snapshot_id(manifest) + ".lock")
-                    ).open("a")
+                    current = store.SnapshotStore(
+                        command["root"], partial_id=command.get("partial_id")
+                    )
+                    pipeline = {} if op == "begin_pipeline" else None
+                    file_manifest = None
+                    signatures = {}
+                    if pipeline is not None:
+                        if current.partial_id is None:
+                            raise ValueError("Missing checkpoint transaction ID")
+                        manifest = None
+                    else:
+                        manifest = store.validate(command["manifest"])
+                        # Resume pre-pipeline transfers when the complete source
+                        # manifest was already cached before this operation.
+                        if (
+                            current.partial_id is not None
+                            and (
+                                current.root
+                                / (".partial-" + store.snapshot_id(manifest))
+                            ).exists()
+                        ):
+                            current = store.SnapshotStore(command["root"])
+                    lock_id = current.partial_id or store.snapshot_id(manifest)
+                    lock = (current.receipts / (lock_id + ".lock")).open("a")
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if pipeline is not None:
+                        current.writable_partial(None)
+                        emit("result", id=request)
+                        continue
                     final = current.existing(manifest)
                     if final:
                         lock.close()
@@ -335,28 +386,32 @@ def main():
                         result = {"ready": True, "path": str(final)}
                     else:
                         current.writable_partial(manifest)
-                        checked, last_report = 0, 0
-
-                        def checking(n):
-                            nonlocal checked, last_report
-                            checked += n
-                            now = time.monotonic()
-                            if now - last_report >= 0.2:
-                                report(bytes_checked=checked)
-                                last_report = now
-
-                        missing, reused = current.missing(manifest, progress=checking)
-                        report(bytes_checked=checked)
-                        result = {
-                            "ready": False,
-                            "missing": missing,
-                            "bytes_reused": reused,
-                            "path": str(current.partial(manifest)),
-                        }
-                elif op in {"send", "receive"}:
+                        result = check_partial(current, manifest, report)
+                elif op == "file":
+                    if lock is None or pipeline is None or file_manifest is not None:
+                        raise ValueError("No idle pipeline transaction")
+                    manifest = store.validate(command["manifest"])
+                    if (
+                        len(manifest["files"]) != 1
+                        or pipeline.keys() & manifest["files"].keys()
+                    ):
+                        raise ValueError("Duplicate or invalid pipeline file")
+                    file_manifest = manifest
+                    result = check_partial(current, manifest, report)
+                elif op in {"send", "receive", "send_file", "receive_file"}:
                     if group is None:
                         raise ValueError("No validated transfer group")
-                    if op == "send":
+                    if op == "send_file":
+                        store.validate(command["manifest"])
+                        if any(
+                            store.signature(
+                                store.safe_path(Path(command["path"]), name)
+                            )
+                            != command["signatures"].get(name)
+                            for name in command["manifest"]["files"]
+                        ):
+                            raise ValueError("Prepared source file changed")
+                    elif op == "send":
                         source = store.SnapshotStore(command["root"])
                         final = source.existing(command["manifest"])
                         if final is None or str(final) != command["path"]:
@@ -366,16 +421,34 @@ def main():
                         or str(current.partial(command["manifest"])) != command["path"]
                     ):
                         raise ValueError("No matching checkpoint transaction")
-                    signatures = copy_chunks(group, command, report)
+                    if op == "receive_file" and command["manifest"] != file_manifest:
+                        raise ValueError("Unexpected pipeline file manifest")
+                    verified = copy_chunks(group, command, report)
+                    if op == "receive_file":
+                        signatures.update(verified)
+                        pipeline.update(file_manifest["files"])
+                        file_manifest = None
+                    else:
+                        signatures = verified
                 elif op == "commit":
                     if lock is None or signatures is None:
                         raise ValueError("No verified transfer to commit")
-                    result = {
-                        "path": str(current.publish(command["manifest"], signatures))
-                    }
+                    manifest = store.validate(command["manifest"])
+                    if pipeline is not None and (
+                        file_manifest is not None or pipeline != manifest["files"]
+                    ):
+                        raise ValueError("Incomplete or changed pipeline manifest")
+                    # Another preparation may already have published the same bytes.
+                    final = current.existing(manifest) if pipeline is not None else None
+                    if final:
+                        shutil.rmtree(current.partial(manifest))
+                    else:
+                        final = current.publish(manifest, signatures)
+                    result = {"path": str(final)}
                     lock.close()
                     lock = None
                     signatures = None
+                    pipeline = None
                 elif op == "verify":
                     if lock is None:
                         raise ValueError("No checkpoint transaction")

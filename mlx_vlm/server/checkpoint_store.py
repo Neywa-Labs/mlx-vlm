@@ -16,6 +16,7 @@ import os
 import re
 import stat
 import sys
+import threading
 import uuid
 from collections import deque
 from pathlib import Path
@@ -160,9 +161,12 @@ def verify_chunks(path, record, chunk, *, stop=None, progress=None):
 
 
 class SnapshotStore:
-    def __init__(self, root):
+    def __init__(self, root, *, partial_id=None):
         self.root = private_directory(root)
         self.receipts = private_directory(self.root / ".verified")
+        if partial_id is not None and not re.fullmatch(r"[a-f0-9]{64}", partial_id):
+            raise ValueError("Invalid checkpoint transaction ID")
+        self.partial_id = partial_id
 
     def existing(self, manifest, *, stop=None, progress=None):
         digest = snapshot_id(manifest)
@@ -210,7 +214,12 @@ class SnapshotStore:
         )
 
     def partial(self, manifest):
-        path = self.root / (".partial-" + snapshot_id(manifest))
+        digest = (
+            "pipeline-" + self.partial_id
+            if self.partial_id is not None
+            else snapshot_id(manifest)
+        )
+        path = self.root / (".partial-" + digest)
         private_directory(path)
         return path
 
@@ -302,77 +311,148 @@ def _clone(source, target):
     return False
 
 
+def _hub_sha256(path):
+    # Hub cache blob names are their ETags: SHA-256 for LFS, Git SHA-1 otherwise.
+    # These are expected hashes, never proof that the cached bytes are intact.
+    if (
+        path.parent.name == "blobs"
+        and path.parent.parent.name.startswith("models--")
+        and re.fullmatch(r"[a-f0-9]{64}", path.name)
+    ):
+        return path.name
+    return None
+
+
 def prepare_snapshot(
-    source, names, root, *, stop=None, progress=None, chunk=CHUNK_BYTES
+    source,
+    names,
+    root,
+    *,
+    stop=None,
+    progress=None,
+    chunk=CHUNK_BYTES,
+    file_ready=None,
+    before_publish=None,
 ):
     """Hash once, create an independent sealed snapshot, persist its chunk manifest."""
     store = SnapshotStore(root)
     source = Path(source).resolve()
     # Follow Hub blob links for the input only; receipts always describe private copies.
     inputs = {n: signature((source / n).resolve()) for n in names}
+    expected = {n: _hub_sha256((source / n).resolve()) for n in names}
     key = hashlib.sha256(str(source).encode()).hexdigest()
     index = store.receipts / ("source-" + key + ".json")
     try:
         cached = json.loads(index.read_text())
-        if cached["inputs"] == inputs and cached["manifest"]["chunk_bytes"] == chunk:
+        if (
+            cached["inputs"] == inputs
+            and cached["manifest"]["chunk_bytes"] == chunk
+            and all(
+                not h or cached["manifest"]["files"][n]["sha256"] == h
+                for n, h in expected.items()
+            )
+        ):
             final = store.existing(cached["manifest"], stop=stop)
             if final:
                 return final, cached["manifest"]
     except (FileNotFoundError, KeyError, json.JSONDecodeError):
         pass
     temporary = private_directory(store.root / (".building-" + uuid.uuid4().hex))
-    files, read, verified = {}, 0, 0
+    read = 0
+    verified_signatures = {}
+    progress_lock, failed = threading.Lock(), threading.Event()
+
+    def prepare_file(name):
+        nonlocal read
+        cancelled(stop)
+        cancelled(failed)
+        src = (source / name).resolve()
+        target = safe_path(temporary, name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cloned = _clone(src, target)
+        digest, chunks, pending = hashlib.sha256(), [], deque()
+        output = None if cloned else target.open("xb", buffering=0)
+        try:
+            with (target if cloned else src).open("rb", buffering=0) as stream:
+                while data := stream.read(chunk):
+                    cancelled(stop)
+                    cancelled(failed)
+                    if output:
+                        view = memoryview(data)
+                        while view:
+                            count = output.write(view)
+                            if not count:
+                                raise OSError("Short checkpoint write")
+                            view = view[count:]
+                    pending.append(hash_pool.submit(hashlib.sha256, data))
+                    digest.update(data)
+                    if len(pending) >= 2:
+                        chunks.append(pending.popleft().result().hexdigest())
+                    # Serialize callbacks as well as counters; consumers see monotonic
+                    # totals even when several files complete chunks simultaneously.
+                    with progress_lock:
+                        read += len(data)
+                        if progress:
+                            progress(bytes_read=read, bytes_verified=read)
+            chunks.extend(f.result().hexdigest() for f in pending)
+            if expected[name] and digest.hexdigest() != expected[name]:
+                raise ValueError(f"Hugging Face checksum mismatch: {name}")
+            if output:
+                flush_file(output)
+            else:
+                with target.open("rb") as cloned_file:
+                    flush_file(cloned_file)
+        finally:
+            if output:
+                output.close()
+        if signature(src) != inputs[name]:
+            raise ValueError("Source checkpoint changed during preparation")
+        verified_signatures[name] = signature(target)
+        return {
+            "size": target.stat().st_size,
+            "sha256": expected[name] or digest.hexdigest(),
+            "chunks": chunks,
+        }
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            for name in names:
-                cancelled(stop)
-                src = (source / name).resolve()
-                target = safe_path(temporary, name)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                cloned = _clone(src, target)
-                digest, chunks, pending = hashlib.sha256(), [], deque()
-                output = None if cloned else target.open("xb", buffering=0)
-                try:
-                    with (target if cloned else src).open("rb", buffering=0) as stream:
-                        while data := stream.read(chunk):
-                            cancelled(stop)
-                            if output:
-                                view = memoryview(data)
-                                while view:
-                                    count = output.write(view)
-                                    if not count:
-                                        raise OSError("Short checkpoint write")
-                                    view = view[count:]
-                            pending.append(
-                                pool.submit(
-                                    lambda block: hashlib.sha256(block).hexdigest(),
-                                    data,
-                                )
-                            )
-                            digest.update(data)
-                            if len(pending) >= 4:
-                                chunks.append(pending.popleft().result())
-                            read += len(data)
-                            verified += len(data)
-                            if progress:
-                                progress(bytes_read=read, bytes_verified=verified)
-                        chunks.extend(f.result() for f in pending)
-                    if output:
-                        flush_file(output)
-                    else:
-                        with target.open("rb") as cloned_file:
-                            flush_file(cloned_file)
-                finally:
-                    if output:
-                        output.close()
-                if signature(src) != inputs[name]:
-                    raise ValueError("Source checkpoint changed during preparation")
-                files[name] = {
-                    "size": target.stat().st_size,
-                    "sha256": digest.hexdigest(),
-                    "chunks": chunks,
-                }
+        # Whole-file SHA-256 has a serial dependency within each file. Parallelize
+        # files, not just chunks, with at most eight readers and bounded buffers.
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=4) as hash_pool,
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, os.cpu_count() or 1)
+            ) as pool,
+        ):
+            futures = {pool.submit(prepare_file, n): n for n in names}
+            files = {}
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    name = futures[future]
+                    files[name] = future.result()
+                    if file_ready:
+                        file_ready(
+                            temporary,
+                            {
+                                "version": 1,
+                                "chunk_bytes": chunk,
+                                "files": {name: files[name]},
+                            },
+                        )
+            except BaseException:
+                failed.set()
+                for future in futures:
+                    future.cancel()
+                raise
+        cancelled(stop)
+        files = {n: files[n] for n in names}
         manifest = {"version": 1, "chunk_bytes": chunk, "files": files}
+        # Keep the private source paths stable until all in-flight reads finish.
+        # Warm receipt reuse above invokes neither callback.
+        if before_publish:
+            before_publish()
+        cancelled(stop)
+        if any(signature(temporary / n) != verified_signatures[n] for n in names):
+            raise ValueError("Prepared checkpoint changed before publication")
         final = store.existing(manifest, stop=stop)
         if final is None:
             partial = store.root / (".partial-" + snapshot_id(manifest))
@@ -381,9 +461,7 @@ def prepare_snapshot(
                     "Local partial checkpoint exists; inspect it before rebuilding"
                 )
             os.rename(temporary, partial)
-            final = store.publish(
-                manifest, {n: signature(safe_path(partial, n)) for n in names}
-            )
+            final = store.publish(manifest, verified_signatures)
         atomic_json(index, {"inputs": inputs, "manifest": manifest})
         return final, manifest
     finally:
