@@ -1748,9 +1748,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
-@pytest.mark.parametrize("native_metadata", [False, True])
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case, native_metadata
+    tmp_path, mistral_large4_case, config_filename
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1836,17 +1836,16 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    if native_metadata:
-        params = model_case("mistral_large4")["native_params"]
-        (tmp_path / "params.json").write_text(json.dumps(params))
-        config = load_config(tmp_path)
-    else:
-        (tmp_path / "config.json").write_text(json.dumps(config))
+    if config_filename == "params.json":
+        from mlx_vlm.models.mistral_large4.config import config_from_params
+
+        config = config_from_params(model_case("mistral_large4")["native_params"])
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
-    if native_metadata:
+    if config_filename == "params.json":
         assert not (tmp_path / "config.json").exists()
-        assert json.loads((tmp_path / "params.json").read_text()) == params
+        assert json.loads((tmp_path / "params.json").read_text()) == config
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -3791,23 +3790,10 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-@pytest.mark.parametrize("family", ["mistral_large3", "mistral_large4"])
-def test_load_config_native_mistral_params(tmp_path, family):
-    params = model_case("mistral_large4")["native_params"]
-    if family == "mistral_large3":
-        params.pop("dsa")
+@pytest.mark.parametrize("params", [{"dim": 8}, {"dim": 8, "dsa": {"topk": 4}}])
+def test_load_config_preserves_params_schema(tmp_path, params):
     (tmp_path / "params.json").write_text(json.dumps(params))
-    (tmp_path / "generation_config.json").write_text(
-        json.dumps({"eos_token_id": 2, "temperature": 0.7})
-    )
-
-    config = load_config(tmp_path)
-    module, model_type = get_model_and_args(config)
-    assert model_type == family
-    assert config["text_config"]["hidden_size"] == params["dim"]
-    assert config["eos_token_id"] == 2
-    assert config["temperature"] == 0.7
-    assert module.ModelConfig.from_dict(config).model_type == family
+    assert load_config(tmp_path) == params
     assert not (tmp_path / "config.json").exists()
     assert json.loads((tmp_path / "params.json").read_text()) == params
 
@@ -3876,7 +3862,10 @@ def test_mistral_large4_config_rejects_invalid_native_layouts(field, value, mess
         config_from_params(params)
 
 
-def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+def test_load_config_applies_generation_config_sampling_defaults(
+    tmp_path, config_filename
+):
     generation_config = {
         "eos_token_id": [2, 3],
         "do_sample": True,
@@ -3885,7 +3874,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
         "top_k": 64,
         "max_new_tokens": 4096,
     }
-    (tmp_path / "config.json").write_text(
+    (tmp_path / config_filename).write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}), encoding="utf-8"
     )
     (tmp_path / "generation_config.json").write_text(
