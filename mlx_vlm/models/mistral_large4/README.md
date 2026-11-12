@@ -10,10 +10,11 @@ the Pixtral encoder and Mistral projector.
 
 Use a model directory with a standard `config.json` (`model_type: mistral_large4`,
 `text_config`, and `vision_config`), tokenizer/processor files, and safetensors.
-The shared loader also accepts the original release's `params.json`, normalizing
-it in memory, and `consolidated.safetensors` when no converted weights are present.
-An existing `config.json` takes precedence. Tokenizer/processor files are still
-required for generation; the source checkpoint files remain unchanged.
+The original Mistral release uses `params.json`; normalize it with
+`mlx_vlm.models.mistral_large4.config.config_from_params` and save the result as
+`config.json` before loading. Use standard checkpoint filenames such as
+`model.safetensors`. The shared loader requires the prepared configuration and
+tokenizer/processor files.
 
 The model sanitizer maps native weight names and stacks experts. The shared
 quantization converter preserves packed NVFP4 expert weights, block scales, and

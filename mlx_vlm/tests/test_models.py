@@ -1748,9 +1748,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
-@pytest.mark.parametrize("native_metadata", [False, True])
+@pytest.mark.parametrize("normalize_params", [False, True])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case, native_metadata
+    tmp_path, mistral_large4_case, normalize_params
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1836,33 +1836,13 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    if native_metadata:
-        params = model_case("mistral_large4")["native_params"]
-        (tmp_path / "params.json").write_text(json.dumps(params))
-        weight_path = tmp_path / "consolidated.safetensors"
-    else:
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        weight_path = tmp_path / "model.safetensors"
-    mx.save_safetensors(str(weight_path), native)
-    model = load_model(tmp_path)
-    if native_metadata:
-        assert not (tmp_path / "config.json").exists()
-        assert json.loads((tmp_path / "params.json").read_text()) == params
-        from tokenizers import Tokenizer
-        from tokenizers.models import WordLevel
-        from transformers import PreTrainedTokenizerFast
+    if normalize_params:
+        from mlx_vlm.models.mistral_large4.config import config_from_params
 
-        tokenizer = Tokenizer(
-            WordLevel({"[UNK]": 0, "hello": 1, "</s>": 2}, unk_token="[UNK]")
-        )
-        PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer, unk_token="[UNK]", eos_token="</s>"
-        ).save_pretrained(tmp_path)
-        group = mx.distributed.init()
-        assert group.size() == 1
-        model, processor = sharded_load(tmp_path, tensor_group=group)
-        assert processor("hello")["input_ids"] == [1]
-        assert not (tmp_path / "config.json").exists()
+        config = config_from_params(model_case("mistral_large4")["native_params"])
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    model = load_model(tmp_path)
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -3807,44 +3787,30 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-@pytest.mark.parametrize("family", ["mistral_large3", "mistral_large4"])
-def test_load_config_normalizes_native_mistral_params(tmp_path, family):
-    params = model_case("mistral_large4")["native_params"]
-    if family == "mistral_large3":
-        params.pop("dsa")
-    params["mtp"] = {"n_layers": 3, "block_size": 4}
-    (tmp_path / "params.json").write_text(json.dumps(params))
-    (tmp_path / "generation_config.json").write_text(
-        json.dumps({"eos_token_id": 2, "temperature": 0.7})
-    )
+def test_mistral_large4_config_from_params():
+    from mlx_vlm.models.mistral_large4.config import config_from_params
 
-    config = load_config(tmp_path)
+    params = model_case("mistral_large4")["native_params"]
+    params["mtp"] = {"n_layers": 3, "block_size": 4}
+    original = copy.deepcopy(params)
+
+    config = config_from_params(params)
     module, model_type = get_model_and_args(config)
-    assert model_type == family
+    assert model_type == "mistral_large4"
     assert config["text_config"]["hidden_size"] == params["dim"]
     assert (
         config["vision_config"]["hidden_size"]
         == params["vision_encoder"]["hidden_size"]
     )
-    assert config["eos_token_id"] == 2
-    assert config["temperature"] == 0.7
-    if family == "mistral_large4":
-        text = module.TextConfig.from_dict(config["text_config"])
-        expected = build_config(module, model_case(family)["config"]).text_config
-        assert asdict(text) == {
-            **asdict(expected),
-            "nvfp4": True,
-            "mtp_config": params["mtp"],
-        }
-        assert config["quantization_config"] == params["quantization_config"]
-    assert not (tmp_path / "config.json").exists()
-    assert json.loads((tmp_path / "params.json").read_text()) == params
-
-
-def test_load_config_prefers_standard_config_to_native_params(tmp_path):
-    (tmp_path / "params.json").write_text("invalid native metadata")
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "demo"}))
-    assert load_config(tmp_path) == {"model_type": "demo"}
+    text = module.TextConfig.from_dict(config["text_config"])
+    expected = build_config(module, model_case("mistral_large4")["config"]).text_config
+    assert asdict(text) == {
+        **asdict(expected),
+        "nvfp4": True,
+        "mtp_config": params["mtp"],
+    }
+    assert config["quantization_config"] == params["quantization_config"]
+    assert params == original
 
 
 @pytest.mark.parametrize(
@@ -3855,17 +3821,16 @@ def test_load_config_prefers_standard_config_to_native_params(tmp_path):
         ("kv_sharing", {"source_layers_str": "0,1,2,3,4,5,6,8"}, "Invalid KV source"),
     ],
 )
-def test_load_config_rejects_invalid_native_mistral_layouts(
-    tmp_path, field, value, message
-):
+def test_mistral_large4_config_rejects_invalid_native_layouts(field, value, message):
+    from mlx_vlm.models.mistral_large4.config import config_from_params
+
     params = model_case("mistral_large4")["native_params"]
     if isinstance(value, dict):
         params[field].update(value)
     else:
         params[field] = value
-    (tmp_path / "params.json").write_text(json.dumps(params))
     with pytest.raises(ValueError, match=message):
-        load_config(tmp_path)
+        config_from_params(params)
 
 
 def test_load_config_applies_generation_config_sampling_defaults(tmp_path):

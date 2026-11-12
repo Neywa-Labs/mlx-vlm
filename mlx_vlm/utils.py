@@ -433,13 +433,6 @@ def load_model(
             for wf in glob.glob(str(model_path / "*.safetensors"))
             if not wf.endswith("consolidated.safetensors")
         ]
-    if not weight_files and config.get("model_type") in (
-        "mistral_large3",
-        "mistral_large4",
-    ):
-        native_weights = model_path / "consolidated.safetensors"
-        if native_weights.is_file():
-            weight_files = [str(native_weights)]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -954,7 +947,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         dict: Model configuration
 
     Raises:
-        FileNotFoundError: If neither config.json nor native params.json is found
+        FileNotFoundError: If config.json is not found at the path
     """
     if isinstance(model_path, str):
         model_path = get_model_path(
@@ -964,19 +957,8 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         )
 
     try:
-        if (model_path / "config.json").is_file():
-            with open(model_path / "config.json", encoding="utf-8") as f:
-                config = json.load(f)
-        else:
-            with open(model_path / "params.json", encoding="utf-8") as f:
-                params = json.load(f)
-            # Native Mistral metadata is normalized by its model family, so
-            # discovery and loading resolve the same architecture and settings.
-            if "dsa" in params:
-                from .models.mistral_large4.config import config_from_params
-            else:
-                from .models.mistral_large3.config import config_from_params
-            config = config_from_params(params)
+        with open(model_path / "config.json", encoding="utf-8") as f:
+            config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
