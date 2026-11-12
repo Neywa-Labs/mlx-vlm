@@ -80,6 +80,26 @@ def validate(manifest):
     return manifest
 
 
+def validate_layout(layout):
+    """Validate sizes before the sender has calculated the final manifest."""
+    chunk = layout.get("chunk_bytes")
+    files = layout.get("files")
+    if type(chunk) is not int or not 0 < chunk <= 64 * 1024 * 1024:
+        raise ValueError("Invalid checkpoint chunk size")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("Empty checkpoint layout")
+    for name, record in files.items():
+        safe_path(Path("/nonexistent-mlx-manifest-validation"), name)
+        if type(record.get("size")) is not int or record["size"] < 0:
+            raise ValueError("Invalid checkpoint file size")
+        expected = record.get("expected_sha256")
+        if expected is not None and (
+            not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected)
+        ):
+            raise ValueError("Invalid expected checkpoint checksum")
+    return layout
+
+
 def snapshot_id(manifest):
     validate(manifest)
     return hashlib.sha256(
@@ -331,8 +351,7 @@ def prepare_snapshot(
     stop=None,
     progress=None,
     chunk=CHUNK_BYTES,
-    file_ready=None,
-    before_publish=None,
+    stream=None,
 ):
     """Hash once, create an independent sealed snapshot, persist its chunk manifest."""
     store = SnapshotStore(root)
@@ -415,42 +434,62 @@ def prepare_snapshot(
         }
 
     try:
-        # Whole-file SHA-256 has a serial dependency within each file. Parallelize
-        # files, not just chunks, with at most eight readers and bounded buffers.
-        with (
-            concurrent.futures.ThreadPoolExecutor(max_workers=4) as hash_pool,
-            concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, os.cpu_count() or 1)
-            ) as pool,
-        ):
-            futures = {pool.submit(prepare_file, n): n for n in names}
-            files = {}
-            try:
-                for future in concurrent.futures.as_completed(futures):
-                    name = futures[future]
-                    files[name] = future.result()
-                    if file_ready:
-                        file_ready(
-                            temporary,
-                            {
-                                "version": 1,
-                                "chunk_bytes": chunk,
-                                "files": {name: files[name]},
-                            },
-                        )
-            except BaseException:
-                failed.set()
-                for future in futures:
-                    future.cancel()
-                raise
+        if stream:
+            # Clone privately before sending. On APFS this does not read the bytes;
+            # other filesystems retain a bounded copy to isolate mutable sources.
+            for name in names:
+                cancelled(stop)
+                target = safe_path(temporary, name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not _clone((source / name).resolve(), target):
+                    with (source / name).open("rb") as src, target.open("xb") as dst:
+                        while data := src.read(chunk):
+                            cancelled(stop)
+                            dst.write(data)
+                        flush_file(dst)
+                verified_signatures[name] = signature(target)
+            layout = {
+                "chunk_bytes": chunk,
+                "files": {
+                    n: {"size": inputs[n][2], "expected_sha256": expected[n]}
+                    for n in names
+                },
+            }
+            manifest = validate(stream(temporary, layout))
+            if manifest["chunk_bytes"] != chunk or set(manifest["files"]) != set(names):
+                raise ValueError("Unexpected streamed checkpoint manifest")
+            for name in names:
+                record = manifest["files"][name]
+                if record["size"] != inputs[name][2] or (
+                    expected[name] and record["sha256"] != expected[name]
+                ):
+                    raise ValueError("Streamed checkpoint does not match source")
+        else:
+            # Whole-file SHA-256 is serial within a file; use bounded file parallelism.
+            with (
+                concurrent.futures.ThreadPoolExecutor(max_workers=4) as hash_pool,
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(8, os.cpu_count() or 1)
+                ) as pool,
+            ):
+                futures = {pool.submit(prepare_file, n): n for n in names}
+                files = {}
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        files[futures[future]] = future.result()
+                except BaseException:
+                    failed.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
+            manifest = {
+                "version": 1,
+                "chunk_bytes": chunk,
+                "files": {n: files[n] for n in names},
+            }
         cancelled(stop)
-        files = {n: files[n] for n in names}
-        manifest = {"version": 1, "chunk_bytes": chunk, "files": files}
-        # Keep the private source paths stable until all in-flight reads finish.
-        # Warm receipt reuse above invokes neither callback.
-        if before_publish:
-            before_publish()
-        cancelled(stop)
+        if any(signature((source / n).resolve()) != inputs[n] for n in names):
+            raise ValueError("Source checkpoint changed during preparation")
         if any(signature(temporary / n) != verified_signatures[n] for n in names):
             raise ValueError("Prepared checkpoint changed before publication")
         final = store.existing(manifest, stop=stop)

@@ -270,10 +270,13 @@ On the first distributed request for a model/revision:
    a filename alone cannot establish cache integrity. Git SHA-1 blob IDs are not
    treated as SHA-256. Hub symlinks become private copies on each machine.
 4. It reuses a verified snapshot on each peer or transfers it with the selected
-   JACCL RDMA or SSH/rsync transport. For the first RDMA-capable peer, each file
-   starts transferring as soon as its source checksums are ready, while other
-   files are still being hashed. The source's private staging paths remain stable
-   until sending finishes. No checkpoint is published until every file passes;
+   JACCL RDMA or SSH/rsync transport. For the first RDMA-capable peer, up to
+   eight files stream in parallel: each source buffer is read once, hashed, and
+   sent through the dedicated transfer group. Two bounded CPU buffers per file
+   keep hashing ahead of transmission. The receiver verifies chunk hashes while
+   writing, then compares its completed chunk manifest with the sender's manifest
+   over the authenticated SSH control channel. No checkpoint is published until
+   every file passes its whole-file and chunk checks;
    later peers use the completed manifest. Bounded RDMA receiver buffers overlap
    verification and sequential disk writes; macOS uses uncached streaming writes
    to avoid retaining a checkpoint's worth of file-cache pages. Checksums and
@@ -289,13 +292,15 @@ commit for reproducibility and restart the coordinator when intentionally
 refreshing a moving Hub branch or an edited local directory. Staged snapshots
 are immutable and are not automatically deleted. Unchanged, sealed snapshots reuse
 verification receipts without rereading weights. A fresh snapshot still requires
-one source scan to validate whole-file hashes and build the chunk checksums used
-for resumable transfers; Hugging Face does not supply those chunk checksums.
-That scan overlaps the first peer's RDMA delivery instead of blocking all payload
-transfer. It remains a separate read from the sender's read, and SSH/rsync still
-waits for the complete source manifest. Progress events for source verification
-and transfer can interleave. Interrupted file pipelines recheck existing partial
-chunks against the newly verified source manifests before reusing them.
+whole-file and chunk verification; Hugging Face does not supply chunk checksums.
+For the first RDMA peer, verification uses the same source buffers as transmission,
+removing the separate preparatory read. APFS copy-on-write clones isolate the
+source without copying its contents; other filesystems require a bounded private
+copy first. SSH/rsync still waits for the complete source manifest. During RDMA
+streaming, `bytes_read`, `bytes_received`, `bytes_verified` and `bytes_reused`
+report actual work under the transfer phase. Interrupted streams inspect actual
+partial bytes and compare them with newly calculated source chunk hashes before
+reusing them; changed chunks are retransmitted.
 Workers currently receive the complete checkpoint. Delivering only rank-local
 weights requires a model-aware tensor partition format: Hub shard filenames do
 not identify inference ranks.

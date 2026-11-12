@@ -249,6 +249,289 @@ def copy_chunks(group, command, report):
         halted.set()
 
 
+def stream_chunks(group, command, report):
+    """Hash each source byte as it enters a bounded, striped RDMA pipeline."""
+    import mlx.core as mx
+    import numpy as np
+
+    layout = store.validate_layout(command["layout"])
+    root, chunk = Path(command["path"]), layout["chunk_bytes"]
+    sending = group.rank() == 0
+    stream = mx.new_stream(mx.cpu)
+    halted, lock = threading.Event(), threading.Lock()
+    ready = queue.Queue(2)
+    errors, records, signatures = [], {}, {}
+    counts = dict(bytes_read=0, bytes_received=0, bytes_verified=0, bytes_reused=0)
+    last = 0
+
+    def progress(force=False, **data):
+        nonlocal last
+        with lock:
+            for key, value in data.items():
+                counts[key] += value
+            now = time.monotonic()
+            if force or now - last >= 0.2:
+                report(**counts)
+                last = now
+
+    def exchange(q, value=None, *, put=False):
+        while not halted.is_set():
+            try:
+                return q.put(value, timeout=0.1) if put else q.get(timeout=0.1)
+            except (queue.Empty, queue.Full):
+                pass
+        raise errors[0] if errors else RuntimeError("Transfer pipeline failed")
+
+    def reader(name, buffers, idle, outgoing):
+        try:
+            path = store.safe_path(root, name)
+            before = store.signature(path)
+            record = layout["files"][name]
+            if before[2] != record["size"]:
+                raise ValueError("Source checkpoint size changed")
+            digest, hashes = hashlib.sha256(), []
+            with path.open("rb", buffering=0) as source:
+                for offset in range(0, record["size"], chunk):
+                    slot = exchange(idle)
+                    n = min(chunk, record["size"] - offset)
+                    view = buffers[slot][1][:n]
+                    got = 0
+                    while got < n:
+                        count = source.readinto(view[got:])
+                        if not count:
+                            raise OSError("Short checkpoint read")
+                        got += count
+                    digest.update(view)
+                    hashed = hashlib.sha256(view).hexdigest()
+                    hashes.append(hashed)
+                    progress(bytes_read=n)
+                    exchange(outgoing, (slot, hashed), put=True)
+                if (
+                    record.get("expected_sha256")
+                    and digest.hexdigest() != record["expected_sha256"]
+                ):
+                    raise ValueError(f"Hugging Face checksum mismatch: {name}")
+                store.flush_file(source)
+            if store.signature(path) != before:
+                raise ValueError("Source checkpoint changed during transfer")
+            records[name] = {
+                "size": record["size"],
+                "sha256": digest.hexdigest(),
+                "chunks": hashes,
+            }
+        except BaseException as error:
+            errors.append(error)
+            halted.set()
+            raise
+
+    def writer():
+        destinations, pending = {}, deque()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as hash_pool:
+
+                def check(view, expected):
+                    if hashlib.sha256(view).hexdigest() != expected:
+                        raise ValueError("Checkpoint chunk checksum mismatch")
+                    return len(view)
+
+                while True:
+                    item = exchange(ready)
+                    if item is None:
+                        break
+                    name, index, expected, value, view = item
+                    record = layout["files"][name]
+                    if name not in destinations:
+                        path = store.safe_path(root, name)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        destination = path.open(
+                            "r+b" if path.exists() else "xb", buffering=0
+                        )
+                        destinations[name] = destination
+                        if sys.platform == "darwin":
+                            fcntl.fcntl(destination.fileno(), fcntl.F_NOCACHE, 1)
+                        destination.truncate(record["size"])
+                        records[name] = {"size": record["size"], "chunks": []}
+                    destination = destinations[name]
+                    destination.seek(index * chunk)
+                    if view is None:
+                        # Recheck reused bytes while consuming the sender's final hash.
+                        view = memoryview(
+                            destination.read(min(chunk, record["size"] - index * chunk))
+                        )
+                        progress(bytes_reused=len(view))
+                    else:
+                        remaining = view
+                        while remaining:
+                            count = destination.write(remaining)
+                            if not count:
+                                raise OSError("Short checkpoint write")
+                            remaining = remaining[count:]
+                    pending.append(hash_pool.submit(check, view, expected))
+                    records[name]["chunks"].append(expected)
+                    if len(pending) >= 4:
+                        progress(bytes_verified=pending.popleft().result())
+                while pending:
+                    progress(bytes_verified=pending.popleft().result())
+            for name, record in layout["files"].items():
+                path = store.safe_path(root, name)
+                if name not in destinations:  # Empty files have no payload chunks.
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    destinations[name] = path.open("wb", buffering=0)
+                    records[name] = {"size": 0, "chunks": []}
+                store.flush_file(destinations[name])
+                signatures[name] = store.signature(path)
+        except BaseException as error:
+            errors.append(error)
+            halted.set()
+        finally:
+            for destination in destinations.values():
+                destination.close()
+
+    thread = None
+    if not sending:
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+    names = sorted(layout["files"], key=lambda n: (-layout["files"][n]["size"], n))
+    readers = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    try:
+        # Eight files in parallel preserve whole-file SHA-256 throughput. Each lane
+        # owns two 16 MiB CPU buffers; source size never determines memory usage.
+        for start in range(0, len(names), 8):
+            lanes = names[start : start + 8]
+            buffers, idles, outgoing, futures = {}, {}, {}, []
+            if sending:
+                for name in lanes:
+                    buffers[name], idles[name], outgoing[name] = (
+                        [],
+                        queue.Queue(2),
+                        queue.Queue(2),
+                    )
+                    for slot in range(2):
+                        value = mx.zeros((chunk,), mx.uint8, stream=mx.cpu)
+                        mx.eval(value)
+                        view = memoryview(np.asarray(value))
+                        if view.readonly:
+                            raise RuntimeError("MLX CPU buffers are not writable")
+                        buffers[name].append((value, view))
+                        idles[name].put(slot)
+                    futures.append(
+                        readers.submit(
+                            reader, name, buffers[name], idles[name], outgoing[name]
+                        )
+                    )
+            rounds = max(
+                (layout["files"][n]["size"] + chunk - 1) // chunk for n in lanes
+            )
+            for index in range(rounds):
+                active = [
+                    n for n in lanes if index * chunk < layout["files"][n]["size"]
+                ]
+                if sending:
+                    batch, header = [], bytearray()
+                    for name in active:
+                        slot, hashed = exchange(outgoing[name])
+                        reused = command["partial_hashes"][name][index] == hashed
+                        header.extend(bytes([int(reused)]) + bytes.fromhex(hashed))
+                        batch.append((name, slot, reused))
+                    mx.eval(
+                        mx.distributed.send(
+                            mx.array(np.frombuffer(header, dtype=np.uint8)),
+                            1,
+                            group=group,
+                            stream=stream,
+                        )
+                    )
+                    for name, slot, reused in batch:
+                        n = min(chunk, layout["files"][name]["size"] - index * chunk)
+                        if not reused:
+                            value = buffers[name][slot][0]
+                            mx.eval(
+                                mx.distributed.send(
+                                    value if n == chunk else value[:n],
+                                    1,
+                                    group=group,
+                                    stream=stream,
+                                )
+                            )
+                        exchange(idles[name], slot, put=True)
+                else:
+                    header = mx.distributed.recv(
+                        (33 * len(active),), mx.uint8, 0, group=group, stream=stream
+                    )
+                    mx.eval(header)
+                    header = np.asarray(header).tobytes()
+                    pending = deque()
+
+                    def consume():
+                        name, expected, value = pending.popleft()
+                        if value is None:
+                            view = None
+                        else:
+                            mx.eval(value)
+                            view = memoryview(np.asarray(value))
+                            progress(bytes_received=len(view))
+                        exchange(ready, (name, index, expected, value, view), put=True)
+
+                    for lane, name in enumerate(active):
+                        reused = header[lane * 33]
+                        if reused not in (0, 1):
+                            raise ValueError("Invalid checkpoint chunk header")
+                        expected = header[lane * 33 + 1 : lane * 33 + 33].hex()
+                        n = min(chunk, layout["files"][name]["size"] - index * chunk)
+                        value = None
+                        if not reused:
+                            value = mx.distributed.recv(
+                                (n,), mx.uint8, 0, group=group, stream=stream
+                            )
+                            mx.async_eval(value)
+                        pending.append((name, expected, value))
+                        if len(pending) >= 2:
+                            consume()
+                    while pending:
+                        consume()
+            for future in futures:
+                future.result()
+        if thread:
+            exchange(ready, None, put=True)
+            thread.join()
+        if errors:
+            raise errors[0]
+        progress(True)
+        return {
+            "manifest": {"version": 1, "chunk_bytes": chunk, "files": records},
+            "signatures": signatures,
+        }
+    finally:
+        halted.set()
+        readers.shutdown(wait=True, cancel_futures=True)
+        if thread:
+            thread.join()
+
+
+def partial_hashes(path, layout, report):
+    """Inspect actual partial bytes; a resume bitmap alone cannot establish reuse."""
+    chunk, checked, hashes = layout["chunk_bytes"], 0, {}
+    for name, record in layout["files"].items():
+        target = store.safe_path(path, name)
+        values = []
+        source = target.open("rb", buffering=0) if target.exists() else None
+        try:
+            for offset in range(0, record["size"], chunk):
+                n = min(chunk, record["size"] - offset)
+                data = source.read(n) if source else b""
+                values.append(
+                    hashlib.sha256(data).hexdigest() if len(data) == n else None
+                )
+                checked += len(data)
+                if data:
+                    report(bytes_checked=checked)
+        finally:
+            if source:
+                source.close()
+        hashes[name] = values
+    return hashes
+
+
 def check_partial(current, manifest, report):
     checked, last_report = 0, 0
 
@@ -300,7 +583,7 @@ def main():
     current = None
     signatures = None
     pipeline = None
-    file_manifest = None
+    layout = None
     emit("hello", physical_id=physical_id(), pid=os.getpid(), protocol=1)
     with tempfile.TemporaryDirectory(prefix="mlx-transfer-") as scratch:
         while True:
@@ -347,14 +630,18 @@ def main():
                     if not np.array_equal(np.asarray(probe), token * 2):
                         raise ValueError("RDMA connection challenge mismatch")
                     result = {"rdma_validated": True, "mlx_version": mx.__version__}
-                elif op in {"begin", "begin_pipeline"}:
+                elif op in {"begin", "begin_stream"}:
                     if lock is not None:
                         raise ValueError("A checkpoint transaction is already active")
                     current = store.SnapshotStore(
                         command["root"], partial_id=command.get("partial_id")
                     )
-                    pipeline = {} if op == "begin_pipeline" else None
-                    file_manifest = None
+                    pipeline = {} if op == "begin_stream" else None
+                    layout = (
+                        store.validate_layout(command["layout"])
+                        if pipeline is not None
+                        else None
+                    )
                     signatures = {}
                     if pipeline is not None:
                         if current.partial_id is None:
@@ -376,8 +663,13 @@ def main():
                     lock = (current.receipts / (lock_id + ".lock")).open("a")
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     if pipeline is not None:
-                        current.writable_partial(None)
-                        emit("result", id=request)
+                        partial = current.writable_partial(None)
+                        emit(
+                            "result",
+                            id=request,
+                            path=str(partial),
+                            partial_hashes=partial_hashes(partial, layout, report),
+                        )
                         continue
                     final = current.existing(manifest)
                     if final:
@@ -387,31 +679,24 @@ def main():
                     else:
                         current.writable_partial(manifest)
                         result = check_partial(current, manifest, report)
-                elif op == "file":
-                    if lock is None or pipeline is None or file_manifest is not None:
-                        raise ValueError("No idle pipeline transaction")
-                    manifest = store.validate(command["manifest"])
-                    if (
-                        len(manifest["files"]) != 1
-                        or pipeline.keys() & manifest["files"].keys()
-                    ):
-                        raise ValueError("Duplicate or invalid pipeline file")
-                    file_manifest = manifest
-                    result = check_partial(current, manifest, report)
-                elif op in {"send", "receive", "send_file", "receive_file"}:
+                elif op in {"send_stream", "receive_stream"}:
                     if group is None:
                         raise ValueError("No validated transfer group")
-                    if op == "send_file":
-                        store.validate(command["manifest"])
-                        if any(
-                            store.signature(
-                                store.safe_path(Path(command["path"]), name)
-                            )
-                            != command["signatures"].get(name)
-                            for name in command["manifest"]["files"]
-                        ):
-                            raise ValueError("Prepared source file changed")
-                    elif op == "send":
+                    if op == "receive_stream" and (
+                        lock is None
+                        or layout != command["layout"]
+                        or str(current.partial(None)) != command["path"]
+                    ):
+                        raise ValueError("No matching checkpoint transaction")
+                    result = stream_chunks(group, command, report)
+                    if op == "receive_stream":
+                        signatures = result["signatures"]
+                        pipeline = result["manifest"]["files"]
+                        result = {}
+                elif op in {"send", "receive"}:
+                    if group is None:
+                        raise ValueError("No validated transfer group")
+                    if op == "send":
                         source = store.SnapshotStore(command["root"])
                         final = source.existing(command["manifest"])
                         if final is None or str(final) != command["path"]:
@@ -421,21 +706,18 @@ def main():
                         or str(current.partial(command["manifest"])) != command["path"]
                     ):
                         raise ValueError("No matching checkpoint transaction")
-                    if op == "receive_file" and command["manifest"] != file_manifest:
-                        raise ValueError("Unexpected pipeline file manifest")
-                    verified = copy_chunks(group, command, report)
-                    if op == "receive_file":
-                        signatures.update(verified)
-                        pipeline.update(file_manifest["files"])
-                        file_manifest = None
-                    else:
-                        signatures = verified
+                    signatures = copy_chunks(group, command, report)
                 elif op == "commit":
                     if lock is None or signatures is None:
                         raise ValueError("No verified transfer to commit")
                     manifest = store.validate(command["manifest"])
                     if pipeline is not None and (
-                        file_manifest is not None or pipeline != manifest["files"]
+                        manifest["chunk_bytes"] != layout["chunk_bytes"]
+                        or pipeline
+                        != {
+                            n: {"size": r["size"], "chunks": r["chunks"]}
+                            for n, r in manifest["files"].items()
+                        }
                     ):
                         raise ValueError("Incomplete or changed pipeline manifest")
                     # Another preparation may already have published the same bytes.

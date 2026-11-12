@@ -656,46 +656,41 @@ def test_parallel_preparation_cancellation_leaves_no_snapshot(tmp_path):
     assert not list(root.glob("*/one.safetensors"))
 
 
-@pytest.mark.parametrize("mutation", [False, True])
-def test_file_pipeline_starts_before_all_hashes_and_checks_source_before_publish(
-    tmp_path, monkeypatch, mutation
+@pytest.mark.parametrize("mutation", [None, "source", "snapshot", "manifest"])
+def test_streamed_snapshot_checks_mutation_before_publication(
+    snapshot, tmp_path, mutation
 ):
-    source, root = tmp_path / "source", tmp_path / "cache"
-    source.mkdir()
-    names = ["first.safetensors", "second.safetensors"]
-    for name in names:
-        (source / name).write_bytes(name.encode() * 100)
-    delivered = threading.Event()
-    monkeypatch.setattr(store.os, "cpu_count", lambda: 2)
-    clone = store._clone
-    staged = []
+    source, names, _, _, manifest = snapshot
+    root = tmp_path / "streamed"
 
-    def wait_for_delivery(src, dst):
-        if src.name == names[1]:
-            assert delivered.wait(5), "Hashing must not block the first file's delivery"
-        return clone(src, dst)
-
-    def file_ready(path, manifest):
-        name = next(iter(manifest["files"]))
-        assert (path / name).is_file()
-        store.verify_chunks(path / name, manifest["files"][name], 1024)
+    def streaming(path, layout):
+        assert all((path / n).read_bytes() == (source / n).read_bytes() for n in names)
         assert not list(root.glob("*/.mlx-vlm-distributed.json"))
-        staged.append(path)
-        delivered.set()
+        if mutation in {"source", "snapshot"}:
+            ((source if mutation == "source" else path) / names[0]).write_bytes(
+                b"mutation"
+            )
+        if mutation == "manifest":
+            return {**manifest, "chunk_bytes": 2048}
+        return manifest
 
-    def before_publish():
-        if mutation:
-            (staged[0] / names[0]).write_bytes(b"modified after sending")
-
-    monkeypatch.setattr(store, "_clone", wait_for_delivery)
-    kwargs = dict(chunk=1024, file_ready=file_ready, before_publish=before_publish)
     if mutation:
-        with pytest.raises(ValueError, match="changed before publication"):
-            store.prepare_snapshot(source, names, root, **kwargs)
+        with pytest.raises(ValueError):
+            store.prepare_snapshot(source, names, root, chunk=1024, stream=streaming)
         assert not list(root.glob("*/.mlx-vlm-distributed.json"))
     else:
-        final, _ = store.prepare_snapshot(source, names, root, **kwargs)
+        final, actual = store.prepare_snapshot(
+            source, names, root, chunk=1024, stream=streaming
+        )
+        assert actual == manifest
         assert (final / names[1]).read_bytes() == (source / names[1]).read_bytes()
+        store.prepare_snapshot(
+            source,
+            names,
+            root,
+            chunk=1024,
+            stream=lambda *a: pytest.fail("Warm source must not stream"),
+        )
     assert not list(root.glob(".building-*"))
 
 
@@ -748,12 +743,15 @@ def test_pipeline_helper_rejects_commit_until_every_file_is_received(
     helper = Helper([sys.executable, "-u", "-c", bootstrap()], timeout=5)
     try:
         helper.call(
-            "begin_pipeline", root=str(tmp_path / "receiver"), partial_id="a" * 64
-        )
-        helper.call(
-            "file",
-            manifest=snapshot[-1]
-            | {"files": {"config.json": snapshot[-1]["files"]["config.json"]}},
+            "begin_stream",
+            root=str(tmp_path / "receiver"),
+            partial_id="a" * 64,
+            layout={
+                "chunk_bytes": 1024,
+                "files": {
+                    n: {"size": r["size"]} for n, r in snapshot[-1]["files"].items()
+                },
+            },
         )
         with pytest.raises(RuntimeError, match="Incomplete or changed"):
             helper.call("commit", manifest=snapshot[-1])
@@ -805,3 +803,120 @@ def test_stager_pipelines_remote_peer_when_local_rank_is_first(
     assert pool.prepare_and_deliver.call_args.args[1] is remote
     assert pool.deliver.call_args.args[1] is local
     assert stager.worker_transfers[remote.url] == remote_result
+
+
+@pytest.mark.parametrize("corrupt", [None, "source", "payload"])
+def test_stream_hashes_each_source_byte_once_and_verifies_receiver(
+    tmp_path, monkeypatch, corrupt
+):
+    import mlx.core as mx
+    import numpy as np
+
+    from mlx_vlm.server import _checkpoint_worker as worker
+
+    source, partial = tmp_path / "source", tmp_path / "partial"
+    source.mkdir()
+    partial.mkdir()
+    original = {f"part{i}": bytes([i]) * (2048 + i * 53) for i in range(9)}
+    original["empty"] = b""
+    for name, data in original.items():
+        (source / name).write_bytes(data)
+    (partial / "part0").write_bytes(original["part0"])  # Reuse actual verified chunks.
+    (partial / "part1").write_bytes(b"wrong" * 400)  # Repair a corrupt partial.
+    layout = {
+        "chunk_bytes": 1024,
+        "files": {
+            n: {"size": len(v), "expected_sha256": hashlib.sha256(v).hexdigest()}
+            for n, v in original.items()
+        },
+    }
+    if corrupt == "source":
+        (source / "part0").write_bytes(b"X" * len(original["part0"]))
+    partial_hashes = worker.partial_hashes(partial, layout, lambda **kw: None)
+    packets, reads = [], {}
+    open_file = Path.open
+
+    class CountReads:
+        def __init__(self, file, name):
+            self.file, self.name = file, name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.file.close()
+
+        def fileno(self):
+            return self.file.fileno()
+
+        def flush(self):
+            return self.file.flush()
+
+        def readinto(self, view):
+            n = self.file.readinto(view)
+            reads[self.name] = reads.get(self.name, 0) + n
+            return n
+
+    def opening(path, mode="r", *args, **kwargs):
+        file = open_file(path, mode, *args, **kwargs)
+        return (
+            CountReads(file, path.name)
+            if path.parent == source and mode == "rb"
+            else file
+        )
+
+    def sending(value, *args, **kwargs):
+        mx.eval(value)
+        packets.append(np.asarray(value).tobytes())
+        return value
+
+    monkeypatch.setattr(Path, "open", opening)
+    monkeypatch.setattr(mx.distributed, "send", sending)
+    command = {"layout": layout, "path": str(source), "partial_hashes": partial_hashes}
+    if corrupt == "source":
+        with pytest.raises(ValueError, match="Hugging Face checksum mismatch"):
+            worker.stream_chunks(
+                SimpleNamespace(rank=lambda: 0), command, lambda **kw: None
+            )
+        return
+    sent = worker.stream_chunks(
+        SimpleNamespace(rank=lambda: 0), command, lambda **kw: None
+    )
+    assert sum(reads.values()) == sum(map(len, original.values()))
+    assert (
+        sent["manifest"]["files"]["part0"]["sha256"]
+        == layout["files"]["part0"]["expected_sha256"]
+    )
+    if corrupt == "payload":
+        index = next(i for i, data in enumerate(packets) if len(data) >= 1024)
+        packets[index] = b"X" * len(packets[index])
+    packets = iter(packets)
+
+    def receiving(shape, *args, **kwargs):
+        data = next(packets)
+        assert len(data) == shape[0]
+        return mx.array(np.frombuffer(data, dtype=np.uint8))
+
+    monkeypatch.setattr(mx.distributed, "recv", receiving)
+    events = []
+    receive = lambda: worker.stream_chunks(
+        SimpleNamespace(rank=lambda: 1),
+        {"layout": layout, "path": str(partial)},
+        lambda **kw: events.append(kw),
+    )
+    if corrupt == "payload":
+        with pytest.raises(ValueError, match="checksum mismatch"):
+            receive()
+    else:
+        got = receive()
+        assert {n: (partial / n).read_bytes() for n in original} == original
+        assert got["manifest"]["files"] == {
+            n: {"size": r["size"], "chunks": r["chunks"]}
+            for n, r in sent["manifest"]["files"].items()
+        }
+        assert events[-1]["bytes_reused"] == len(original["part0"])
+        assert events[-1]["bytes_verified"] == sum(map(len, original.values()))
+        assert (
+            events[-1]["bytes_received"] + events[-1]["bytes_reused"]
+            == events[-1]["bytes_verified"]
+        )

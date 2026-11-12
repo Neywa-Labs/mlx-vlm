@@ -326,33 +326,14 @@ class TransferPool:
     def prepare_and_deliver(
         self, config, worker, source, names, transport, report, verifying, stop=None
     ):
-        """Overlap verified-file preparation with the first peer's RDMA delivery.
-
-        Only hashes/manifests cross the queue. Private source files stay in place
-        until every send finishes; neither endpoint publishes on an error.
-        """
+        """Hash private source buffers while delivering them to the first peer."""
         inputs = {n: store.signature((source / n).resolve()) for n in names}
         partial_id = hashlib.sha256(
             json.dumps(
                 [str(source.resolve()), inputs, store.CHUNK_BYTES], sort_keys=True
             ).encode()
         ).hexdigest()
-        ready = queue.Queue()
-        release, failed = threading.Event(), threading.Event()
-        progress_lock = threading.Lock()
-
-        class Stopping:
-            def is_set(self):
-                return failed.is_set() or (stop is not None and stop.is_set())
-
-        stopping = Stopping()
-
-        def before_publish():
-            ready.put(None)
-            while not release.wait(0.1):
-                store.cancelled(stopping)
-
-        started = time.monotonic()
+        started, progress_lock = time.monotonic(), threading.Lock()
         counters = dict(
             bytes_read=0,
             bytes_received=0,
@@ -361,10 +342,9 @@ class TransferPool:
             bytes_transferred=0,
             total_bytes=sum(s[2] for s in inputs.values()),
         )
+        pair = key = fallback = None
 
-        def update(phase, *, snapshot=None, **data):
-            # Sender and receiver report from different threads. Serialize the
-            # counter snapshot and callback so clients never see counts regress.
+        def update(phase="transferring", **data):
             with progress_lock:
                 counters.update(data)
                 elapsed = time.monotonic() - started
@@ -376,140 +356,101 @@ class TransferPool:
                     throughput_bytes_per_second=counters["bytes_transferred"]
                     / max(elapsed, 1e-9),
                     rate_kind="logical_payload",
-                    **({"snapshot": snapshot} if snapshot is not None else {}),
                 )
 
-        pair = key = None
-        fallback = None
-        checked = 0
+        def stream(path, layout):
+            nonlocal pair, key
+            key, pair = self._pair(config, worker)
+            update("connecting")
+            pair.connect(stop)
+            update("connected")
+            state = pair.remote.call(
+                "begin_stream",
+                root=worker.model_dir or str(config.model_dir),
+                partial_id=partial_id,
+                layout=layout,
+                stop=stop,
+                progress=lambda data: report(
+                    "checking_partial",
+                    transport="jaccl_rdma",
+                    total_bytes=counters["total_bytes"],
+                    **data,
+                ),
+            )
+            receiver = pair.remote.submit(
+                "receive_stream", path=state["path"], layout=layout
+            )
+            sender = pair.local.submit(
+                "send_stream",
+                path=str(path),
+                layout=layout,
+                partial_hashes=state["partial_hashes"],
+            )
+
+            def receiving(data):
+                update(
+                    bytes_received=data["bytes_received"],
+                    bytes_verified=data["bytes_verified"],
+                    bytes_reused=data["bytes_reused"],
+                    bytes_transferred=data["bytes_received"],
+                )
+
+            sent, _ = self._wait_pair(
+                pair,
+                sender,
+                receiver,
+                stop,
+                lambda data: update(bytes_read=data["bytes_read"]),
+                receiving,
+            )
+            return sent["manifest"]
+
         with self.lock:
+            store.cancelled(stop)
             if self.closed.is_set():
                 raise RuntimeError("Checkpoint transfer pool is closed")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                prepared = executor.submit(
-                    store.prepare_snapshot,
+            try:
+                final, manifest = store.prepare_snapshot(
                     source,
                     names,
                     config.model_dir,
-                    stop=stopping,
+                    stop=stop,
                     progress=verifying,
-                    file_ready=lambda path, manifest: ready.put((path, manifest)),
-                    before_publish=before_publish,
+                    stream=stream,
                 )
-                prepared.add_done_callback(lambda future: ready.put(None))
-                try:
-                    while True:
-                        store.cancelled(stopping)
-                        try:
-                            item = ready.get(timeout=0.1)
-                        except queue.Empty:
-                            if prepared.done():
-                                break  # Warm source receipt, or preparation failed.
-                            continue
-                        if item is None:
-                            break
-                        # Stop promptly on a hashing failure, even with queued files.
-                        if prepared.done():
-                            prepared.result()
-                        path, manifest = item
-                        if fallback is not None:
-                            continue
-                        if pair is None:
-                            key, pair = self._pair(config, worker)
-                            update("connecting")
-                            try:
-                                pair.connect(stop)
-                            except TransferUnavailable as error:
-                                self.pairs.pop(key).close()
-                                pair = None
-                                if transport != "auto":
-                                    raise
-                                fallback = str(error)
-                                report(
-                                    "transport_fallback",
-                                    transport="ssh_rsync",
-                                    fallback_reason=fallback,
-                                )
-                                continue
-                            update("connected")
-                            pair.remote.call(
-                                "begin_pipeline",
-                                root=worker.model_dir or str(config.model_dir),
-                                partial_id=partial_id,
-                                stop=stop,
-                            )
-                        before_checked = checked
-
-                        def checking(data):
-                            nonlocal checked
-                            checked = before_checked + data["bytes_checked"]
-                            report(
-                                "checking_partial",
-                                transport="jaccl_rdma",
-                                bytes_checked=checked,
-                                total_bytes=counters["total_bytes"],
-                            )
-
-                        state = pair.remote.call(
-                            "file",
-                            manifest=manifest,
-                            stop=stop,
-                            progress=checking,
-                        )
-                        counters["bytes_reused"] += state["bytes_reused"]
-                        counters["bytes_verified"] += state["bytes_reused"]
-                        previous = counters.copy()
-
-                        def file_update(phase="transferring", **data):
-                            update(
-                                phase, **{k: previous[k] + v for k, v in data.items()}
-                            )
-
-                        self._copy_pair(
-                            pair,
-                            path,
-                            manifest,
-                            state,
-                            {},
-                            file_update,
-                            stopping,
-                            streaming=True,
-                        )
-                    release.set()
-                    final, manifest = prepared.result()
+                store.cancelled(stop)
+                if pair is not None:
+                    update("publishing")
                     store.cancelled(stop)
-                    if pair is not None:
-                        update("publishing", snapshot=final.name)
-                        store.cancelled(stop)
-                        published = pair.remote.call("commit", manifest=manifest)
-                        update(
-                            "worker_ready",
-                            snapshot=final.name,
-                            bytes_verified=counters["total_bytes"],
-                        )
-                        pair.last_used = time.monotonic()
-                        return (
-                            final,
-                            manifest,
-                            {
-                                "transport": "jaccl_rdma",
-                                "verified": True,
-                                "path": published["path"],
-                                "rdma_validated": pair.validated,
-                                "helper_pids": [
-                                    p.pid for p in (pair.local, pair.remote)
-                                ],
-                            },
-                        )
-                except BaseException:
-                    failed.set()
-                    if pair is not None:
-                        self.pairs.pop(key).close()
+                    published = pair.remote.call("commit", manifest=manifest)
+                    update("worker_ready")
+                    pair.last_used = time.monotonic()
+                    return (
+                        final,
+                        manifest,
+                        {
+                            "transport": "jaccl_rdma",
+                            "verified": True,
+                            "path": published["path"],
+                            "rdma_validated": pair.validated,
+                            "helper_pids": [p.pid for p in (pair.local, pair.remote)],
+                        },
+                    )
+            except BaseException as error:
+                if pair is not None:
+                    self.pairs.pop(key).close()
+                if transport != "auto" or not isinstance(error, TransferUnavailable):
                     raise
-                finally:
-                    release.set()
-        # Warm source receipts need no file pipeline. Only a recognized connection
-        # failure in auto mode may select SSH; data/verification failures propagate.
+                fallback = str(error)
+                report(
+                    "transport_fallback",
+                    transport="ssh_rsync",
+                    fallback_reason=fallback,
+                )
+                final, manifest = store.prepare_snapshot(
+                    source, names, config.model_dir, stop=stop, progress=verifying
+                )
+        # Cached manifests keep the ordinary verified-snapshot/resume path.
         result = self.deliver(
             config,
             worker,
@@ -671,45 +612,32 @@ class TransferPool:
         TransferPool._copy_pair(pair, source, manifest, state, counters, update, stop)
 
     @staticmethod
-    def _copy_pair(
-        pair, source, manifest, state, counters, update, stop, *, streaming=False
-    ):
+    def _copy_pair(pair, source, manifest, state, counters, update, stop):
         common = dict(manifest=manifest, missing=state["missing"])
-        receiver = pair.remote.submit(
-            "receive_file" if streaming else "receive", path=state["path"], **common
-        )
+        receiver = pair.remote.submit("receive", path=state["path"], **common)
         sender = pair.local.submit(
-            "send_file" if streaming else "send",
-            root=str(Path(source).parent),
-            path=str(source),
-            **(
-                {
-                    "signatures": {
-                        n: store.signature(source / n) for n in manifest["files"]
-                    }
-                }
-                if streaming
-                else {}
-            ),
-            **common,
+            "send", root=str(Path(source).parent), path=str(source), **common
         )
 
-        # Drain both streams while the file is in flight; never buffer a
-        # checkpoint's worth of progress waiting for the other rank.
         def receiving(data):
             update(
                 bytes_received=data["bytes_received"],
-                bytes_verified=(0 if streaming else state["bytes_reused"])
-                + data["bytes_verified"],
+                bytes_verified=state["bytes_reused"] + data["bytes_verified"],
                 bytes_transferred=data["bytes_received"],
             )
 
-        def sending(data):
-            if streaming:
-                update("transferring", bytes_read=data["bytes_read"])
-            else:
-                counters["bytes_read"] = data["bytes_read"]
+        TransferPool._wait_pair(
+            pair,
+            sender,
+            receiver,
+            stop,
+            lambda data: counters.update(bytes_read=data["bytes_read"]),
+            receiving,
+        )
 
+    @staticmethod
+    def _wait_pair(pair, sender, receiver, stop, sending, receiving):
+        # Drain both progress streams; a failure must unblock the other native rank.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             sent = pool.submit(pair.local.wait, sender, progress=sending, stop=stop)
             received = pool.submit(
@@ -721,8 +649,9 @@ class TransferPool:
                 )
                 for future in done:
                     future.result()
+                return sent.result(), received.result()
             except BaseException:
-                pair.close()  # Unblock the other rank's native collective too.
+                pair.close()
                 raise
 
     @staticmethod
