@@ -10,9 +10,9 @@ the Pixtral encoder and Mistral projector.
 
 Use a model directory with a standard `config.json` (`model_type: mistral_large4`,
 `text_config`, and `vision_config`), tokenizer/processor files, and safetensors.
-When `config.json` is absent, the shared loader reads `params.json`. Both filenames
-must contain the standard model configuration schema. Normalize native Mistral
-metadata before saving it under either filename. Use standard checkpoint
+When `config.json` is absent, the shared loader reads `params.json`. Native Mistral
+metadata is recognized and normalized by the model's config adapter before
+architecture discovery; no metadata files are rewritten. Use standard checkpoint
 filenames such as `model.safetensors` and compatible tokenizer/processor files.
 
 The model sanitizer maps native weight names and stacks experts. The shared

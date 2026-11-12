@@ -75,6 +75,12 @@ class ModelConfig(BaseModelConfig):
             self.image_token_index = self.image_token_id
 
 
+def matches_native_config(params: Dict[str, Any]) -> bool:
+    return {"dim", "n_layers", "moe", "vision_encoder"}.issubset(
+        params
+    ) and "dsa" not in params
+
+
 def config_from_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Translate a Mistral-native ``params.json`` into an mlx-vlm config dict.
 

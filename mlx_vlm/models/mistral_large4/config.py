@@ -78,3 +78,57 @@ class ModelConfig(Mistral3Config):
     vision_config: VisionConfig = field(default_factory=VisionConfig)
     model_type: str = "mistral_large4"
     image_token_index: int = 10
+
+
+def matches_native_config(params: dict) -> bool:
+    return {"dim", "n_layers", "moe", "vision_encoder", "dsa"}.issubset(params)
+
+
+def config_from_params(params: dict) -> dict:
+    """Normalize native release metadata for the shared checkpoint loader."""
+    from ..mistral_large3.config import config_from_params as base_config
+
+    config = base_config(params)
+    config["model_type"] = "mistral_large4"
+    config["image_token_index"] = config["image_token_id"]
+    text = config["text_config"]
+    layers = params["n_layers"]
+    dsa, moe, yarn = params["dsa"], params["moe"], params["yarn"]
+    rotary = params["nope"].split(",")
+    if any(value not in ("rope", "nope") for value in rotary):
+        raise ValueError("Invalid native rotary layout")
+    quantization = params.get("quantization_config") or {}
+    text.update(
+        model_type="mistral_large4_text",
+        n_group=moe["num_expert_groups"],
+        topk_group=moe["num_expert_groups_per_tok"],
+        routed_scaling_factor=moe["routed_scale"],
+        final_logit_softcapping=params["softmax_tanh_gating"],
+        index_topk=dsa["topk"],
+        index_head_dim=dsa["head_dim"],
+        index_n_heads=dsa["n_heads"],
+        no_rope_layers=[int(rotary[i % len(rotary)] == "rope") for i in range(layers)],
+        kv_source_layers=[
+            int(i) for i in params["kv_sharing"]["source_layers_str"].split(",")
+        ],
+        indexer_types=dsa["sharing"].split(","),
+        rope_parameters=dict(
+            rope_theta=params["rope_theta"],
+            factor=yarn["factor"],
+            original_max_position_embeddings=yarn["original_max_position_embeddings"],
+            beta_fast=yarn["beta"],
+            beta_slow=yarn["alpha"],
+        ),
+        nvfp4=quantization.get("quant_algo") == "NVFP4"
+        or any(
+            layer.get("quant_algo") == "NVFP4"
+            for layer in quantization.get("quantized_layers", {}).values()
+        ),
+    )
+    if "mtp" in params:
+        text["mtp_config"] = params["mtp"]
+    if quantization:
+        config["quantization_config"] = quantization
+    # Reject incompatible layer layouts before opening any tensors.
+    TextConfig.from_dict(text)
+    return config

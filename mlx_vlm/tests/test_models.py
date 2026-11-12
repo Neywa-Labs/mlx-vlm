@@ -36,6 +36,7 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
+from mlx_vlm.models import normalize_config
 from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
 from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
@@ -1748,9 +1749,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
-@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+@pytest.mark.parametrize("metadata_format", ["config", "params", "native"])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case, config_filename
+    tmp_path, mistral_large4_case, metadata_format
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1836,12 +1837,18 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / config_filename).write_text(json.dumps(config))
+    config_filename = "config.json" if metadata_format == "config" else "params.json"
+    metadata = (
+        model_case("mistral_large4")["native_params"]
+        if metadata_format == "native"
+        else config
+    )
+    (tmp_path / config_filename).write_text(json.dumps(metadata))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
     if config_filename == "params.json":
         assert not (tmp_path / "config.json").exists()
-        assert json.loads((tmp_path / "params.json").read_text()) == config
+        assert json.loads((tmp_path / "params.json").read_text()) == metadata
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -3784,6 +3791,77 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
 
 # Loading and utility contracts
+
+
+@pytest.mark.parametrize("family", ["mistral_large3", "mistral_large4"])
+def test_load_config_recognizes_native_model_metadata(tmp_path, family):
+    from transformers import AutoProcessor
+
+    from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+
+    params = model_case("mistral_large4")["native_params"]
+    if family == "mistral_large3":
+        params.pop("dsa")
+    else:
+        params["mtp"] = {"n_layers": 3, "block_size": 4}
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": 2, "temperature": 0.7})
+    )
+
+    config = load_config(tmp_path)
+    module, model_type = get_model_and_args(config)
+    assert model_type == family
+    assert config["text_config"]["hidden_size"] == params["dim"]
+    assert (
+        config["vision_config"]["hidden_size"]
+        == params["vision_encoder"]["hidden_size"]
+    )
+    assert config["eos_token_id"] == 2
+    assert config["temperature"] == 0.7
+    if family == "mistral_large4":
+        text = module.TextConfig.from_dict(config["text_config"])
+        expected = build_config(module, model_case(family)["config"]).text_config
+        assert asdict(text) == {
+            **asdict(expected),
+            "nvfp4": True,
+            "mtp_config": params["mtp"],
+        }
+        assert config["quantization_config"] == params["quantization_config"]
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+    sentinel = object()
+    with patch.object(Mistral3Processor, "from_pretrained", return_value=sentinel):
+        assert AutoProcessor.from_pretrained(tmp_path) is sentinel
+
+
+@pytest.mark.parametrize(
+    "marker", ["model_type", "speculators_model_type", "model_file"]
+)
+def test_native_config_adapters_preserve_declared_architectures(marker):
+    config = {**model_case("mistral_large4")["native_params"], marker: "custom"}
+    with patch("mlx_vlm.models.importlib.import_module") as import_module:
+        assert normalize_config(config) is config
+    import_module.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("nope", "rope,typo", "rotary layout"),
+        ("dsa", {"sharing": "full"}, "indexer_types must have 8 entries"),
+        ("kv_sharing", {"source_layers_str": "0,1,2,3,4,5,6,8"}, "Invalid KV source"),
+    ],
+)
+def test_native_config_adapter_rejects_invalid_layouts(tmp_path, field, value, message):
+    params = model_case("mistral_large4")["native_params"]
+    if isinstance(value, dict):
+        params[field].update(value)
+    else:
+        params[field] = value
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path)
 
 
 @pytest.mark.parametrize("params", [{"dim": 8}, {"dim": 8, "dsa": {"topk": 4}}])

@@ -241,4 +241,6 @@ __all__ = ["Mistral3Processor"]
 
 from ..base import install_auto_processor_patch  # noqa: E402
 
-install_auto_processor_patch("mistral3", Mistral3Processor)
+install_auto_processor_patch(
+    ["mistral3", "mistral_large3", "mistral_large4"], Mistral3Processor
+)
