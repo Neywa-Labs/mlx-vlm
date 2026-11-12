@@ -43,8 +43,9 @@ Use an MLX build with residency-refresh support. The 100 ms refresh avoids the
 idle-related prefill stalls observed with this model by periodically renewing
 Metal residency. The launcher passes both environment settings to every rank.
 
-The runner uses `sharded_load`, which calls `model.shard(group)`, followed by
-`stream_generate`. For deterministic distributed decoding, set `do_sample` to
+The runner uses `sharded_load`, which passes the tensor group into checkpoint
+preparation before conversion and expert stacking, then calls `model.shard(group)`
+and `stream_generate`. For deterministic distributed decoding, set `do_sample` to
 `false` in each model directory's `generation_config.json`.
 
 Experts are split as `N * rank // size : N * (rank + 1) // size`: 64/64 on two
@@ -52,6 +53,15 @@ Macs or 42/43/43 on three Macs. Dense layers and vision are replicated. Expert
 outputs are reduced before weighting and accumulation, preserving BF16 operation
 order. A directory containing only one rank's experts must declare its
 `expert_start` and `expert_end` in `text_config`; sharding validates that range.
+
+Distributed serving uses the same early preparation through
+`load(..., sharding_group=group)`. Native per-expert tensors outside the rank's
+range are discarded before shared NVFP4/FP8 conversion. Already-stacked MLX
+expert tensors are gathered into owned storage, avoiding slices that retain the
+full checkpoint allocation. Repeated final sharding is idempotent; attention,
+shared experts and multimodal parameters remain replicated. Pipeline-only
+loading does not select expert partitions. Bundled draft weights remain excluded
+from target loading.
 
 ## DSpark speculative decoding
 

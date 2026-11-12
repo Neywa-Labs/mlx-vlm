@@ -812,7 +812,11 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
     worker.group = object()
     assert worker.load(str(path), None) == (model, processor)
     native.assert_called_once_with(
-        str(path), lazy=True, trust_remote_code=False, local_files_only=True
+        str(path),
+        lazy=True,
+        sharding_group=worker.group,
+        trust_remote_code=False,
+        local_files_only=True,
     )
     assert calls == [
         "load",

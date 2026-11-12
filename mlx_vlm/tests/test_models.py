@@ -1747,13 +1747,16 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
+@pytest.mark.parametrize("expert_count", [8, 128])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case
+    tmp_path, mistral_large4_case, expert_count
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
     mx.random.seed(31)
     module, args = mistral_large4_case
+    args.text_config.n_routed_experts = expert_count
+    args.text_config.expert_end = expert_count
     reference = module.Model(args)
     native = {}
     direct = {
@@ -1866,6 +1869,46 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     for key in saved:
         assert sanitized[key].dtype == saved[key].dtype, key
         assert mx.array_equal(sanitized[key], saved[key]).item(), key
+
+    def check_partition(rank):
+        group = NS(rank=lambda: rank, size=lambda: 3)
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+        partition = load_model(tmp_path, sharding_group=group)
+        assert (
+            partition.language_model.args.expert_start,
+            partition.language_model.args.expert_end,
+        ) == (start, end)
+        before = dict(tree_flatten(partition.parameters()))
+        partition.shard(group)
+        partition.shard(group)
+        after = dict(tree_flatten(partition.parameters()))
+        assert after.keys() == saved.keys()
+        for key, value in after.items():
+            expected = saved[key][start:end] if ".experts." in key else saved[key]
+            assert value is before[key], key
+            assert value.dtype == expected.dtype, key
+            assert mx.array_equal(value, expected).item(), key
+        return before
+
+    # Filter native expert and draft tensors before the shared converter sees them.
+    from mlx_vlm import utils
+
+    convert = utils.transform_quantized_weights
+    for rank in range(3):
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+
+        def check_conversion(weights, quantization):
+            assert not any(k.startswith("mtp") for k in weights)
+            assert {
+                int(k.split(".experts.")[1].split(".")[0])
+                for k in weights
+                if ".experts." in k
+            } == set(range(start, end))
+            return convert(weights, quantization)
+
+        with patch.object(utils, "transform_quantized_weights", check_conversion):
+            check_partition(rank)
+
     # Native staging uses global expert IDs, including nonzero starting ranks.
     config["text_config"].update(expert_start=2, expert_end=5)
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -1874,7 +1917,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         if ".experts." in key:
             assert value.dtype == saved[key].dtype, key
             assert mx.array_equal(value, saved[key][2:5]).item(), key
-    config["text_config"].update(expert_start=0, expert_end=8)
+    config["text_config"].update(expert_start=0, expert_end=expert_count)
     config["quantization_config"] = config["quantization"] = {
         "group_size": 16,
         "bits": 4,
@@ -1887,6 +1930,113 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         np.array(restored(ids).logits.astype(mx.float32)),
         np.array(actual.astype(mx.float32)),
     )
+
+    # Stacked weights and native exports share the same exact rank-local values.
+    for rank in range(3):
+        check_partition(rank)
+    full_config = copy.deepcopy(config)
+    for rank in range(3):
+        start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
+        config["text_config"].update(expert_start=start, expert_end=end)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        local = {k: v[start:end] if ".experts." in k else v for k, v in saved.items()}
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), local)
+        check_partition(rank)
+        with pytest.raises(
+            ValueError, match="Checkpoint partition.*does not match rank"
+        ):
+            load_model(
+                tmp_path, sharding_group=NS(rank=lambda: (rank + 1) % 3, size=lambda: 3)
+            )
+        # A declared local range must not silently accept full stacked tensors,
+        # even through sharded_load's strict=False path.
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
+        with pytest.raises(ValueError, match="expected.*experts.*checkpoint"):
+            load_model(
+                tmp_path,
+                strict=False,
+                sharding_group=NS(rank=lambda: rank, size=lambda: 3),
+            )
+        # Native pre-partitions retain global expert IDs.
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+        }
+        config.pop("quantization", None)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        local = {
+            k: v
+            for k, v in native.items()
+            if ".experts." not in k
+            or start <= int(k.split(".experts.")[1].split(".")[0]) < end
+        }
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), local)
+        check_partition(rank)
+        config = copy.deepcopy(full_config)
+
+
+def test_mistral_large4_early_sharding_native_fp8_experts(
+    tmp_path, mistral_large4_case
+):
+    module, args = mistral_large4_case
+    mx.random.seed(45)
+    native = {}
+    for key, value in tree_flatten(module.Model(args).parameters()):
+        if ".experts." not in key:
+            native[key] = value.astype(mx.bfloat16)
+            continue
+        prefix, projection = key.split(".experts.")
+        for i in range(args.text_config.n_routed_experts):
+            name = f"{prefix}.experts.{i}.{projection}"
+            native[name] = mx.to_fp8(value[i])
+            native[name.removesuffix(".weight") + ".weight_scale"] = mx.array(0.5)
+    config = asdict(args)
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    expected = dict(tree_flatten(load_model(tmp_path).parameters()))
+    for rank in range(3):
+        group = NS(rank=lambda: rank, size=lambda: 3)
+        model = load_model(tmp_path, sharding_group=group)
+        model.shard(group)
+        for key, value in tree_flatten(model.parameters()):
+            reference = (
+                expected[key][8 * rank // 3 : 8 * (rank + 1) // 3]
+                if ".experts." in key
+                else expected[key]
+            )
+            assert value.dtype == reference.dtype, key
+            assert mx.array_equal(value, reference).item(), key
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="Requires Metal allocation counters"
+)
+def test_mistral_large4_prepared_stacked_weights_release_full_storage(
+    mistral_large4_case,
+):
+    import gc
+
+    module, args = mistral_large4_case
+    model = module.Model(args)
+    mx.eval(model.parameters())
+    mx.synchronize()
+    baseline = mx.get_active_memory()
+    # A regular contiguous slice retains this 32 MiB allocation. A prepared
+    # rank owns only its selected experts once its lazy gather is evaluated.
+    weights = {"layers.1.experts.w1.weight": mx.ones((8, 1024, 1024))}
+    mx.eval(weights)
+    group = NS(rank=lambda: 1, size=lambda: 3)
+    selected = model.prepare_sharded_weights(weights, group)
+    mx.eval(selected)
+    gc.collect()
+    mx.synchronize()
+    value = selected["layers.1.experts.w1.weight"]
+    assert value.shape == (3, 1024, 1024)
+    assert mx.get_active_memory() - baseline < value.nbytes + 1024 * 1024
 
 
 def test_nemotron_parse_source_architecture_and_tied_head_mapping():
@@ -4045,6 +4195,62 @@ def test_missing_model_file_raises_clearly(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="model_file"):
         load_model(tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["tensor", "auto", "pipeline"])
+def test_sharded_load_resolves_checkpoint_model_file(tmp_path, monkeypatch, mode):
+    from mlx_vlm import utils
+
+    _write_checkpoint(tmp_path)
+    with (tmp_path / "model.py").open("a") as source:
+        source.write("\nModelConfig.to_dict = lambda self: {}\n")
+        source.write("Model.language_model = property(lambda self: self)\n")
+        source.write(
+            "Model.shard = lambda self, group: setattr(self, 'rank', group.rank())\n"
+        )
+        source.write(
+            "Model.pipeline = lambda self, group: setattr(self, 'pipeline_rank', group.rank())\n"
+        )
+        source.write(
+            "Model.prepare_sharded_weights = lambda self, weights, group: "
+            "(setattr(self, 'prepared_rank', group.rank()) or weights)\n"
+        )
+    processor = object()
+    group = NS(rank=lambda: 1, size=lambda: 3)
+    monkeypatch.setattr(utils, "load_processor", lambda *a, **k: processor)
+    monkeypatch.setattr(utils, "load_image_processor", lambda *a, **k: None)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, **k: value)
+    with patch.object(mx.distributed, "init", return_value=group) as initialize:
+        options = {} if mode == "auto" else {mode + "_group": group}
+        model, actual_processor = utils.sharded_load(str(tmp_path), **options)
+    assert model.loaded_via_model_file
+    assert actual_processor is processor
+    assert initialize.call_count == (mode == "auto")
+    if mode == "pipeline":
+        assert model.pipeline_rank == 1
+        assert not hasattr(model, "prepared_rank")
+        assert not hasattr(model, "rank")
+    else:
+        assert model.prepared_rank == model.rank == 1
+
+
+def test_load_keeps_sharding_group_out_of_processor_kwargs(tmp_path):
+    from mlx_vlm import utils
+
+    _write_checkpoint(tmp_path)
+    group = NS(rank=lambda: 0, size=lambda: 1)
+    with (
+        patch.object(utils, "load_model", wraps=utils.load_model) as loader,
+        patch.object(utils, "load_processor", return_value=object()) as processor,
+        patch.object(
+            utils, "load_image_processor", return_value=None
+        ) as image_processor,
+    ):
+        utils.load(str(tmp_path), sharding_group=group, trust_remote_code=False)
+    assert loader.call_args.kwargs["sharding_group"] is group
+    for call in (processor.call_args, image_processor.call_args):
+        assert "sharding_group" not in call.kwargs
+        assert call.kwargs["trust_remote_code"] is False
 
 
 def test_qwen3_omni_audio_batch_matches_repeated_input():

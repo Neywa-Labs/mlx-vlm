@@ -1151,6 +1151,7 @@ class DistributedWorker:
         model, processor = load(
             str(path),
             lazy=True,
+            sharding_group=self.group,
             trust_remote_code=trust_remote_code,
             local_files_only=True,
         )

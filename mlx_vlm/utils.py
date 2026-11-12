@@ -386,6 +386,7 @@ def get_model_path(
 def load_model(
     model_path: Path,
     lazy: bool = False,
+    sharding_group: Optional[mx.distributed.Group] = None,
     **kwargs,
 ) -> nn.Module:
     """
@@ -396,6 +397,9 @@ def load_model(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        sharding_group: Optional group for architecture-specific checkpoint
+            preparation before conversion. Call ``model.shard(group)`` afterwards
+            to complete the normal distributed loading sequence.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -483,6 +487,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_config.model_path = str(model_path)
 
     model = model_class.Model(model_config)
+
+    # Some MoE checkpoints must select rank-local experts before conversion or
+    # stacking. Slicing a fully stacked tensor afterwards can retain its entire
+    # backing allocation even when the requested shard is small.
+    if sharding_group is not None and hasattr(model, "prepare_sharded_weights"):
+        weights = model.prepare_sharded_weights(weights, sharding_group)
 
     quantization_config = config.get("quantization_config", None)
     if quantization_config is None:
@@ -829,6 +839,7 @@ def load(
     lazy: bool = False,
     revision: Optional[str] = None,
     strict: bool = True,
+    sharding_group: Optional[mx.distributed.Group] = None,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -847,6 +858,9 @@ def load(
             a tag, or a commit hash. Default: ``None``.
         strict (bool): Whether or not to raise an exception if weights don't
             match. Default: ``True``.
+        sharding_group: Optional group for architecture-specific checkpoint
+            preparation before conversion. Passed only to the model loader;
+            callers still complete sharding with ``model.shard(group)``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -862,7 +876,9 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, strict=strict, **kwargs)
+    model = load_model(
+        model_path, lazy, strict=strict, sharding_group=sharding_group, **kwargs
+    )
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -891,12 +907,12 @@ def sharded_load(
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
 
-    # Lazy load model to figure out what type of sharding we can do and which
-    # weights we need to download.
-    model = load_model(model_path, lazy=True, strict=False)
-    config = model.config.to_dict()
-
-    has_tensor_parallel = hasattr(model, "shard")
+    # Resolve the group before loading so architectures can select their weights
+    # before conversion and expert stacking.
+    architecture, _ = get_model_and_args(
+        config=load_config(model_path), model_path=model_path
+    )
+    has_tensor_parallel = hasattr(architecture.Model, "shard")
 
     if tensor_group is not None and not has_tensor_parallel:
         raise ValueError(
@@ -906,6 +922,9 @@ def sharded_load(
     if tensor_group is None and pipeline_group is None:
         if has_tensor_parallel:
             tensor_group = mx.distributed.init()
+
+    model = load_model(model_path, lazy=True, strict=False, sharding_group=tensor_group)
+    config = model.config.to_dict()
 
     processor = load_processor(
         model_path, True, eos_token_ids=config.get("eos_token_id", None)
