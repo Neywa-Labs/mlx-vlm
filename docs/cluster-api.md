@@ -372,7 +372,8 @@ Reasoning, tool events, compaction capsules, usage, and terminal events retain
 the normal Responses contract. MiniMax thinking delimiters are parsed across
 arbitrary token boundaries, including closing-only continuations.
 
-The same shared Responses generation path emits:
+Local serving and distributed workers both use `ResponseGenerator`'s existing
+prefill measurements. The Responses endpoint exposes them as events:
 
 ```json
 {"type":"response.prompt_progress","response_id":"resp_…","status":"in_progress","processed_tokens":512,"total_tokens":2048}
@@ -381,6 +382,8 @@ The same shared Responses generation path emits:
 
 Prefill uses `started`, `in_progress`, and `completed` with monotonic, measured
 counts, emitted while actual prefill runs and before the first generated token.
+The direct `stream_generate` fallback has no scheduler prefill measurements and
+does not emit prompt-progress events.
 Generation timing fields appear only when measured. `timings.predicted_per_second`
 uses the same field name as regular text events and native generation metrics.
 The coordinator forwards rank zero's measurements. Timing or progress frequency

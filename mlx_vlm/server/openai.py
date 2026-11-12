@@ -44,7 +44,6 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .progress import ProgressChannel
 from .request_normalization import (
     _chat_message_to_prompt,
     _normalize_instruction_messages,
@@ -1538,9 +1537,8 @@ async def responses_endpoint(request: Request):
                                 finish_reason = token.finish_reason
                                 break
                     else:
-                        # Fallback uses the same producer measurements, with
-                        # prefill callbacks delivered before next() yields a token.
-                        progress_channel = ProgressChannel()
+                        # Fallback to stream_generate. Prefill measurements come
+                        # from ResponseGenerator in normal local/worker serving.
                         token_iterator = continuation.stream_generation(
                             stream_generate,
                             model=model,
@@ -1550,23 +1548,13 @@ async def responses_endpoint(request: Request):
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             args=gen_args,
-                            prompt_progress_callback=progress_channel,
                             **kwargs,
                         )
 
-                        async for chunk in progress_channel.consume(token_iterator):
+                        for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
-                            progress = getattr(chunk, "prompt_progress", None)
-                            if progress is not None:
-                                event = PromptProgress(
-                                    response_id=response_id, **progress
-                                )
-                                yield _response_sse_event(
-                                    event.type, event.model_dump()
-                                )
-                                continue
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)

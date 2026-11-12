@@ -6393,7 +6393,8 @@ class TestResponseGenerator:
                 for field in ("token_number=", "token_id=", "text=")
             )
 
-    def test_prefill_progress_logging(self, caplog):
+    @pytest.mark.parametrize("emit_progress", [False, True])
+    def test_prefill_progress_logging_and_events(self, caplog, emit_progress):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
         gen = Generator.__new__(Generator)
         prompt_batch = NS(
@@ -6405,11 +6406,38 @@ class TestResponseGenerator:
             _left_padding_per_row=[0],
             _right_pad_per_row=None,
         )
-        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+        updates = Queue()
+        active = {
+            1: {
+                "request_id": "req-1",
+                "prefill_processed": -1,
+                "emit_prompt_progress": emit_progress,
+                "rqueue": updates,
+            }
+        }
 
         gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
+
+        # Re-polling a chunk must not duplicate events or regress the count.
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        prompt_batch._processed_prompt_columns = 4
+        prompt_batch._inputs_embeds = mx.zeros((1, 2, 8))
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        gen._log_prefill_completed(1, active[1], NS(prompt_tokens=6))
+        if emit_progress:
+            tokens = [updates.get_nowait() for _ in range(3)]
+            assert [t.prompt_progress for t in tokens] == [
+                {"status": status, "processed_tokens": count, "total_tokens": 6}
+                for status, count in (
+                    ("in_progress", 2),
+                    ("in_progress", 4),
+                    ("completed", 6),
+                )
+            ]
+            assert all(t.token_count == 0 and t.text == "" for t in tokens)
+        assert updates.empty()
 
     @pytest.mark.parametrize(
         "delayed", [False, True], ids=["timeout-cancels", "delayed-token"]

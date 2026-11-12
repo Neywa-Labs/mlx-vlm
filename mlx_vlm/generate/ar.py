@@ -205,7 +205,6 @@ def generate_step(
     draft_model: Optional[nn.Module] = None,
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
-    prompt_progress_callback: Optional[Callable[[int, int, str], None]] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
     prompt_cache_checkpoint_lengths: Optional[List[int]] = None,
@@ -436,9 +435,6 @@ def generate_step(
         )
 
         inputs_embeds = embedding_output.inputs_embeds
-        progress_total = int(inputs_embeds.shape[1])
-        if prompt_progress_callback is not None:
-            prompt_progress_callback(0, progress_total, "started")
 
         kwargs.update(
             {
@@ -511,10 +507,6 @@ def generate_step(
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
-                    if prompt_progress_callback is not None:
-                        prompt_progress_callback(
-                            processed_tokens, progress_total, "in_progress"
-                        )
                     if checkpoint_lengths and processed_tokens == checkpoint_lengths[0]:
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
                         checkpoint_lengths.pop(0)
@@ -528,9 +520,6 @@ def generate_step(
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y, logprobs)
-    if prompt_progress_callback is not None:
-        mx.eval(y, logprobs)
-        prompt_progress_callback(progress_total, progress_total, "completed")
 
     # Speculative decoding
     if draft_model is not None:
