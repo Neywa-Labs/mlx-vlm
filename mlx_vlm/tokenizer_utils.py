@@ -325,9 +325,15 @@ class _ServerTokenStreamer:
 
     def _emit_text(self, text: str) -> str:
         if text and not self._started:
-            self._started = True
             if self._trim_space:
+                # Strip the leading SPM space artifact. A standalone "▁"
+                # token decodes to a lone " ", so trimming it leaves the chunk
+                # empty; stay unstarted so the space on the following token is
+                # also trimmed, matching SPMStreamingDetokenizer.
                 text = _remove_space(text)
+                if not text:
+                    return text
+            self._started = True
         return text
 
     def _fallback_decode(self, token: int) -> str:
