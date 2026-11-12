@@ -47,6 +47,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    sharded_load,
 )
 
 
@@ -1748,8 +1749,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
 
 
 @pytest.mark.parametrize("expert_count", [8, 128])
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case, expert_count
+    tmp_path, mistral_large4_case, expert_count, config_filename
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1837,9 +1839,12 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
+    if config_filename == "params.json":
+        assert not (tmp_path / "config.json").exists()
+        assert json.loads((tmp_path / "params.json").read_text()) == config
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -1911,7 +1916,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
 
     # Native staging uses global expert IDs, including nonzero starting ranks.
     config["text_config"].update(expert_start=2, expert_end=5)
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     partition = load_model(tmp_path)
     for key, value in tree_flatten(partition.parameters()):
         if ".experts." in key:
@@ -1923,7 +1928,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "bits": 4,
         "mode": "nvfp4",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
     restored = load_model(tmp_path)
     np.testing.assert_array_equal(
@@ -1938,7 +1943,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     for rank in range(3):
         start, end = expert_count * rank // 3, expert_count * (rank + 1) // 3
         config["text_config"].update(expert_start=start, expert_end=end)
-        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / config_filename).write_text(json.dumps(config))
         local = {k: v[start:end] if ".experts." in k else v for k, v in saved.items()}
         mx.save_safetensors(str(tmp_path / "model.safetensors"), local)
         check_partition(rank)
@@ -1963,7 +1968,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
             "quant_algo": "MIXED_PRECISION",
         }
         config.pop("quantization", None)
-        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / config_filename).write_text(json.dumps(config))
         local = {
             k: v
             for k, v in native.items()
@@ -3115,6 +3120,71 @@ def test_minimax_multimodal_model_exposes_sharding():
     shard.assert_called_once_with(group)
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_deepseek_v4_sharded_load(tmp_path, pipeline):
+    from mlx_vlm.models import deepseek_v4
+
+    config = build_config(deepseek_v4, model_case("deepseek_v4")["config"])
+    reference = deepseek_v4.Model(config)
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    group = mx.distributed.init()
+    assert group.size() == 1
+    with patch("mlx_vlm.utils.load_processor", return_value=object()):
+        model, _ = sharded_load(
+            tmp_path,
+            tensor_group=group,
+            pipeline_group=group if pipeline else None,
+        )
+    assert model.language_model.layers[0].attn.sharding_group is group
+    assert callable(model.language_model.model.pipeline)
+    for key, value in tree_flatten(model.parameters()):
+        assert mx.array_equal(value, weights[key]).item(), key
+    ids = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(
+        np.array(model(ids).logits), np.array(reference(ids).logits)
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+def test_deepseek_v4_sharding_allows_replicated_kv(world_size):
+    from mlx_vlm.models import deepseek_v4
+
+    architecture, _ = get_model_and_args({"model_type": "deepseek_v4"})
+    assert callable(architecture.Model.shard)
+    assert architecture.validate_sharding is deepseek_v4.validate_sharding
+    architecture.validate_sharding({"num_key_value_heads": 1}, world_size)
+
+
+@pytest.mark.parametrize(
+    "overrides,world_size,message",
+    [
+        ({}, 0, "worker count"),
+        ({}, 3, "query heads"),
+        ({}, 16, "query heads"),
+        (
+            {"num_attention_heads": 4, "moe_intermediate_size": 7},
+            2,
+            "expert intermediate",
+        ),
+    ],
+)
+def test_deepseek_v4_sharding_rejects_invalid_partitions_before_mutation(
+    overrides, world_size, message
+):
+    from mlx_vlm.models import deepseek_v4
+
+    config = model_case("deepseek_v4")["config"]
+    config.update(overrides)
+    model = deepseek_v4.Model(build_config(deepseek_v4, config))
+    with patch.object(model.language_model, "shard") as shard:
+        with pytest.raises(ValueError, match=message):
+            model.shard(SimpleNamespace(size=lambda: world_size, rank=lambda: 0))
+    shard.assert_not_called()
+
+
 # Distributed language-model contracts
 
 
@@ -3875,7 +3945,36 @@ class TestPPDocLayoutV3(unittest.TestCase):
 # Loading and utility contracts
 
 
-def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+@pytest.mark.parametrize("params", [{"dim": 8}, {"dim": 8, "dsa": {"topk": 4}}])
+def test_load_config_preserves_params_schema(tmp_path, params):
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    assert load_config(tmp_path) == params
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+
+
+def test_load_config_accepts_standard_schema_params(tmp_path):
+    config = {"model_type": "deepseek_v4", "hidden_size": 8}
+    (tmp_path / "params.json").write_text(json.dumps(config))
+    assert load_config(tmp_path) == config
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_load_config_prefers_config_json(tmp_path, valid):
+    (tmp_path / "params.json").write_text(json.dumps({"model_type": "fallback"}))
+    config = {"model_type": "primary"}
+    (tmp_path / "config.json").write_text(json.dumps(config) if valid else "invalid")
+    if valid:
+        assert load_config(tmp_path) == config
+    else:
+        with pytest.raises(json.JSONDecodeError):
+            load_config(tmp_path)
+
+
+@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+def test_load_config_applies_generation_config_sampling_defaults(
+    tmp_path, config_filename
+):
     generation_config = {
         "eos_token_id": [2, 3],
         "do_sample": True,
@@ -3884,7 +3983,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
         "top_k": 64,
         "max_new_tokens": 4096,
     }
-    (tmp_path / "config.json").write_text(
+    (tmp_path / config_filename).write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}), encoding="utf-8"
     )
     (tmp_path / "generation_config.json").write_text(
@@ -6856,3 +6955,136 @@ def test_qwen3_5_attention_forwards_rope_parameters(omit_original_max):
         QWEN3_5_YARN_HF_ATTENTION_FACTOR, rel=1e-6
     )
     assert not rotary.fused_apply
+
+
+class TestGemma4PerLayerConfig:
+    """transformers 5.15+ saves Gemma 4's full-attention shapes as `per_layer_config`."""
+
+    @staticmethod
+    def _text(**extra):
+        params = {
+            "num_hidden_layers": 12,
+            "sliding_window_pattern": 6,
+            "num_key_value_heads": 16,
+            "head_dim": 256,
+            "attention_k_eq_v": True,
+        }
+        params.update(extra)
+        return params
+
+    def test_reads_full_attention_shapes(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+        from mlx_vlm.models.gemma4.language import Attention
+
+        per_layer = {"05": {"head_dim": 512, "num_key_value_heads": 4}}
+        per_layer["11"] = dict(per_layer["05"])
+        cfg = TextConfig.from_dict(self._text(per_layer_config=per_layer))
+        assert cfg.layer_types[5] == cfg.layer_types[11] == "full_attention"
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (512, 4)
+        assert Attention(cfg, 5).n_kv_heads == 4
+
+    def test_text_and_unified_configs(self):
+        from mlx_vlm.models.gemma4_text.config import ModelConfig as TextOnlyConfig
+        from mlx_vlm.models.gemma4_unified.config import TextConfig as UnifiedConfig
+
+        per_layer = {"05": {"head_dim": 384, "num_key_value_heads": 2}}
+        for cls in (TextOnlyConfig, UnifiedConfig):
+            cfg = cls.from_dict(
+                self._text(num_hidden_layers=6, per_layer_config=per_layer)
+            )
+            assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (384, 2)
+
+    def test_old_keys_without_per_layer_config(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(global_head_dim=384, num_global_key_value_heads=2)
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (384, 2)
+
+    def test_head_dim_only_inherits_kv_heads(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                attention_k_eq_v=False,
+                per_layer_config={"05": {"head_dim": 512}},
+            )
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (512, 16)
+
+    def test_rejects_shapes_it_cannot_represent(self):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        differing = {
+            "05": {"head_dim": 512, "num_key_value_heads": 4},
+            "11": {"head_dim": 512, "num_key_value_heads": 2},
+        }
+        with pytest.raises(ValueError, match="different shapes"):
+            TextConfig.from_dict(self._text(per_layer_config=differing))
+        for overrides in ({"head_dim": 512}, {"num_key_value_heads": 4}):
+            with pytest.raises(ValueError, match="different shapes"):
+                TextConfig.from_dict(self._text(per_layer_config={"05": overrides}))
+        with pytest.raises(ValueError, match="not a full-attention layer"):
+            TextConfig.from_dict(self._text(per_layer_config={"00": {"head_dim": 512}}))
+
+    @pytest.mark.parametrize(
+        "per_layer, expected_kv_heads",
+        [({}, 4), ({"05": {"num_key_value_heads": 2}}, 2)],
+    )
+    def test_inherits_omitted_shapes(self, per_layer, expected_kv_heads):
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        cfg = TextConfig.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                head_dim=64,
+                num_key_value_heads=4,
+                per_layer_config=per_layer,
+            )
+        )
+        assert (cfg.global_head_dim, cfg.num_global_key_value_heads) == (
+            64,
+            expected_kv_heads,
+        )
+
+    @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text", "gemma4_unified"])
+    @pytest.mark.parametrize("use_per_layer_config", [False, True])
+    def test_kv_heads_without_k_eq_v(self, model_type, use_per_layer_config):
+        config_module = importlib.import_module(f"mlx_vlm.models.{model_type}.config")
+        config_cls = (
+            config_module.ModelConfig
+            if model_type == "gemma4_text"
+            else config_module.TextConfig
+        )
+        language_type = "gemma4" if model_type == "gemma4_unified" else model_type
+        attention_cls = importlib.import_module(
+            f"mlx_vlm.models.{language_type}.language"
+        ).Attention
+        cfg = config_cls.from_dict(
+            self._text(
+                num_hidden_layers=6,
+                num_kv_shared_layers=0,
+                hidden_size=32,
+                num_attention_heads=4,
+                head_dim=8,
+                global_head_dim=16,
+                num_key_value_heads=4,
+                num_global_key_value_heads=2,
+                attention_k_eq_v=False,
+                per_layer_config=(
+                    {"05": {"head_dim": 16, "num_key_value_heads": 2}}
+                    if use_per_layer_config
+                    else None
+                ),
+            )
+        )
+        full = attention_cls(cfg, 5)
+        expected_kv_heads = 2 if use_per_layer_config else 4
+        assert not full.use_k_eq_v
+        assert full.n_kv_heads == expected_kv_heads
+        assert full.k_proj.weight.shape == (expected_kv_heads * 16, 32)
+        assert full.v_proj.weight.shape == full.k_proj.weight.shape
+        sliding = attention_cls(cfg, 0)
+        assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
