@@ -19,27 +19,14 @@ class Model(Mistral3Model):
         self.language_model = LanguageModel(config.text_config)
         self.vision_feature_layer = config.vision_feature_layer
 
-    def shard(self, group=None):
-        self.language_model.shard(group)
-
-    def prepare_sharded_weights(self, weights, group):
-        """Select experts before shared quantization conversion and stacking."""
+    def shard(self, group=None, *, weights=None):
+        """Shard parameters and optionally select checkpoint weights before conversion."""
         args = self.language_model.args
-        n = args.n_routed_experts
-        rank, size = group.rank(), group.size()
-        if not 0 <= rank < size <= n:
-            raise ValueError("Invalid expert partition")
-        start, end = n * rank // size, n * (rank + 1) // size
-        if not 0 <= start < end <= n:
-            raise ValueError("Invalid expert partition")
         original = (args.expert_start, args.expert_end)
-        if original not in ((0, n), (start, end)):
-            raise ValueError(
-                f"Checkpoint partition {original} does not match rank {rank}: "
-                f"expected {(start, end)}"
-            )
-        self.shard(group)
-        args.expert_start, args.expert_end = start, end
+        self.language_model.shard(group)
+        if weights is None:
+            return
+        start, end = args.expert_start, args.expert_end
         for key in list(weights):
             if key.startswith("mtp"):
                 del weights[key]
@@ -56,7 +43,7 @@ class Model(Mistral3Model):
                         f"{key}: expected {count} experts for checkpoint "
                         f"partition {original}, got shape {value.shape}"
                     )
-                if original == (0, n) and size > 1:
+                if original != (start, end):
                     # Gather owns its storage; even a contiguous slice can keep
                     # all experts' backing allocation alive after evaluation.
                     weights[key] = mx.take(value, mx.arange(start, end), axis=0)

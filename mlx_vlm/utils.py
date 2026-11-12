@@ -397,9 +397,9 @@ def load_model(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
-        sharding_group: Optional group for architecture-specific checkpoint
-            preparation before conversion. Call ``model.shard(group)`` afterwards
-            to complete the normal distributed loading sequence.
+        sharding_group: Optional group passed to ``model.shard(group, weights=...)``
+            before conversion when the architecture supports checkpoint weights.
+            Call ``model.shard(group)`` afterwards to complete distributed loading.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -488,11 +488,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
-    # Some MoE checkpoints must select rank-local experts before conversion or
-    # stacking. Slicing a fully stacked tensor afterwards can retain its entire
-    # backing allocation even when the requested shard is small.
-    if sharding_group is not None and hasattr(model, "prepare_sharded_weights"):
-        weights = model.prepare_sharded_weights(weights, sharding_group)
+    # Architectures accepting checkpoint weights can shard before conversion
+    # and stacking. Others retain the usual post-load model.shard(group) path.
+    shard = getattr(model, "shard", None)
+    if (
+        sharding_group is not None
+        and callable(shard)
+        and "weights" in inspect.signature(shard).parameters
+    ):
+        weights = shard(sharding_group, weights=weights)
 
     quantization_config = config.get("quantization_config", None)
     if quantization_config is None:

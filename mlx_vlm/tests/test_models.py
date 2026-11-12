@@ -2015,8 +2015,9 @@ def test_mistral_large4_early_sharding_native_fp8_experts(
 @pytest.mark.skipif(
     not mx.metal.is_available(), reason="Requires Metal allocation counters"
 )
-def test_mistral_large4_prepared_stacked_weights_release_full_storage(
-    mistral_large4_case,
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_mistral_large4_sharded_weights_release_full_storage(
+    mistral_large4_case, checkpoint
 ):
     import gc
 
@@ -2027,14 +2028,22 @@ def test_mistral_large4_prepared_stacked_weights_release_full_storage(
     baseline = mx.get_active_memory()
     # A regular contiguous slice retains this 32 MiB allocation. A prepared
     # rank owns only its selected experts once its lazy gather is evaluated.
-    weights = {"layers.1.experts.w1.weight": mx.ones((8, 1024, 1024))}
-    mx.eval(weights)
     group = NS(rank=lambda: 1, size=lambda: 3)
-    selected = model.prepare_sharded_weights(weights, group)
-    mx.eval(selected)
+    if checkpoint:
+        weights = {"layers.1.experts.w1.weight": mx.ones((8, 1024, 1024))}
+        mx.eval(weights)
+        selected = model.shard(group, weights=weights)
+        mx.eval(selected)
+        value = selected["layers.1.experts.w1.weight"]
+    else:
+        linear = model.language_model.layers[1].feed_forward.experts.w1
+        linear.weight = mx.ones((8, 1024, 1024))
+        mx.eval(model.parameters())
+        model.shard(group)
+        mx.eval(model.parameters())
+        value = linear.weight
     gc.collect()
     mx.synchronize()
-    value = selected["layers.1.experts.w1.weight"]
     assert value.shape == (3, 1024, 1024)
     assert mx.get_active_memory() - baseline < value.nbytes + 1024 * 1024
 
@@ -4198,22 +4207,31 @@ def test_missing_model_file_raises_clearly(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["tensor", "auto", "pipeline"])
-def test_sharded_load_resolves_checkpoint_model_file(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("checkpoint_sharding", [False, True])
+def test_sharded_load_resolves_checkpoint_model_file(
+    tmp_path, monkeypatch, mode, checkpoint_sharding
+):
     from mlx_vlm import utils
 
     _write_checkpoint(tmp_path)
     with (tmp_path / "model.py").open("a") as source:
         source.write("\nModelConfig.to_dict = lambda self: {}\n")
         source.write("Model.language_model = property(lambda self: self)\n")
-        source.write(
-            "Model.shard = lambda self, group: setattr(self, 'rank', group.rank())\n"
-        )
+        if checkpoint_sharding:
+            source.write(textwrap.dedent("""
+                def shard(self, group, *, weights=None):
+                    if weights is not None:
+                        self.prepared_rank = group.rank()
+                        return weights
+                    self.rank = group.rank()
+                Model.shard = shard
+                """))
+        else:
+            source.write(
+                "Model.shard = lambda self, group: setattr(self, 'rank', group.rank())\n"
+            )
         source.write(
             "Model.pipeline = lambda self, group: setattr(self, 'pipeline_rank', group.rank())\n"
-        )
-        source.write(
-            "Model.prepare_sharded_weights = lambda self, weights, group: "
-            "(setattr(self, 'prepared_rank', group.rank()) or weights)\n"
         )
     processor = object()
     group = NS(rank=lambda: 1, size=lambda: 3)
@@ -4231,7 +4249,11 @@ def test_sharded_load_resolves_checkpoint_model_file(tmp_path, monkeypatch, mode
         assert not hasattr(model, "prepared_rank")
         assert not hasattr(model, "rank")
     else:
-        assert model.prepared_rank == model.rank == 1
+        assert model.rank == 1
+        if checkpoint_sharding:
+            assert model.prepared_rank == 1
+        else:
+            assert not hasattr(model, "prepared_rank")
 
 
 def test_load_keeps_sharding_group_out_of_processor_kwargs(tmp_path):
