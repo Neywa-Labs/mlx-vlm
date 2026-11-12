@@ -4,11 +4,14 @@
 """Distributed request routing and staging without GPUs, downloads or SSH."""
 
 import asyncio
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
@@ -29,7 +32,6 @@ from mlx_vlm.server.distributed import (
     DistributedWorker,
     ModelStager,
     Worker,
-    _manifest,
     _semantic,
     cluster_lock,
 )
@@ -49,6 +51,23 @@ def cluster(tmp_path):
 
 
 @pytest.fixture
+def staging_cluster(cluster):
+    # Exercise real helper verification and publication without remote machines.
+    return replace(
+        cluster,
+        workers=(
+            replace(cluster.workers[0], node_id="a"),
+            replace(
+                cluster.workers[1],
+                ssh=None,
+                node_id="b",
+                model_dir=str(cluster.model_dir.parent / "peer"),
+            ),
+        ),
+    )
+
+
+@pytest.fixture
 def checkpoint(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
@@ -61,73 +80,76 @@ def checkpoint(tmp_path, monkeypatch):
 
 
 def test_staging_reuses_local_content_and_resolves_hub_only_once(
-    cluster, checkpoint, monkeypatch
+    staging_cluster, checkpoint, monkeypatch
 ):
     resolve = Mock(return_value=checkpoint)
     monkeypatch.setattr(utils, "get_model_path", resolve)
-    stager = ModelStager(cluster)
-    remote = Mock(return_value=0)  # Peer already has the verified snapshot.
-    monkeypatch.setattr(stager, "_remote", remote)
+    stager = ModelStager(staging_cluster)
     result = Path(stager.prepare("org/model", "revision-a"))
-    assert result.parent == cluster.model_dir
+    assert result.parent == staging_cluster.model_dir
     assert (result / "model.safetensors").read_bytes() == b"fixture weights"
-    assert json.loads((result / MANIFEST).read_text()) == _manifest(checkpoint)
+    assert json.loads((result / MANIFEST).read_text()) == {
+        p.name: {
+            "size": p.stat().st_size,
+            "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+        }
+        for p in checkpoint.iterdir()
+    }
     assert stager.prepare("org/model", "revision-a") == str(result)
     resolve.assert_called_once_with("org/model", revision="revision-a")
-    remote.assert_called_once()
+    assert all(
+        r["transport"] == "verified_cache" for r in stager.worker_transfers.values()
+    )
 
 
-def test_hub_symlinks_are_materialized(cluster, checkpoint, tmp_path, monkeypatch):
+def test_hub_symlinks_are_materialized(staging_cluster, checkpoint, tmp_path):
     weights = checkpoint / "model.safetensors"
     blob = tmp_path / "blob"
     weights.rename(blob)
     weights.symlink_to(blob)
-    stager = ModelStager(cluster)
-    monkeypatch.setattr(stager, "_remote", lambda *a, **k: 0)
-    result = Path(stager.prepare(str(checkpoint)))
+    result = Path(ModelStager(staging_cluster).prepare(str(checkpoint)))
     assert not (result / weights.name).is_symlink()
     assert (result / weights.name).read_bytes() == blob.read_bytes()
 
 
+@pytest.mark.parametrize("transport", ["ssh_rsync", "auto", "jaccl_rdma"])
 def test_incomplete_or_unsupported_checkpoint_does_not_transfer(
-    cluster, checkpoint, monkeypatch
+    staging_cluster, checkpoint, monkeypatch, transport
 ):
-    stager = ModelStager(cluster)
-    remote = Mock()
-    monkeypatch.setattr(stager, "_remote", remote)
+    transfers = Mock()
+    stager = ModelStager(staging_cluster, transfers=transfers)
     (checkpoint / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "missing.safetensors"}})
     )
     with pytest.raises(ValueError, match="Incomplete checkpoint"):
-        stager.prepare(str(checkpoint))
-    remote.assert_not_called()
+        stager.prepare(str(checkpoint), transport=transport)
+    transfers.deliver.assert_not_called()
     monkeypatch.setattr(
         utils, "get_model_and_args", lambda *_: (NS(Model=object), "test")
     )
     with pytest.raises(ValueError, match="no distributed shard"):
-        stager.prepare(str(checkpoint))
+        stager.prepare(str(checkpoint), transport=transport)
+    transfers.deliver.assert_not_called()
 
 
-def test_transfer_failure_never_marks_model_prepared(cluster, checkpoint, monkeypatch):
-    stager = ModelStager(cluster)
-    monkeypatch.setattr(
-        stager, "_remote", lambda *a, **k: 3 if a[1][-1] == "verify" else 0
-    )
-    original = stager._run
+def test_transfer_failure_never_marks_model_prepared(
+    staging_cluster, checkpoint, monkeypatch
+):
+    stager = ModelStager(staging_cluster)
     transfers = []
 
-    def run(args, **kwargs):
-        if args[0] == "rsync":
-            transfers.append(args)
-            return subprocess.CompletedProcess(args, 1, "", "transfer interrupted")
-        return original(args, **kwargs)
+    def copy(args, **kwargs):
+        transfers.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "transfer interrupted")
 
-    monkeypatch.setattr(stager, "_run", run)
+    monkeypatch.setattr("mlx_vlm.server.checkpoint_transfer.run_rsync", copy)
     with pytest.raises(RuntimeError, match="transfer interrupted"):
         stager.prepare(str(checkpoint))
-    assert not stager.prepared
+    peer = staging_cluster.workers[1]
+    assert peer.url not in stager.worker_transfers
+    assert not list(Path(peer.model_dir).glob("*/" + MANIFEST))
     assert "--checksum" in transfers[0] and "-aL" in transfers[0]
-    assert transfers[0][-1].startswith("mac-two:")
+    assert transfers[0][-1].startswith(peer.model_dir)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 7, 1024])
@@ -298,22 +320,18 @@ def test_real_rsync_progress_reuses_existing_files_and_counts_payload(tmp_path):
 
 @pytest.mark.parametrize("bad_checksum", [False, True])
 def test_staging_progress_is_live_per_worker_and_readiness_requires_verification(
-    cluster, checkpoint, monkeypatch, bad_checksum
+    staging_cluster, checkpoint, monkeypatch, bad_checksum
 ):
-    stager = ModelStager(cluster)
+    stager = ModelStager(staging_cluster)
     updates = []
 
-    def remote(worker, args, **kwargs):
-        if args[-1] == "verify":
-            return 3
-        if args[-1] == "commit":
-            assert updates[-1][0] == "verifying_worker"
-            return 3 if bad_checksum else 0
-        return 0
-
-    def copy(args, *, input, timeout, total_bytes, progress):
+    def copy(args, *, input, timeout, total_bytes, progress, stop):
         assert "--checksum" in args and "--partial" in args
-        assert args[-1].startswith("mac-two:")
+        source, target = Path(args[-2]), Path(args[-1])
+        for name in input.splitlines():
+            shutil.copyfile(source / name, target / name)
+        if bad_checksum:
+            (target / "model.safetensors").write_bytes(b"corrupt weights")
         for count in (total_bytes // 2, total_bytes):
             progress(bytes_transferred=count, bytes_reused=0, total_bytes=total_bytes)
             assert updates[-1][1]["bytes_transferred"] == count
@@ -323,28 +341,15 @@ def test_staging_progress_is_live_per_worker_and_readiness_requires_verification
         )
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    from dataclasses import replace
-
-    monkeypatch.setattr(
-        stager,
-        "config",
-        replace(
-            cluster,
-            workers=(
-                replace(cluster.workers[0], node_id="a"),
-                replace(cluster.workers[1], node_id="b"),
-            ),
-        ),
-    )
-    monkeypatch.setattr(stager, "_remote", remote)
-    monkeypatch.setattr("mlx_vlm.server.distributed.run_rsync", copy)
+    monkeypatch.setattr("mlx_vlm.server.checkpoint_transfer.run_rsync", copy)
     if bad_checksum:
-        with pytest.raises(RuntimeError, match="checksum verification failed"):
+        with pytest.raises(RuntimeError, match="checksum mismatch"):
             stager.prepare(
                 str(checkpoint),
                 progress=lambda phase, **data: updates.append((phase, data)),
             )
-        assert not stager.prepared and updates[-1][0] == "verifying_worker"
+        assert staging_cluster.workers[1].url not in stager.worker_transfers
+        assert updates[-1][0] == "verifying_worker"
     else:
         stager.prepare(
             str(checkpoint),
@@ -357,23 +362,21 @@ def test_staging_progress_is_live_per_worker_and_readiness_requires_verification
     assert copying[1]["bytes_transferred"] < copying[1]["total_bytes"]
 
 
-def test_corrupt_existing_snapshot_is_not_used(cluster, checkpoint, monkeypatch):
-    stager = ModelStager(cluster)
-    monkeypatch.setattr(stager, "_remote", lambda *a, **k: 0)
-    result = Path(stager.prepare(str(checkpoint)))
-    (result / "model.safetensors").write_bytes(b"corrupted")
-    fresh = ModelStager(cluster)
-    with pytest.raises(RuntimeError, match="failed verification"):
-        fresh.prepare(str(checkpoint))
+def test_corrupt_existing_snapshot_is_not_used(staging_cluster, checkpoint):
+    result = Path(ModelStager(staging_cluster).prepare(str(checkpoint)))
+    weights = result / "model.safetensors"
+    weights.chmod(0o600)
+    weights.write_bytes(b"X" * weights.stat().st_size)
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        ModelStager(staging_cluster).prepare(str(checkpoint))
 
 
-def test_selecting_another_model_stages_new_snapshot(cluster, checkpoint, monkeypatch):
+def test_selecting_another_model_stages_new_snapshot(staging_cluster, checkpoint):
     second = checkpoint.parent / "second-model"
     second.mkdir()
     (second / "config.json").write_bytes((checkpoint / "config.json").read_bytes())
     (second / "model.safetensors").write_bytes(b"different weights")
-    stager = ModelStager(cluster)
-    monkeypatch.setattr(stager, "_remote", lambda *a, **k: 0)
+    stager = ModelStager(staging_cluster)
     first_path = stager.prepare(str(checkpoint))
     second_path = stager.prepare(str(second))
     assert first_path != second_path
@@ -1690,3 +1693,20 @@ def test_management_and_inference_staging_cannot_write_same_peer_concurrently(cl
         assert not peer_entered.wait(0.05)
         release.set()
         assert a.result() == "first" and b.result() == "second"
+
+
+@pytest.mark.parametrize("transport", ["ssh_rsync", "auto", "jaccl_rdma"])
+def test_preparation_cancelled_while_waiting_for_staging_lock(cluster, transport):
+    from concurrent.futures import ThreadPoolExecutor
+
+    stager = ModelStager(cluster)
+    stop = threading.Event()
+    with cluster_lock(Path(str(cluster.shared_lock) + ".staging")):
+        with ThreadPoolExecutor(1) as pool:
+            waiting = pool.submit(
+                stager.prepare, "must-not-resolve", transport=transport, stop=stop
+            )
+            stop.set()
+            with pytest.raises(InterruptedError, match="cancelled"):
+                waiting.result(timeout=2)
+    assert not stager.sources and not stager.worker_transfers

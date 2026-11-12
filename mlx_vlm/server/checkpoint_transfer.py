@@ -415,77 +415,9 @@ class TransferPool:
         counters["bytes_reused"] = state["bytes_reused"]
         counters["bytes_verified"] = state["bytes_reused"]
         if selected == "jaccl_rdma":
-            update("connecting")
-            pair.connect(stop)
-            update("connected")
-            common = dict(manifest=manifest, missing=state["missing"])
-            receiver = pair.remote.submit("receive", path=state["path"], **common)
-            sender = pair.local.submit(
-                "send", root=str(Path(source).parent), path=str(source), **common
-            )
-
-            # Drain both streams while the file is in flight; never buffer a
-            # checkpoint's worth of progress waiting for the other rank.
-            def receiving(data):
-                update(
-                    bytes_received=data["bytes_received"],
-                    bytes_verified=state["bytes_reused"] + data["bytes_verified"],
-                    bytes_transferred=data["bytes_received"],
-                )
-
-            def sending(data):
-                counters["bytes_read"] = data["bytes_read"]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                sent = pool.submit(pair.local.wait, sender, progress=sending, stop=stop)
-                received = pool.submit(
-                    pair.remote.wait, receiver, progress=receiving, stop=stop
-                )
-                try:
-                    done, _ = concurrent.futures.wait(
-                        [sent, received], return_when=concurrent.futures.FIRST_EXCEPTION
-                    )
-                    for future in done:
-                        future.result()
-                except BaseException:
-                    pair.close()  # Unblock the other rank's native collective too.
-                    raise
+            self._rdma(pair, source, manifest, state, counters, update, stop)
         else:
-            update()
-            args = [
-                "rsync",
-                "-aL",
-                "--checksum",
-                "--partial",
-                "--files-from=-",
-                "-e",
-                shlex.join(ssh_command(config)),
-                str(source) + "/",
-                (
-                    f"{worker.ssh}:{state['path']}/"
-                    if worker.ssh
-                    else state["path"] + "/"
-                ),
-            ]
-            copied = run_rsync(
-                args,
-                input="\n".join(manifest["files"]) + "\n",
-                timeout=config.timeout,
-                total_bytes=total,
-                progress=lambda **data: update(**data),
-                stop=stop,
-            )
-            if copied.returncode:
-                raise RuntimeError("Checkpoint rsync failed: " + copied.stderr[-1000:])
-            store.cancelled(stop)
-            pair.remote.call(
-                "verify",
-                manifest=manifest,
-                stop=stop,
-                progress=lambda data: update(
-                    "verifying_worker", bytes_verified=data["bytes_verified"]
-                ),
-            )
+            self._rsync(pair, source, manifest, state, total, update, stop)
         store.cancelled(stop)
         update("publishing")
         store.cancelled(stop)
@@ -500,3 +432,77 @@ class TransferPool:
             "rdma_validated": pair.validated,
             "helper_pids": [p.pid for p in (pair.local, pair.remote) if p],
         }
+
+    @staticmethod
+    def _rdma(pair, source, manifest, state, counters, update, stop):
+        update("connecting")
+        pair.connect(stop)
+        update("connected")
+        common = dict(manifest=manifest, missing=state["missing"])
+        receiver = pair.remote.submit("receive", path=state["path"], **common)
+        sender = pair.local.submit(
+            "send", root=str(Path(source).parent), path=str(source), **common
+        )
+
+        # Drain both streams while the file is in flight; never buffer a
+        # checkpoint's worth of progress waiting for the other rank.
+        def receiving(data):
+            update(
+                bytes_received=data["bytes_received"],
+                bytes_verified=state["bytes_reused"] + data["bytes_verified"],
+                bytes_transferred=data["bytes_received"],
+            )
+
+        def sending(data):
+            counters["bytes_read"] = data["bytes_read"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            sent = pool.submit(pair.local.wait, sender, progress=sending, stop=stop)
+            received = pool.submit(
+                pair.remote.wait, receiver, progress=receiving, stop=stop
+            )
+            try:
+                done, _ = concurrent.futures.wait(
+                    [sent, received], return_when=concurrent.futures.FIRST_EXCEPTION
+                )
+                for future in done:
+                    future.result()
+            except BaseException:
+                pair.close()  # Unblock the other rank's native collective too.
+                raise
+
+    @staticmethod
+    def _rsync(pair, source, manifest, state, total, update, stop):
+        worker, config = pair.worker, pair.config
+        update()
+        args = [
+            "rsync",
+            "-aL",
+            "--checksum",
+            "--partial",
+            "--files-from=-",
+            "-e",
+            shlex.join(ssh_command(config)),
+            str(source) + "/",
+            (f"{worker.ssh}:{state['path']}/" if worker.ssh else state["path"] + "/"),
+        ]
+        copied = run_rsync(
+            args,
+            input="\n".join(manifest["files"]) + "\n",
+            timeout=config.timeout,
+            total_bytes=total,
+            progress=lambda **data: update(**data),
+            stop=stop,
+        )
+        if copied.returncode:
+            raise RuntimeError("Checkpoint rsync failed: " + copied.stderr[-1000:])
+        store.cancelled(stop)
+        update("verifying_worker")
+        pair.remote.call(
+            "verify",
+            manifest=manifest,
+            stop=stop,
+            progress=lambda data: update(
+                "verifying_worker", bytes_verified=data["bytes_verified"]
+            ),
+        )

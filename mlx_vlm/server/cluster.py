@@ -600,7 +600,7 @@ class ClusterManager:
             )
             self.current = operation.id
             self.operations[operation.id] = operation
-            if kind == "prepare_model" and body.transport != "ssh_rsync":
+            if kind == "prepare_model":
                 self.transfer_stops[operation.id] = threading.Event()
             if key:
                 self.idempotency[key] = [signature, operation.id]
@@ -671,27 +671,22 @@ class ClusterManager:
         # Independent immutable delivery cache; never mutate the active model or
         # acquire an inference lease just to copy a checkpoint.
         config = self.config(targets)
-        if body.transport != "ssh_rsync":
-            from .checkpoint_transfer import TransferPool
+        from .checkpoint_transfer import TransferPool
 
-            if self.transfers is None:
-                self.transfers = TransferPool()
-            coordinator = runtime.distributed_coordinator
-            if coordinator:
-                coordinator.stager.transfers = self.transfers
+        if self.transfers is None:
+            self.transfers = TransferPool()
+        coordinator = runtime.distributed_coordinator
+        if coordinator:
+            coordinator.stager.transfers = self.transfers
         stager = ModelStager(config, transfers=self.transfers)
-        options = (
-            {"transport": body.transport, "stop": self.transfer_stops[operation.id]}
-            if body.transport != "ssh_rsync"
-            else {}
-        )
         prepared = await self.stage_model(
             operation,
             stager,
             body.model,
             body.revision,
             validate_sharding=False,
-            **options,
+            transport=body.transport,
+            stop=self.transfer_stops[operation.id],
         )
         operation.result = {
             "model": body.model,

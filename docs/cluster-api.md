@@ -55,7 +55,7 @@ All schemas are in `/openapi.json`. Management operations are serialized.
 | `POST /v1/cluster/start` | Attach a compatible existing collective or launch with the configured SSH launcher; optional model loads before readiness |
 | `POST /v1/cluster/stop` | Drain, dispose retained sessions if explicitly requested, stop owned processes or detach external processes |
 | `GET /v1/cluster/operations/{operation_id}` | Long-operation phase, progress/result, and terminal status/error |
-| `POST /v1/cluster/operations/{operation_id}/cancel` | Cancel an `auto`/`jaccl_rdma` preparation before publication; keep verified partial chunks for retry |
+| `POST /v1/cluster/operations/{operation_id}/cancel` | Cancel a model preparation before publication; keep verified partial chunks for retry |
 | `GET /v1/cluster/events` | Throttled SSE snapshots, connection/telemetry, membership, and operation updates |
 
 `start`, `stop`, and `models/prepare` return **202** with an `Operation`. Use
@@ -181,7 +181,9 @@ preserved for diagnosis; partial snapshots cannot be loaded.
 
 ## RDMA delivery and verified snapshot reuse
 
-`PrepareModel.transport` accepts `ssh_rsync` (the compatibility default),
+All transports use one preparation path for checkpoint validation, sealed
+snapshots, partial verification and atomic publication. Only the payload delivery
+step differs. `PrepareModel.transport` accepts `ssh_rsync` (the default),
 `jaccl_rdma` (require RDMA), or `auto` (try a configured direct RDMA pair, otherwise
 use SSH/rsync and emit `transport_fallback` with a `fallback_reason`). Automatic
 fallback is permitted only for a missing RDMA pair, an unavailable JACCL backend/device
@@ -264,7 +266,9 @@ completion bitmap. A valid destination snapshot reports `transport:
 "verified_cache"`, zero transferred bytes, and the entire checkpoint reused.
 The source manifest and destination receipts survive coordinator restarts;
 helper processes do not. Preparation and subsequent inference staging share
-the same snapshot store, so the latter can adopt the preparation receipt.
+the same snapshot store and verification receipts, including when switching
+between RDMA and SSH/rsync. Snapshots from the former whole-file staging format
+remain intact and loadable; a new preparation creates the chunk manifest once.
 
 Progress uses the existing operation/events endpoints:
 
@@ -291,9 +295,9 @@ Cancellation returns 202 and is observed through the original operation. A
 cancelled preparation finishes as `failed` with `preparation_cancelled`; a retry
 needs a new idempotency key. Publication is a commit point: cancellation after
 that point is rejected with `cancellation_too_late`. Already completed operations
-are returned unchanged. This endpoint does not cancel inference or legacy
-`ssh_rsync` preparations (`cancellation_unavailable`). Automatic rsync fallback
-inside an `auto` operation remains cancellable.
+are returned unchanged. Explicit SSH/rsync, RDMA and automatic preparations all
+support cancellation, including while waiting for the staging lock. This endpoint
+does not cancel inference or other lifecycle operations (`cancellation_unavailable`).
 
 The first snapshot still pays the initial hash/copy cost. Manifest reuse and warm
 helpers remove repeated work, not that initial verification. Published benchmark

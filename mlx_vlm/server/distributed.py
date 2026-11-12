@@ -15,9 +15,6 @@ import logging
 import os
 import re
 import secrets
-import shlex
-import shutil
-import subprocess
 import time
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
@@ -29,8 +26,8 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
+from .checkpoint_store import MANIFEST
 from .distributed_launch import LaunchConfig
-from .rsync_progress import run_rsync
 
 logger = logging.getLogger("mlx_vlm.server.distributed")
 
@@ -41,7 +38,6 @@ ROUTES = {
     "/v1/responses/input_tokens",
     "/v1/responses/compact",
 }
-MANIFEST = ".mlx-vlm-distributed.json"
 CANCEL_ROUTE = "/internal/distributed/cancel"
 REQUEST_HEADER = "X-MLX-Distributed-Request"
 MODEL_SUFFIXES = {
@@ -65,60 +61,6 @@ def _digest_file(path):
         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _manifest(directory):
-    files = {}
-    for path in sorted(directory.rglob("*")):
-        relative = path.relative_to(directory)
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-        if not path.is_file() or path.suffix not in MODEL_SUFFIXES:
-            continue
-        name = relative.as_posix()
-        if "\n" in name or "\r" in name:
-            raise ValueError("Model filenames cannot contain newlines")
-        files[name] = {"size": path.stat().st_size, "sha256": _digest_file(path)}
-    if "config.json" not in files or not any(n.endswith(".safetensors") for n in files):
-        raise ValueError("Model must contain config.json and safetensors weights")
-    for name in files:
-        if name.endswith(".safetensors.index.json"):
-            index = json.loads((directory / name).read_text())
-            missing = set(index.get("weight_map", {}).values()) - files.keys()
-            if missing:
-                raise ValueError(f"Incomplete checkpoint: missing {sorted(missing)}")
-    return files
-
-
-# Runs with the configured Python on a worker; no MLX imports or Hub access.
-# The manifest comes over stdin, never as shell-interpolated code.
-_VERIFY = r"""
-import hashlib, json, os, pathlib, sys
-root, digest, mode = sys.argv[1:]
-files = json.load(sys.stdin)
-final = pathlib.Path(root) / digest
-path = pathlib.Path(root) / ('.partial-' + digest) if mode == 'commit' else final
-if not path.is_dir():
-    sys.exit(3)
-for name, record in files.items():
-    rel = pathlib.PurePosixPath(name)
-    if rel.is_absolute() or '..' in rel.parts:
-        raise ValueError('Invalid manifest path')
-    file = path / name
-    if not file.is_file() or file.is_symlink() or file.stat().st_size != record['size']:
-        sys.exit(3)
-    h = hashlib.sha256()
-    with file.open('rb') as f:
-        for block in iter(lambda: f.read(4 * 1024 * 1024), b''):
-            h.update(block)
-    if h.hexdigest() != record['sha256']:
-        sys.exit(3)
-if mode == 'commit':
-    (path / '.mlx-vlm-distributed.json').write_text(json.dumps(files, sort_keys=True))
-    if final.exists():
-        raise ValueError('Existing model snapshot failed verification; preserve it for diagnosis')
-    os.rename(path, final)
-"""
 
 
 @dataclass(frozen=True)
@@ -231,7 +173,7 @@ class ClusterConfig:
 class ModelStager:
     def __init__(self, config, transfers=None):
         self.config = config
-        self.prepared = {}
+        self.sources = {}
         self.worker_paths = {}
         self.worker_transfers = {}
         self.transfers = transfers
@@ -249,30 +191,10 @@ class ModelStager:
         # Native snapshot_download reuses cached blobs and downloads missing files.
         # A local-files-only snapshot lookup cannot establish that every tokenizer
         # or weight file is present. Only this coordinator contacts the Hub.
-        return get_model_path(model, revision=revision)
-
-    def _run(self, args, **kwargs):
-        return subprocess.run(
-            args, capture_output=True, text=True, timeout=self.config.timeout, **kwargs
-        )
-
-    def _remote(self, worker, command, **kwargs):
-        result = self._run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                *self.config.ssh_options,
-                worker.ssh,
-                shlex.join(command),
-            ],
-            **kwargs,
-        )
-        if result.returncode not in (0, 3):
-            raise RuntimeError(
-                f"Worker staging failed ({worker.url}): {result.stderr[-1000:]}"
-            )
-        return result.returncode
+        key = (model, revision)
+        if key not in self.sources:
+            self.sources[key] = get_model_path(model, revision=revision)
+        return self.sources[key]
 
     def prepare(
         self,
@@ -286,43 +208,37 @@ class ModelStager:
     ):
         # Management preparation and inference can target the same immutable
         # snapshot. Serialize staging even when their coordinator caches differ.
+        from .checkpoint_store import cancelled
+
         staging_lock = Path(str(self.config.shared_lock) + ".staging")
         staging_lock.parent.mkdir(parents=True, exist_ok=True)
         with staging_lock.open("a+") as lock:
-            if transport != "ssh_rsync":
-                from .checkpoint_store import cancelled
-
-                while True:
-                    cancelled(stop)
-                    try:
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        time.sleep(0.1)
-            else:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-            if transport != "ssh_rsync":
-                return self._prepare_chunks(
-                    model,
-                    revision,
-                    validate_sharding=validate_sharding,
-                    progress=progress,
-                    transport=transport,
-                    stop=stop,
-                )
+            while True:
+                cancelled(stop)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.1)
             return self._prepare(
-                model, revision, validate_sharding=validate_sharding, progress=progress
+                model,
+                revision,
+                validate_sharding=validate_sharding,
+                progress=progress,
+                transport=transport,
+                stop=stop,
             )
 
-    def _prepare_chunks(
+    def _prepare(
         self, model, revision, *, validate_sharding, progress, transport, stop
     ):
-        from ..utils import load_config
+        from ..utils import get_model_and_args, load_config
         from .checkpoint_store import prepare_snapshot
         from .checkpoint_transfer import TransferPool
 
         if transport not in {"auto", "jaccl_rdma", "ssh_rsync"}:
             raise ValueError("Unsupported checkpoint transport")
+        self.worker_transfers.clear()
 
         def report(phase, **data):
             if progress:
@@ -336,6 +252,9 @@ class ModelStager:
                 "Custom model_file checkpoints are not supported in distributed mode"
             )
         if validate_sharding:
+            architecture, _ = get_model_and_args(config)
+            if not callable(getattr(architecture.Model, "shard", None)):
+                raise ValueError("This model has no distributed shard implementation")
             from .cluster import validate_model
 
             validate_model(config, len(self.config.workers))
@@ -390,162 +309,6 @@ class ModelStager:
         finally:
             if self.transfers is None:
                 pool.close()
-
-    def _prepare(self, model, revision=None, *, validate_sharding=True, progress=None):
-        def report(phase, **data):
-            if progress:
-                progress(phase, **data)
-
-        key = (model, revision)
-        if key in self.prepared:
-            return self.prepared[key]
-        logger.info(
-            "Resolving distributed model on coordinator: %s (revision=%s)",
-            model,
-            revision,
-        )
-        report("resolving_model")
-        source = self._resolve(model, revision)
-        # Public prepare and inference share immutable snapshots. A preparation
-        # receipt selects the verified-chunk path without rescanning all weights
-        # through the older rsync stager when inference loads that same model.
-        receipt = (
-            self.config.model_dir
-            / ".verified"
-            / (
-                "source-"
-                + hashlib.sha256(str(source.resolve()).encode()).hexdigest()
-                + ".json"
-            )
-        )
-        if receipt.exists():
-            return self._prepare_chunks(
-                model,
-                revision,
-                validate_sharding=validate_sharding,
-                progress=progress,
-                transport="ssh_rsync",
-                stop=None,
-            )
-        from ..utils import get_model_and_args, load_config
-
-        config = load_config(source)
-        if config.get("model_file"):
-            raise ValueError(
-                "Custom model_file checkpoints are not supported in distributed mode"
-            )
-        if validate_sharding:
-            architecture, _ = get_model_and_args(config)
-            if not callable(getattr(architecture.Model, "shard", None)):
-                raise ValueError("This model has no distributed shard implementation")
-            from .cluster import validate_model
-
-            validate_model(config, len(self.config.workers))
-        report("verifying_source")
-        files = _manifest(source)
-        total_bytes = sum(record["size"] for record in files.values())
-        manifest = json.dumps(files, sort_keys=True)
-        digest = hashlib.sha256(manifest.encode()).hexdigest()
-        root = self.config.model_dir
-        final = root / digest
-        root.mkdir(parents=True, exist_ok=True)
-        report("staging_coordinator", snapshot=digest)
-        verify = [self.config.python, "-c", _VERIFY, str(root), digest]
-        result = self._run([*verify, "verify"], input=manifest)
-        if result.returncode != 0:
-            if result.returncode != 3 or final.exists():
-                raise RuntimeError("Existing coordinator snapshot failed verification")
-            temporary = root / (".partial-" + digest)
-            temporary.mkdir(exist_ok=True)
-            for name in files:
-                target = temporary / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                # Dereference Hub blob symlinks; peers never need the Hub cache.
-                shutil.copyfile(source / name, target)
-            result = self._run([*verify, "commit"], input=manifest)
-            if result.returncode != 0:
-                raise RuntimeError("Coordinator model snapshot verification failed")
-        for worker in self.config.workers:
-            report("preparing_worker", node_id=worker.node_id, snapshot=digest)
-            worker_root = Path(worker.model_dir) if worker.model_dir else root
-            verify = [
-                worker.python or self.config.python,
-                "-c",
-                _VERIFY,
-                str(worker_root),
-                digest,
-            ]
-            self.worker_paths[(str(final), worker.url)] = str(worker_root / digest)
-
-            def verify_worker(mode):
-                if worker.ssh:
-                    return self._remote(worker, [*verify, mode], input=manifest)
-                return self._run([*verify, mode], input=manifest).returncode
-
-            if verify_worker("verify") == 0:
-                report(
-                    "worker_ready",
-                    node_id=worker.node_id,
-                    snapshot=digest,
-                    bytes_transferred=0,
-                    bytes_reused=total_bytes,
-                    total_bytes=total_bytes,
-                )
-                continue
-            logger.info("Transferring model snapshot %s to %s", digest, worker.url)
-            temporary = worker_root / (".partial-" + digest)
-            if worker.ssh:
-                self._remote(worker, ["mkdir", "-p", str(temporary)])
-            else:
-                temporary.mkdir(parents=True, exist_ok=True)
-            counts = dict(bytes_transferred=0, bytes_reused=0, total_bytes=total_bytes)
-
-            def transfer_progress(**updates):
-                counts.update(updates)
-                report(
-                    "transferring", node_id=worker.node_id, snapshot=digest, **counts
-                )
-
-            transfer_progress()
-            args = [
-                "rsync",
-                "-aL",
-                "--checksum",
-                "--partial",
-                "--files-from=-",
-                "-e",
-                shlex.join(["ssh", "-o", "BatchMode=yes", *self.config.ssh_options]),
-                str(final) + "/",
-                (f"{worker.ssh}:{temporary}/" if worker.ssh else str(temporary) + "/"),
-            ]
-            file_list = "\n".join(files) + "\n"
-            if progress:
-                result = run_rsync(
-                    args,
-                    input=file_list,
-                    timeout=self.config.timeout,
-                    total_bytes=total_bytes,
-                    progress=transfer_progress,
-                )
-            else:
-                result = self._run(args, input=file_list)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Model transfer failed ({worker.url}): {result.stderr[-1000:]}"
-                )
-            report(
-                "verifying_worker", node_id=worker.node_id, snapshot=digest, **counts
-            )
-            if verify_worker("commit") != 0:
-                raise RuntimeError(f"Model checksum verification failed ({worker.url})")
-            report("worker_ready", node_id=worker.node_id, snapshot=digest, **counts)
-        self.prepared[key] = str(final)
-        logger.info(
-            "Model snapshot %s verified on all %s workers",
-            digest,
-            len(self.config.workers),
-        )
-        return str(final)
 
 
 @contextmanager

@@ -237,7 +237,8 @@ def test_explicit_rdma_never_silently_falls_back(snapshot, tmp_path):
         pool.close()
 
 
-def test_prepare_auto_uses_verified_snapshot_and_keeps_pool(tmp_path):
+@pytest.mark.parametrize("transport", ["auto", "ssh_rsync"])
+def test_preparation_transports_share_verified_snapshots_and_pool(tmp_path, transport):
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text("{}")
@@ -249,14 +250,17 @@ def test_prepare_auto_uses_verified_snapshot_and_keeps_pool(tmp_path):
     pool = TransferPool()
     try:
         stager = ModelStager(config, transfers=pool)
-        first = stager.prepare(str(source), validate_sharding=False, transport="auto")
+        first = stager.prepare(
+            str(source), validate_sharding=False, transport=transport
+        )
         second = ModelStager(config, transfers=pool)
         assert (
-            second.prepare(str(source), validate_sharding=False, transport="auto")
+            second.prepare(str(source), validate_sharding=False, transport="jaccl_rdma")
             == first
         )
         assert second.worker_transfers[worker.url]["transport"] == "verified_cache"
-        # Ordinary inference staging adopts an earlier API preparation receipt.
+        # Switching transport, including ordinary inference staging, uses the
+        # same snapshot without a connection check or checkpoint retransmission.
         assert second.prepare(str(source), validate_sharding=False) == first
     finally:
         pool.close()

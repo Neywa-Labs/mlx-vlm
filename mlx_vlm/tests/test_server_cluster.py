@@ -495,8 +495,11 @@ def test_model_member_count_errors_are_actionable(monkeypatch):
 
 
 def test_weight_delivery_operation_is_independent_of_membership(control, monkeypatch):
-    def prepare(stager, model, revision, *, validate_sharding, progress):
+    def prepare(
+        stager, model, revision, *, validate_sharding, progress, transport, stop
+    ):
         assert not validate_sharding
+        assert transport == "ssh_rsync" and not stop.is_set()
         assert len(stager.config.workers) == 1
         worker = stager.config.workers[0]
         assert worker.ssh == "worker-b"
@@ -676,13 +679,14 @@ def test_no_http_weight_upload_api_and_delivery_is_authenticated(control):
     ]
 
 
+@pytest.mark.parametrize("selected_transport", ["auto", "ssh_rsync", "jaccl_rdma"])
 def test_cancel_preparation_is_authenticated_idempotent_and_keeps_inference(
-    control, monkeypatch
+    control, monkeypatch, selected_transport
 ):
     entered = threading.Event()
 
     def prepare(stager, model, revision, *, stop, transport, **options):
-        assert transport == "auto"
+        assert transport == selected_transport
         entered.set()
         assert stop.wait(5)
         raise InterruptedError("Checkpoint preparation cancelled")
@@ -694,7 +698,7 @@ def test_cancel_preparation_is_authenticated_idempotent_and_keeps_inference(
         control.state, control.running = "ready", ["a", "b"]
         op = await control.begin(
             "prepare_model",
-            PrepareModel(model="org/model", transport="auto"),
+            PrepareModel(model="org/model", transport=selected_transport),
             "cancel-test",
         )
         assert await asyncio.to_thread(entered.wait, 3)
