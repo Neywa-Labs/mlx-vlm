@@ -47,6 +47,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    sharded_load,
 )
 
 
@@ -1747,8 +1748,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
     )
 
 
+@pytest.mark.parametrize("native_metadata", [False, True])
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
-    tmp_path, mistral_large4_case
+    tmp_path, mistral_large4_case, native_metadata
 ):
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
 
@@ -1834,9 +1836,33 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
+    if native_metadata:
+        params = model_case("mistral_large4")["native_params"]
+        (tmp_path / "params.json").write_text(json.dumps(params))
+        weight_path = tmp_path / "consolidated.safetensors"
+    else:
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        weight_path = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(weight_path), native)
     model = load_model(tmp_path)
+    if native_metadata:
+        assert not (tmp_path / "config.json").exists()
+        assert json.loads((tmp_path / "params.json").read_text()) == params
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1, "</s>": 2}, unk_token="[UNK]")
+        )
+        PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, unk_token="[UNK]", eos_token="</s>"
+        ).save_pretrained(tmp_path)
+        group = mx.distributed.init()
+        assert group.size() == 1
+        model, processor = sharded_load(tmp_path, tensor_group=group)
+        assert processor("hello")["input_ids"] == [1]
+        assert not (tmp_path / "config.json").exists()
     assert isinstance(
         model.language_model.layers[1].feed_forward.experts.w1,
         ScaledQuantizedSwitchLinear,
@@ -2956,6 +2982,71 @@ def test_minimax_multimodal_model_exposes_sharding():
     shard.assert_called_once_with(group)
 
 
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_deepseek_v4_sharded_load(tmp_path, pipeline):
+    from mlx_vlm.models import deepseek_v4
+
+    config = build_config(deepseek_v4, model_case("deepseek_v4")["config"])
+    reference = deepseek_v4.Model(config)
+    reference.eval()
+    weights = dict(tree_flatten(reference.parameters()))
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    group = mx.distributed.init()
+    assert group.size() == 1
+    with patch("mlx_vlm.utils.load_processor", return_value=object()):
+        model, _ = sharded_load(
+            tmp_path,
+            tensor_group=group,
+            pipeline_group=group if pipeline else None,
+        )
+    assert model.language_model.layers[0].attn.sharding_group is group
+    assert callable(model.language_model.model.pipeline)
+    for key, value in tree_flatten(model.parameters()):
+        assert mx.array_equal(value, weights[key]).item(), key
+    ids = mx.array([[1, 2, 3]])
+    np.testing.assert_array_equal(
+        np.array(model(ids).logits), np.array(reference(ids).logits)
+    )
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+def test_deepseek_v4_sharding_allows_replicated_kv(world_size):
+    from mlx_vlm.models import deepseek_v4
+
+    architecture, _ = get_model_and_args({"model_type": "deepseek_v4"})
+    assert callable(architecture.Model.shard)
+    assert architecture.validate_sharding is deepseek_v4.validate_sharding
+    architecture.validate_sharding({"num_key_value_heads": 1}, world_size)
+
+
+@pytest.mark.parametrize(
+    "overrides,world_size,message",
+    [
+        ({}, 0, "worker count"),
+        ({}, 3, "query heads"),
+        ({}, 16, "query heads"),
+        (
+            {"num_attention_heads": 4, "moe_intermediate_size": 7},
+            2,
+            "expert intermediate",
+        ),
+    ],
+)
+def test_deepseek_v4_sharding_rejects_invalid_partitions_before_mutation(
+    overrides, world_size, message
+):
+    from mlx_vlm.models import deepseek_v4
+
+    config = model_case("deepseek_v4")["config"]
+    config.update(overrides)
+    model = deepseek_v4.Model(build_config(deepseek_v4, config))
+    with patch.object(model.language_model, "shard") as shard:
+        with pytest.raises(ValueError, match=message):
+            model.shard(SimpleNamespace(size=lambda: world_size, rank=lambda: 0))
+    shard.assert_not_called()
+
+
 # Distributed language-model contracts
 
 
@@ -3714,6 +3805,67 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
 
 # Loading and utility contracts
+
+
+@pytest.mark.parametrize("family", ["mistral_large3", "mistral_large4"])
+def test_load_config_normalizes_native_mistral_params(tmp_path, family):
+    params = model_case("mistral_large4")["native_params"]
+    if family == "mistral_large3":
+        params.pop("dsa")
+    params["mtp"] = {"n_layers": 3, "block_size": 4}
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": 2, "temperature": 0.7})
+    )
+
+    config = load_config(tmp_path)
+    module, model_type = get_model_and_args(config)
+    assert model_type == family
+    assert config["text_config"]["hidden_size"] == params["dim"]
+    assert (
+        config["vision_config"]["hidden_size"]
+        == params["vision_encoder"]["hidden_size"]
+    )
+    assert config["eos_token_id"] == 2
+    assert config["temperature"] == 0.7
+    if family == "mistral_large4":
+        text = module.TextConfig.from_dict(config["text_config"])
+        expected = build_config(module, model_case(family)["config"]).text_config
+        assert asdict(text) == {
+            **asdict(expected),
+            "nvfp4": True,
+            "mtp_config": params["mtp"],
+        }
+        assert config["quantization_config"] == params["quantization_config"]
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+
+
+def test_load_config_prefers_standard_config_to_native_params(tmp_path):
+    (tmp_path / "params.json").write_text("invalid native metadata")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "demo"}))
+    assert load_config(tmp_path) == {"model_type": "demo"}
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("nope", "rope,typo", "rotary layout"),
+        ("dsa", {"sharing": "full"}, "indexer_types must have 8 entries"),
+        ("kv_sharing", {"source_layers_str": "0,1,2,3,4,5,6,8"}, "Invalid KV source"),
+    ],
+)
+def test_load_config_rejects_invalid_native_mistral_layouts(
+    tmp_path, field, value, message
+):
+    params = model_case("mistral_large4")["native_params"]
+    if isinstance(value, dict):
+        params[field].update(value)
+    else:
+        params[field] = value
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path)
 
 
 def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
