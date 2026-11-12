@@ -5,6 +5,9 @@ Validation ran against working-tree changes based on PR #2712 revision
 Only MLX-VLM was modified. The final transport is SSH/rsync; there are no HTTP
 weight-upload endpoints.
 
+Subsequent RDMA delivery, persistent-helper and verified-manifest reuse results
+are recorded separately in [checkpoint transfer validation](checkpoint-transfer-validation.md).
+
 ## Automated checks
 
 - Server, distributed coordinator, launcher, cluster API, and generation suites:

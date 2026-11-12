@@ -8,8 +8,8 @@ application responsibilities. This API does not browse Bonjour, install apps,
 configure Remote Login, or enroll SSH keys.
 
 Inference stays on `/v1/responses` and `/v1/chat/completions` with
-`distributed: true`. The cluster API is a control plane; weight bytes use the
-existing **SSH/rsync transport**, not HTTP uploads.
+`distributed: true`. The cluster API is a control plane; weight bytes use
+**SSH/rsync or a dedicated JACCL RDMA transfer group**, not HTTP uploads.
 
 ## Authentication and identity
 
@@ -55,6 +55,7 @@ All schemas are in `/openapi.json`. Management operations are serialized.
 | `POST /v1/cluster/start` | Attach a compatible existing collective or launch with the configured SSH launcher; optional model loads before readiness |
 | `POST /v1/cluster/stop` | Drain, dispose retained sessions if explicitly requested, stop owned processes or detach external processes |
 | `GET /v1/cluster/operations/{operation_id}` | Long-operation phase, progress/result, and terminal status/error |
+| `POST /v1/cluster/operations/{operation_id}/cancel` | Cancel an `auto`/`jaccl_rdma` preparation before publication; keep verified partial chunks for retry |
 | `GET /v1/cluster/events` | Throttled SSE snapshots, connection/telemetry, membership, and operation updates |
 
 `start`, `stop`, and `models/prepare` return **202** with an `Operation`. Use
@@ -178,6 +179,129 @@ startup perform that separate validation. A transfer failure does not fail an
 unrelated running inference group. Existing corrupt committed snapshots are
 preserved for diagnosis; partial snapshots cannot be loaded.
 
+## RDMA delivery and verified snapshot reuse
+
+`PrepareModel.transport` accepts `ssh_rsync` (the compatibility default),
+`jaccl_rdma` (require RDMA), or `auto` (try a configured direct RDMA pair, otherwise
+use SSH/rsync and emit `transport_fallback` with a `fallback_reason`). Automatic
+fallback is permitted only for a missing RDMA pair, an unavailable JACCL backend/device
+or coordinator address, or a recognized native connection failure/timeout
+**before payload delivery**. Helper startup, protocol, configuration and
+unexpected backend errors fail visibly instead of being relabelled as transport
+unavailability. A checksum failure, lost worker, cancellation or mid-copy error fails
+the operation; it never silently retries through another transport. Submit a new
+operation to resume after addressing the failure.
+
+Register the direct pair under the existing SSH access configuration:
+
+```python
+client.patch(f"/v1/cluster/nodes/{worker_id}", json={
+    "ssh": {
+        "destination": "approved-worker-alias",
+        "python": "/worker-specific/venv/bin/python",
+        "rdma": {
+            "local_address": "192.168.10.1",
+            "local_device": "rdma_en4",
+            "remote_device": "rdma_en5",
+        },
+    },
+}).raise_for_status()
+
+operation = wait_operation("/v1/cluster/models/prepare", {
+    "model": model,
+    "node_ids": [worker_id],
+    "transport": "auto",
+}, "rdma-prepare-1")
+```
+
+These are deployment-supplied interfaces, not discovered or synthesized wiring.
+The local address must be an IPv4 address on this coordinator, reachable by the
+peer. JACCL, enabled RDMA and a compatible direct link must already be available.
+The worker identity advertises `checkpoint_transfer`; backend availability does
+not prove a working link. An actual isolated two-rank challenge establishes
+transfer readiness. Its result is separate from inference RDMA validation and
+negotiated link speed.
+
+SSH still authenticates the helper, carries control/manifest/progress messages,
+and verifies that the remote physical device matches its registered HTTP
+identity. Strict host-key checking is required. Helpers are supplied as source
+and use the specified Python environment's MLX, so paths can differ and no app
+installation is performed. **Weight payloads use RDMA**, not the SSH connection.
+RDMA payload traffic is not encrypted by this implementation; use a trusted,
+dedicated link. rsync remains the encrypted alternative.
+
+The transfer group never joins an inference collective. A pool retains at most
+eight worker pairs, with a five-minute idle limit, reusing their processes and
+group across files and preparations. Each pair has its own ephemeral coordinator
+port. Multiple targets are served sequentially as independent two-Mac transfers;
+they are not one three-rank inference group. EOF, lost control leases, cancellation
+or shutdown terminate only owned transfer helpers. A failed pair is discarded;
+the next attempt creates a fresh group. External inference processes stay alive.
+
+The chunk path creates independent private snapshots, with APFS copy-on-write
+clones when available. An unsupported clone operation or a cross-filesystem
+source uses a streamed copy; permission, disk-space and other filesystem errors
+fail preparation immediately. It computes whole-file SHA-256 and ordered 16 MiB chunk
+digests during the same initial read, then persists a verified manifest. Files
+and directories are made read-only. A receipt records device/inode identity,
+size, nanosecond modification/change times and modes for the entire snapshot.
+Reuse requires that receipt and the sealed tree to match. A changed tree is
+reverified; corruption fails rather than overwriting the published snapshot.
+Original source files are never chmod'ed or hard-linked into this cache.
+
+This cache assumes the server account and its private state are trusted. It is
+not protection against an attacker controlling that same OS account. Checking
+only a filename, size, or mtime is insufficient. Receipts are only produced after
+verification and are never accepted from an unverified source directory.
+Receipt reuse does not detect silent storage corruption that leaves filesystem
+metadata unchanged; checking for that requires a separate full readback audit.
+
+On delivery, the receiver hashes every incoming chunk against the authenticated
+manifest, overlaps hashing and disk writes using bounded queues, flushes file
+data (`F_FULLFSYNC` on macOS), and atomically publishes only after both helpers
+succeed. Resume rechecks bytes in partial files instead of trusting a stale
+completion bitmap. A valid destination snapshot reports `transport:
+"verified_cache"`, zero transferred bytes, and the entire checkpoint reused.
+The source manifest and destination receipts survive coordinator restarts;
+helper processes do not. Preparation and subsequent inference staging share
+the same snapshot store, so the latter can adopt the preparation receipt.
+
+Progress uses the existing operation/events endpoints:
+
+| Field | Meaning |
+|---|---|
+| `transport`, `node_id`, `snapshot` | Actual transport, registered target, immutable snapshot identity |
+| `bytes_read` | Source file bytes read during this transfer attempt |
+| `bytes_received` | Payload bytes evaluated at the receiving RDMA rank |
+| `bytes_verified` | Verified received chunks plus verified reused chunks |
+| `bytes_reused` | Valid bytes already present at the destination |
+| `bytes_transferred`, `total_bytes` | Delivered logical payload and manifest total |
+| `bytes_checked` | Bytes inspected while validating a partial file, including invalid chunks |
+| `elapsed_seconds`, `throughput_bytes_per_second` | Measured attempt time and logical transfer progress/time |
+| `rate_kind` | `logical_payload` for RDMA, `logical_copy_progress` for rsync; neither is a wire-traffic counter |
+
+RDMA updates are throttled to roughly five per second plus phase boundaries;
+rsync retains its twice-per-second interval. `verifying_source`,
+`checking_partial`, `connecting`, `connected`, `transferring`, `publishing`, and
+`worker_ready` distinguish hashing, connection setup, delivery and durable
+publication. Counters reset for each attempt/target; source preparation has its
+own counters. Copy completion alone is not readiness.
+
+Cancellation returns 202 and is observed through the original operation. A
+cancelled preparation finishes as `failed` with `preparation_cancelled`; a retry
+needs a new idempotency key. Publication is a commit point: cancellation after
+that point is rejected with `cancellation_too_late`. Already completed operations
+are returned unchanged. This endpoint does not cancel inference or legacy
+`ssh_rsync` preparations (`cancellation_unavailable`). Automatic rsync fallback
+inside an `auto` operation remains cancellable.
+
+The first snapshot still pays the initial hash/copy cost. Manifest reuse and warm
+helpers remove repeated work, not that initial verification. Published benchmark
+results must distinguish first preparation, manifest reuse with fresh helpers,
+warm-helper transfer, and a destination cache hit. Optional independent disk
+readback is an audit; inline chunk verification does not reread storage after
+every write.
+
 ## Lifecycle and ownership
 
 Registered nodes, selected members, and the running collective are distinct.
@@ -297,7 +421,7 @@ Authentication/validation errors also retain standard FastAPI status semantics.
 | Coordinated batch admission and cancellation | Shared distributed scheduler and native sessions |
 | Parsing worker logs for status/memory | Cluster/nodes/operations endpoints and throttled events |
 | Managing rank membership implicitly | Stable registrations, explicit selection and safe group transitions |
-| Downloading/synchronizing weights itself | `models/prepare` and verified SSH/rsync staging |
+| Downloading/synchronizing weights itself | `models/prepare`, verified snapshots, SSH/rsync or isolated RDMA delivery |
 | Resume implementation or regeneration | Existing Responses continuation contract across ranks |
 
 Applications still own discovery, pairing/consent, device UI, and their own
