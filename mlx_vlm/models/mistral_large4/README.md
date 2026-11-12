@@ -15,6 +15,9 @@ must contain the standard model configuration schema. Normalize native Mistral
 metadata before saving it under either filename. Use standard checkpoint
 filenames such as `model.safetensors` and compatible tokenizer/processor files.
 
+The model uses MLX-VLM's Mistral processor and NumPy/PIL image preprocessing;
+Torch and Torchvision are not required.
+
 The model sanitizer maps native weight names and stacks experts. The shared
 quantization converter preserves packed NVFP4 expert weights, block scales, and
 FP32 global scales, and expands dense FP8 weights to BF16. Its ModelOpt conversion
