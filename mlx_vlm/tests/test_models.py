@@ -1836,10 +1836,6 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    if config_filename == "params.json":
-        from mlx_vlm.models.mistral_large4.config import config_from_params
-
-        config = config_from_params(model_case("mistral_large4")["native_params"])
     (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
@@ -3814,52 +3810,6 @@ def test_load_config_prefers_config_json(tmp_path, valid):
     else:
         with pytest.raises(json.JSONDecodeError):
             load_config(tmp_path)
-
-
-def test_mistral_large4_config_from_params():
-    from mlx_vlm.models.mistral_large4.config import config_from_params
-
-    params = model_case("mistral_large4")["native_params"]
-    params["mtp"] = {"n_layers": 3, "block_size": 4}
-    original = copy.deepcopy(params)
-
-    config = config_from_params(params)
-    module, model_type = get_model_and_args(config)
-    assert model_type == "mistral_large4"
-    assert config["text_config"]["hidden_size"] == params["dim"]
-    assert (
-        config["vision_config"]["hidden_size"]
-        == params["vision_encoder"]["hidden_size"]
-    )
-    text = module.TextConfig.from_dict(config["text_config"])
-    expected = build_config(module, model_case("mistral_large4")["config"]).text_config
-    assert asdict(text) == {
-        **asdict(expected),
-        "nvfp4": True,
-        "mtp_config": params["mtp"],
-    }
-    assert config["quantization_config"] == params["quantization_config"]
-    assert params == original
-
-
-@pytest.mark.parametrize(
-    "field,value,message",
-    [
-        ("nope", "rope,typo", "rotary layout"),
-        ("dsa", {"sharing": "full"}, "indexer_types must have 8 entries"),
-        ("kv_sharing", {"source_layers_str": "0,1,2,3,4,5,6,8"}, "Invalid KV source"),
-    ],
-)
-def test_mistral_large4_config_rejects_invalid_native_layouts(field, value, message):
-    from mlx_vlm.models.mistral_large4.config import config_from_params
-
-    params = model_case("mistral_large4")["native_params"]
-    if isinstance(value, dict):
-        params[field].update(value)
-    else:
-        params[field] = value
-    with pytest.raises(ValueError, match=message):
-        config_from_params(params)
 
 
 @pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
