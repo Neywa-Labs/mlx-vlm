@@ -9,6 +9,7 @@ module. An endpoint is trusted only after its authenticated identity is checked.
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from collections import deque
@@ -113,6 +114,8 @@ class ClusterManager:
         self.monitor = None
         self.last_refresh = 0
         self.bootstrapped = False
+        self.transfers = None
+        self.transfer_stops = {}
         path = self.root / "registry.json"
         if path.exists():
             data = json.loads(path.read_text())
@@ -494,6 +497,12 @@ class ClusterManager:
                 node_id=n,
                 model_dir=self.nodes[n].identity.model_dir,
                 api_key=self.credentials[n],
+                physical_id=self.nodes[n].identity.physical_id,
+                rdma=(
+                    self.nodes[n].ssh.rdma.model_dump()
+                    if self.nodes[n].ssh and self.nodes[n].ssh.rdma
+                    else None
+                ),
             )
             for n in targets
         )
@@ -591,6 +600,8 @@ class ClusterManager:
             )
             self.current = operation.id
             self.operations[operation.id] = operation
+            if kind == "prepare_model" and body.transport != "ssh_rsync":
+                self.transfer_stops[operation.id] = threading.Event()
             if key:
                 self.idempotency[key] = [signature, operation.id]
             self.save()
@@ -622,7 +633,11 @@ class ClusterManager:
                 operation.error = ClusterError.model_validate(error.detail)
             else:
                 operation.error = ClusterError(
-                    code="transition_failed",
+                    code=(
+                        "preparation_cancelled"
+                        if isinstance(error, InterruptedError)
+                        else "transition_failed"
+                    ),
                     message=str(error) or type(error).__name__,
                     retryable=True,
                 )
@@ -631,6 +646,8 @@ class ClusterManager:
             await self.phase(operation, "failed")
             if isinstance(error, asyncio.CancelledError):
                 raise
+        finally:
+            self.transfer_stops.pop(operation.id, None)
 
     async def prepare_model(self, operation, body):
         targets = body.node_ids if body.node_ids is not None else self.selected
@@ -653,10 +670,28 @@ class ClusterManager:
             )
         # Independent immutable delivery cache; never mutate the active model or
         # acquire an inference lease just to copy a checkpoint.
-        config = replace(self.config(targets), model_dir=self.root / "delivery")
-        stager = ModelStager(config)
+        config = self.config(targets)
+        if body.transport != "ssh_rsync":
+            from .checkpoint_transfer import TransferPool
+
+            if self.transfers is None:
+                self.transfers = TransferPool()
+            coordinator = runtime.distributed_coordinator
+            if coordinator:
+                coordinator.stager.transfers = self.transfers
+        stager = ModelStager(config, transfers=self.transfers)
+        options = (
+            {"transport": body.transport, "stop": self.transfer_stops[operation.id]}
+            if body.transport != "ssh_rsync"
+            else {}
+        )
         prepared = await self.stage_model(
-            operation, stager, body.model, body.revision, validate_sharding=False
+            operation,
+            stager,
+            body.model,
+            body.revision,
+            validate_sharding=False,
+            **options,
         )
         operation.result = {
             "model": body.model,
@@ -666,8 +701,15 @@ class ClusterManager:
                 {
                     "id": w.node_id,
                     "path": stager.worker_paths[(prepared, w.url)],
-                    "transport": "ssh_rsync" if w.ssh else "local_filesystem",
+                    "transport": stager.worker_transfers.get(w.url, {}).get(
+                        "transport", "ssh_rsync" if w.ssh else "local_filesystem"
+                    ),
                     "verified": True,
+                    **{
+                        key: value
+                        for key, value in stager.worker_transfers.get(w.url, {}).items()
+                        if key in {"rdma_validated", "fallback_reason"}
+                    },
                 }
                 for w in config.workers
             ],
@@ -732,6 +774,7 @@ class ClusterManager:
                     retryable=True,
                 )
             coordinator = Coordinator(config)
+            coordinator.stager.transfers = self.transfers
             if config.launch:
                 if config.launch.backend != self.backend:
                     fail(
@@ -940,6 +983,8 @@ class ClusterManager:
             raise
 
     async def close(self):
+        for stop in self.transfer_stops.values():
+            stop.set()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -948,6 +993,8 @@ class ClusterManager:
             await asyncio.gather(self.monitor, return_exceptions=True)
         if self.launcher:
             await asyncio.to_thread(self.launcher.stop)
+        if self.transfers:
+            await asyncio.to_thread(self.transfers.close)
 
 
 def manager():
@@ -1036,6 +1083,34 @@ def router(authenticate):
         if operation is None:
             fail("operation_not_found", "Unknown operation ID.", 404)
         return operation
+
+    @api.post(
+        "/v1/cluster/operations/{operation_id}/cancel",
+        status_code=202,
+        response_model=Operation,
+    )
+    async def cancel_preparation(operation_id: str):
+        control = manager()
+        async with control.lock:
+            operation = control.operations.get(operation_id)
+            if operation is None:
+                fail("operation_not_found", "Unknown operation ID.", 404)
+            if operation.status != "running":
+                return operation
+            if operation.phase == "publishing":
+                fail(
+                    "cancellation_too_late",
+                    "Verified snapshot publication has already started.",
+                )
+            stop = control.transfer_stops.get(operation_id)
+            if stop is None:
+                fail(
+                    "cancellation_unavailable",
+                    "This operation cannot be cancelled through the transfer API.",
+                )
+            stop.set()
+            await control.phase(operation, "cancelling")
+            return operation
 
     @api.get(
         "/v1/cluster/events",

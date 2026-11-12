@@ -129,8 +129,14 @@ class Worker:
     model_dir: str | None = None
     python: str | None = None
     api_key: str | None = field(default=None, repr=False)
+    physical_id: str | None = None
+    rdma: dict | None = None
 
     def __post_init__(self):
+        if self.rdma is not None:
+            from .cluster_types import RDMAPair
+
+            RDMAPair.model_validate(self.rdma)
         if self.ssh is not None and not re.fullmatch(r"[\w][\w.@-]*", self.ssh):
             raise ValueError(
                 "SSH destinations must be configured host names or aliases"
@@ -223,10 +229,12 @@ class ClusterConfig:
 
 
 class ModelStager:
-    def __init__(self, config):
+    def __init__(self, config, transfers=None):
         self.config = config
         self.prepared = {}
         self.worker_paths = {}
+        self.worker_transfers = {}
+        self.transfers = transfers
 
     def _resolve(self, model, revision):
         from ..utils import get_model_path
@@ -266,16 +274,122 @@ class ModelStager:
             )
         return result.returncode
 
-    def prepare(self, model, revision=None, *, validate_sharding=True, progress=None):
+    def prepare(
+        self,
+        model,
+        revision=None,
+        *,
+        validate_sharding=True,
+        progress=None,
+        transport="ssh_rsync",
+        stop=None,
+    ):
         # Management preparation and inference can target the same immutable
         # snapshot. Serialize staging even when their coordinator caches differ.
         staging_lock = Path(str(self.config.shared_lock) + ".staging")
         staging_lock.parent.mkdir(parents=True, exist_ok=True)
         with staging_lock.open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if transport != "ssh_rsync":
+                from .checkpoint_store import cancelled
+
+                while True:
+                    cancelled(stop)
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            if transport != "ssh_rsync":
+                return self._prepare_chunks(
+                    model,
+                    revision,
+                    validate_sharding=validate_sharding,
+                    progress=progress,
+                    transport=transport,
+                    stop=stop,
+                )
             return self._prepare(
                 model, revision, validate_sharding=validate_sharding, progress=progress
             )
+
+    def _prepare_chunks(
+        self, model, revision, *, validate_sharding, progress, transport, stop
+    ):
+        from ..utils import load_config
+        from .checkpoint_store import prepare_snapshot
+        from .checkpoint_transfer import TransferPool
+
+        if transport not in {"auto", "jaccl_rdma", "ssh_rsync"}:
+            raise ValueError("Unsupported checkpoint transport")
+
+        def report(phase, **data):
+            if progress:
+                progress(phase, **data)
+
+        report("resolving_model")
+        source = self._resolve(model, revision)
+        config = load_config(source)
+        if config.get("model_file"):
+            raise ValueError(
+                "Custom model_file checkpoints are not supported in distributed mode"
+            )
+        if validate_sharding:
+            from .cluster import validate_model
+
+            validate_model(config, len(self.config.workers))
+        names = sorted(
+            p.relative_to(source).as_posix()
+            for p in source.rglob("*")
+            if p.is_file()
+            and p.suffix in MODEL_SUFFIXES
+            and not any(part.startswith(".") for part in p.relative_to(source).parts)
+        )
+        if "config.json" not in names or not any(
+            n.endswith(".safetensors") for n in names
+        ):
+            raise ValueError("Model must contain config.json and safetensors weights")
+        for name in names:
+            if "\n" in name or "\r" in name:
+                raise ValueError("Model filenames cannot contain newlines")
+            if name.endswith(".safetensors.index.json"):
+                missing = set(
+                    json.loads((source / name).read_text())
+                    .get("weight_map", {})
+                    .values()
+                ) - set(names)
+                if missing:
+                    raise ValueError(
+                        f"Incomplete checkpoint: missing {sorted(missing)}"
+                    )
+        last = [0.0]
+
+        def verifying(**data):
+            now = time.monotonic()
+            if now - last[0] >= 0.2:
+                last[0] = now
+                report("verifying_source", **data)
+
+        final, manifest = prepare_snapshot(
+            source, names, self.config.model_dir, stop=stop, progress=verifying
+        )
+        pool = self.transfers or TransferPool()
+        try:
+            for worker in self.config.workers:
+
+                def worker_report(phase, **data):
+                    report(phase, node_id=worker.node_id, snapshot=final.name, **data)
+
+                result = pool.deliver(
+                    self.config, worker, final, manifest, transport, worker_report, stop
+                )
+                self.worker_paths[(str(final), worker.url)] = result["path"]
+                self.worker_transfers[worker.url] = result
+            return str(final)
+        finally:
+            if self.transfers is None:
+                pool.close()
 
     def _prepare(self, model, revision=None, *, validate_sharding=True, progress=None):
         def report(phase, **data):
@@ -292,6 +406,27 @@ class ModelStager:
         )
         report("resolving_model")
         source = self._resolve(model, revision)
+        # Public prepare and inference share immutable snapshots. A preparation
+        # receipt selects the verified-chunk path without rescanning all weights
+        # through the older rsync stager when inference loads that same model.
+        receipt = (
+            self.config.model_dir
+            / ".verified"
+            / (
+                "source-"
+                + hashlib.sha256(str(source.resolve()).encode()).hexdigest()
+                + ".json"
+            )
+        )
+        if receipt.exists():
+            return self._prepare_chunks(
+                model,
+                revision,
+                validate_sharding=validate_sharding,
+                progress=progress,
+                transport="ssh_rsync",
+                stop=None,
+            )
         from ..utils import get_model_and_args, load_config
 
         config = load_config(source)

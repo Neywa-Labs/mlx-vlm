@@ -670,7 +670,46 @@ def test_no_http_weight_upload_api_and_delivery_is_authenticated(control):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/v1/cluster/models/prepare" in paths
     assert not any("/staging/" in path for path in paths)
-    assert control.snapshot().capabilities.checkpoint_transfer == ["ssh_rsync"]
+    assert control.snapshot().capabilities.checkpoint_transfer == [
+        "ssh_rsync",
+        "jaccl_rdma",
+    ]
+
+
+def test_cancel_preparation_is_authenticated_idempotent_and_keeps_inference(
+    control, monkeypatch
+):
+    entered = threading.Event()
+
+    def prepare(stager, model, revision, *, stop, transport, **options):
+        assert transport == "auto"
+        entered.set()
+        assert stop.wait(5)
+        raise InterruptedError("Checkpoint preparation cancelled")
+
+    monkeypatch.setattr(management.ModelStager, "prepare", prepare)
+
+    async def scenario():
+        await register_pair(control)
+        control.state, control.running = "ready", ["a", "b"]
+        op = await control.begin(
+            "prepare_model",
+            PrepareModel(model="org/model", transport="auto"),
+            "cancel-test",
+        )
+        assert await asyncio.to_thread(entered.wait, 3)
+        routes = {r.path: r.endpoint for r in management.router(lambda: None).routes}
+        cancel = routes["/v1/cluster/operations/{operation_id}/cancel"]
+        assert (await cancel(op.id)).id == op.id
+        await asyncio.gather(*control.tasks)
+        assert op.status == "failed" and op.error.code == "preparation_cancelled"
+        assert (await cancel(op.id)).id == op.id
+        assert control.state == "ready" and control.running == ["a", "b"]
+        await control.close()
+
+    asyncio.run(scenario())
+    client = TestClient(server.app)
+    assert client.post("/v1/cluster/operations/any/cancel").status_code == 401
 
 
 def test_delivery_can_stage_on_same_device_at_different_absolute_path(tmp_path):

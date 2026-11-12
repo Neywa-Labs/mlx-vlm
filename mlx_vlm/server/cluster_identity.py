@@ -176,6 +176,8 @@ def identity(worker=None):
         memory=memory_info(),
         measured_at=time.time(),
         backends=backends,
+        checkpoint_transfer=["ssh_rsync"]
+        + (["jaccl_rdma"] if "jaccl" in backends else []),
         worker=info,
         model_dir=(
             str(worker.model_dir)

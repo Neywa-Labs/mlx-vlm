@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Public, application-independent cluster management contract."""
 
+from ipaddress import IPv4Address
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -23,11 +24,25 @@ class ClusterErrorResponse(Contract):
     detail: ClusterError
 
 
+class RDMAPair(Contract):
+    """Explicit direct link from this coordinator to one approved worker."""
+
+    local_address: str
+    local_device: str = Field(pattern=r"^rdma_[\w]+$")
+    remote_device: str = Field(pattern=r"^rdma_[\w]+$")
+
+    @field_validator("local_address")
+    @classmethod
+    def address(cls, value):
+        return str(IPv4Address(value))
+
+
 class SSHTransport(Contract):
     """Optional preconfigured transfer access, never SSH enrollment."""
 
     destination: str = Field(pattern=r"^[\w][\w.@-]*$")
     python: str = Field(default="python3", min_length=1)
+    rdma: RDMAPair | None = None
 
 
 class Memory(Contract):
@@ -53,6 +68,7 @@ class NodeIdentity(Contract):
     # Negotiated link properties do not prove usable RDMA collectives.
     links: list[dict] = Field(default_factory=list)
     rdma_validated: bool = False
+    checkpoint_transfer: list[str] = Field(default_factory=lambda: ["ssh_rsync"])
 
 
 class RegisterNode(Contract):
@@ -132,6 +148,7 @@ class PrepareModel(Contract):
     model: str = Field(min_length=1)
     revision: str | None = None
     node_ids: list[str] | None = Field(default=None, min_length=1)
+    transport: Literal["auto", "jaccl_rdma", "ssh_rsync"] = "ssh_rsync"
 
     @field_validator("node_ids")
     @classmethod
@@ -168,7 +185,9 @@ class Capabilities(Contract):
     stored_responses: bool = False
     previous_response_id: bool = False
     authenticated_weight_delivery: bool = True
-    checkpoint_transfer: list[str] = Field(default_factory=lambda: ["ssh_rsync"])
+    checkpoint_transfer: list[str] = Field(
+        default_factory=lambda: ["ssh_rsync", "jaccl_rdma"]
+    )
 
 
 class AggregateMemory(Contract):

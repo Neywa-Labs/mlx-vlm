@@ -78,7 +78,7 @@ class RsyncProgress:
         self.report(force=True)
 
 
-def run_rsync(args, *, input, timeout, total_bytes, progress):
+def run_rsync(args, *, input, timeout, total_bytes, progress, stop=None):
     """Drain both pipes live, retaining only a bounded diagnostic tail.
 
     Double itemization includes unchanged files on rsync 2.6.7+, including
@@ -110,6 +110,8 @@ def run_rsync(args, *, input, timeout, total_bytes, progress):
                 for stream in (process.stdout, process.stderr):
                     selector.register(stream, selectors.EVENT_READ)
                 while selector.get_map():
+                    if stop is not None and stop.is_set():
+                        raise InterruptedError("Checkpoint preparation cancelled")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(args, timeout, stderr=stderr)
