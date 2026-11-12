@@ -47,6 +47,25 @@ def snapshot(tmp_path):
     return source, names, root, final, manifest
 
 
+@pytest.fixture
+def darwin_clone(monkeypatch):
+    original = store._clone
+    clone = Mock()
+
+    def call(source, target):
+        # Simulate Darwin only during clonefile. Copying and flushing must use
+        # the host platform, which may not provide macOS's F_FULLFSYNC.
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "sys", SimpleNamespace(platform="darwin"))
+            patch.setattr(
+                store.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(clonefile=clone)
+            )
+            return original(source, target)
+
+    monkeypatch.setattr(store, "_clone", call)
+    return clone
+
+
 def test_manifest_reuse_does_not_read_weight_bytes(snapshot, monkeypatch):
     source, names, root, final, manifest = snapshot
     original = Path.open
@@ -270,12 +289,8 @@ def test_chunk_hashes_and_whole_file_identity(snapshot):
 
 
 @pytest.mark.parametrize("code", [errno.EXDEV, errno.ENOTSUP, errno.ENOSYS])
-def test_unsupported_clone_uses_verified_copy(tmp_path, monkeypatch, code):
-    clone = Mock(side_effect=lambda *args: (ctypes.set_errno(code), -1)[1])
-    monkeypatch.setattr(store.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        store.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(clonefile=clone)
-    )
+def test_unsupported_clone_uses_verified_copy(tmp_path, darwin_clone, code):
+    darwin_clone.side_effect = lambda *args: (ctypes.set_errno(code), -1)[1]
     source = tmp_path / "source"
     source.mkdir()
     data = b"checkpoint content"
@@ -288,18 +303,14 @@ def test_unsupported_clone_uses_verified_copy(tmp_path, monkeypatch, code):
         manifest["files"]["weights.safetensors"]["sha256"]
         == hashlib.sha256(data).hexdigest()
     )
-    clone.assert_called_once()
+    darwin_clone.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "code", [errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EIO, errno.EINVAL]
 )
-def test_clone_errors_abort_instead_of_copying(tmp_path, monkeypatch, code):
-    clone = Mock(side_effect=lambda *args: (ctypes.set_errno(code), -1)[1])
-    monkeypatch.setattr(store.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        store.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(clonefile=clone)
-    )
+def test_clone_errors_abort_instead_of_copying(tmp_path, darwin_clone, code):
+    darwin_clone.side_effect = lambda *args: (ctypes.set_errno(code), -1)[1]
     source = tmp_path / "source"
     source.mkdir()
     (source / "weights.safetensors").write_bytes(b"checkpoint content")
