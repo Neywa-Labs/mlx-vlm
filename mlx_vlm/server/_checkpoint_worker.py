@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """SSH-controlled, leased transfer helper. Never joins an inference group.
 
 This file and checkpoint_store are bootstrapped as source, allowing approved

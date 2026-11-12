@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Public, application-independent cluster management contract."""
 
 import re

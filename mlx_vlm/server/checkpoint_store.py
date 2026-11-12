@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Private, sealed checkpoint snapshots and bounded chunk verification.
 
 Receipts are written only after verification. Reuse requires the same inode,

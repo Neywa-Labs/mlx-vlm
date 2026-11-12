@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 
 """Standalone stdlib bootstrap, sent as Python source through mlx.launch.
 

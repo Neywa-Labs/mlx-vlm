@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 
 """Own the lifetime of an optional mlx.launch worker group."""
 

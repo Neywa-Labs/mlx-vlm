@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Reusable, isolated two-Mac transfer sessions with SSH-authenticated control."""
 
 import atexit

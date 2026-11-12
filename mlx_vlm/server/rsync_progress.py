@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Stream rsync file progress without requiring rsync 3's --info=progress2."""
 
 import os

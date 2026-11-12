@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 
 """Worker lifecycle tests; no remote hosts, downloads or inference."""
 

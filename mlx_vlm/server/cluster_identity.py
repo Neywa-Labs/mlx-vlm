@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Stable installation identity and measured, explicitly optional telemetry."""
 
 import fcntl

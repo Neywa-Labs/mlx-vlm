@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 """Authenticated registry and lifecycle controller for the inference coordinator.
 
 Discovery, consent, and external process launch are intentionally outside this

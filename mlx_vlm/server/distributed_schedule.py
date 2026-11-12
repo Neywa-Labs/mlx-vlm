@@ -1,5 +1,4 @@
 # Copyright © 2026 Neywa Labs Inc.
-# SPDX-License-Identifier: MIT
 
 """Rank-zero admission order for the native continuous batch scheduler.
 
