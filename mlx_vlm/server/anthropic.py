@@ -509,6 +509,52 @@ class StopSequenceStreamState:
         return hold
 
 
+def tool_output_before_stop(
+    output: str,
+    stop_state: StopSequenceStreamState,
+    tc_start: Optional[str],
+    tc_end: Optional[str],
+    thinking_args: Tuple[bool, Optional[str], Optional[str]],
+    make_thinking_state,
+    visible_text: str,
+    keep_before: int = 0,
+) -> str:
+    if stop_state.matched is None or not tc_start:
+        return output
+    call_start = output.find(tc_start)
+    while call_start >= 0:
+        thinking_prefix = ThinkingStreamState(*thinking_args)
+        thinking_prefix.feed(output[:call_start])
+        if thinking_prefix.in_thinking:
+            # An unclosed example in reasoning must not span
+            # an executable call after the stop marker.
+            call_start = output.find(tc_start, call_start + len(tc_start))
+            continue
+        # Match the extractor's non-overlapping call spans,
+        # including parsers whose calls end at a newline/EOF.
+        marker = tc_end or "\n"
+        call_end = output.find(marker, call_start + len(tc_start))
+        if call_end < 0:
+            if tc_end:
+                break
+            call_end = len(output)
+
+        # Compare visible offsets: raw prefixes also contain
+        # thinking and tool markup, which never reach the
+        # stop matcher.
+        prefix = make_thinking_state().feed(output[:call_start], last=True)
+        prefix_tools = ToolCallStreamState(tc_start, tc_end)
+        visible = prefix_tools.feed(prefix.content) or ""
+        # Whitespace held before a call still precedes that
+        # call when later visible text releases it.
+        pending_space = prefix_tools.pending_space
+        visible += prefix_tools.finish() or pending_space
+        if call_start >= keep_before and len(visible) > len(visible_text):
+            return output[:call_start]
+        call_start = output.find(tc_start, call_end + len(marker))
+    return output
+
+
 def _anthropic_content_from_generation(
     reasoning: Optional[str],
     content: str,
@@ -712,50 +758,6 @@ async def anthropic_messages_endpoint(http_request: Request):
                         },
                     )
 
-                def tool_output_before_stop():
-                    if stop_state.matched is None or not tc_start:
-                        return full_output
-                    call_start = full_output.find(tc_start)
-                    while call_start >= 0:
-                        thinking_prefix = ThinkingStreamState(
-                            starts_in_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
-                        thinking_prefix.feed(full_output[:call_start])
-                        if thinking_prefix.in_thinking:
-                            # An unclosed example in reasoning must not span
-                            # an executable call after the stop marker.
-                            call_start = full_output.find(
-                                tc_start, call_start + len(tc_start)
-                            )
-                            continue
-                        # Match the extractor's non-overlapping call spans,
-                        # including parsers whose calls end at a newline/EOF.
-                        marker = tc_end or "\n"
-                        call_end = full_output.find(marker, call_start + len(tc_start))
-                        if call_end < 0:
-                            if tc_end:
-                                break
-                            call_end = len(full_output)
-
-                        # Compare visible offsets: raw prefixes also contain
-                        # thinking and tool markup, which never reach the
-                        # stop matcher.
-                        prefix = make_thinking_state().feed(
-                            full_output[:call_start], last=True
-                        )
-                        prefix_tools = ToolCallStreamState(tc_start, tc_end)
-                        visible = prefix_tools.feed(prefix.content) or ""
-                        # Whitespace held before a call still precedes that
-                        # call when later visible text releases it.
-                        pending_space = prefix_tools.pending_space
-                        visible += prefix_tools.finish() or pending_space
-                        if len(visible) > len(text_output):
-                            return full_output[:call_start]
-                        call_start = full_output.find(tc_start, call_end + len(marker))
-                    return full_output
-
                 try:
                     if runtime.response_generator is not None:
                         ctx, token_iter = await asyncio.to_thread(
@@ -911,7 +913,21 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = parse_tools(tool_output_before_stop())
+                        tc = parse_tools(
+                            tool_output_before_stop(
+                                full_output,
+                                stop_state,
+                                tc_start,
+                                tc_end,
+                                (
+                                    starts_in_thinking,
+                                    gen_args.thinking_start_token,
+                                    gen_args.thinking_end_token,
+                                ),
+                                make_thinking_state,
+                                text_output,
+                            )
+                        )
                         if tc.calls:
                             parsed_tool_calls = tc.calls
 

@@ -1007,6 +1007,9 @@ class ChatRequest(GenerationRequest, ContinuationOptions):
     )
     tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
     _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
+    stop: Optional[Union[str, List[str]]] = Field(
+        None, description="Sequences where generation stops. The match is not returned."
+    )
 
 
 class TopLogprob(BaseModel):
