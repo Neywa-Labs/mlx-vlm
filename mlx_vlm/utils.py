@@ -24,7 +24,6 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
-from .models import normalize_config
 from .models.base import BaseImageProcessor
 from .quantization.checkpoint import (
     merge_quantization_configs,
@@ -962,7 +961,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             "config.json" if (model_path / "config.json").exists() else "params.json"
         )
         with open(model_path / config_file, encoding="utf-8") as f:
-            config = normalize_config(json.load(f))
+            config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():

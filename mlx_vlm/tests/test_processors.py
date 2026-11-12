@@ -836,12 +836,11 @@ def _assert_attrs(obj, **expected):
 
 
 @pytest.mark.parametrize("model_type,module_path,class_name", DATA["routes"])
-@pytest.mark.parametrize("config_filename", ["config", "params"])
 def test_auto_processor_routes_to_custom_loader(
-    tmp_path, model_type, module_path, class_name, config_filename
+    tmp_path, model_type, module_path, class_name
 ):
     cls = getattr(importlib.import_module("mlx_vlm.models." + module_path), class_name)
-    _write_configs(tmp_path, **{config_filename: {"model_type": model_type}})
+    _write_configs(tmp_path, config={"model_type": model_type})
     sentinel = object()
     with patch.object(cls, "from_pretrained", return_value=sentinel) as loader:
         assert (
