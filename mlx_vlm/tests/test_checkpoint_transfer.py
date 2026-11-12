@@ -30,6 +30,13 @@ from mlx_vlm.server.distributed import ClusterConfig, ModelStager, Worker
 
 
 @pytest.fixture
+def pool():
+    value = TransferPool()
+    yield value
+    value.close()
+
+
+@pytest.fixture
 def snapshot(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -133,31 +140,22 @@ def test_readonly_rsync_partial_can_be_resumed(snapshot, tmp_path):
     assert not missing["config.json"] and reused == file.stat().st_size
 
 
-def test_publish_rejects_mutation_after_verification(snapshot, tmp_path):
+@pytest.mark.parametrize(
+    "name,error",
+    [("config.json", "changed after"), ("unexpected.py", "Unexpected file")],
+)
+def test_publish_rejects_unverified_changes(snapshot, tmp_path, name, error):
     manifest = snapshot[-1]
     destination = store.SnapshotStore(tmp_path / "receiver")
     partial = destination.partial(manifest)
     signatures = {}
-    for name in manifest["files"]:
-        (partial / name).write_bytes((snapshot[-2] / name).read_bytes())
-        signatures[name] = store.signature(partial / name)
-    (partial / "config.json").write_text("bad")
-    with pytest.raises(ValueError, match="changed after"):
+    for filename in manifest["files"]:
+        (partial / filename).write_bytes((snapshot[-2] / filename).read_bytes())
+        signatures[filename] = store.signature(partial / filename)
+    (partial / name).write_text("unverified content")
+    with pytest.raises(ValueError, match=error):
         destination.publish(manifest, signatures)
     assert not (destination.root / store.snapshot_id(manifest)).exists()
-
-
-def test_publish_rejects_unverified_extra_files(snapshot, tmp_path):
-    manifest = snapshot[-1]
-    destination = store.SnapshotStore(tmp_path / "receiver")
-    partial = destination.partial(manifest)
-    signatures = {}
-    for name in manifest["files"]:
-        (partial / name).write_bytes((snapshot[-2] / name).read_bytes())
-        signatures[name] = store.signature(partial / name)
-    (partial / "unexpected.py").write_text("unverified code")
-    with pytest.raises(ValueError, match="Unexpected file"):
-        destination.publish(manifest, signatures)
 
 
 def test_snapshot_root_symlink_is_rejected(snapshot, tmp_path):
@@ -190,55 +188,22 @@ def test_helper_identity_mismatch_closes_owned_process():
         )
 
 
-def test_rsync_fallback_and_warm_snapshot_reuse(snapshot, tmp_path):
-    source, names, root, final, manifest = snapshot
-    worker = Worker("http://local-test", model_dir=str(tmp_path / "receiver"))
-    config = ClusterConfig(
-        (worker,), root, tmp_path / "lock", python=sys.executable, timeout=20
-    )
-    pool = TransferPool()
-    updates = []
-    report = lambda phase, **data: updates.append((phase, data))
-    try:
-        first = pool.deliver(config, worker, final, manifest, "auto", report)
-        assert first["transport"] == "ssh_rsync"
-        assert any(p == "transport_fallback" for p, _ in updates)
-        assert (Path(first["path"]) / "weights.safetensors").read_bytes() == (
-            final / "weights.safetensors"
-        ).read_bytes()
-        assert any(p == "verifying_worker" for p, _ in updates)
-        pair = next(iter(pool.pairs.values()))
-        pid = pair.remote.pid
-        second = pool.deliver(config, worker, final, manifest, "auto", report)
-        assert second["transport"] == "verified_cache"
-        assert pair.remote.pid == pid
-        assert updates[-1][1]["bytes_transferred"] == 0
-        assert updates[-1][1]["bytes_reused"] == sum(
-            r["size"] for r in manifest["files"].values()
-        )
-    finally:
-        pool.close()
-    assert pair.remote.process.poll() is not None
-
-
-def test_explicit_rdma_never_silently_falls_back(snapshot, tmp_path):
+def test_explicit_rdma_never_silently_falls_back(snapshot, tmp_path, pool):
     _, _, root, final, manifest = snapshot
     worker = Worker("http://local-test", model_dir=str(tmp_path / "receiver"))
     config = ClusterConfig((worker,), root, tmp_path / "lock", python=sys.executable)
-    pool = TransferPool()
-    try:
-        with pytest.raises(RuntimeError, match="No direct RDMA"):
-            pool.deliver(
-                config, worker, final, manifest, "jaccl_rdma", lambda *a, **k: None
-            )
-        assert not pool.pairs
-        assert not (Path(worker.model_dir) / store.snapshot_id(manifest)).exists()
-    finally:
-        pool.close()
+    with pytest.raises(RuntimeError, match="No direct RDMA"):
+        pool.deliver(
+            config, worker, final, manifest, "jaccl_rdma", lambda *a, **k: None
+        )
+    assert not pool.pairs
+    assert not (Path(worker.model_dir) / store.snapshot_id(manifest)).exists()
 
 
 @pytest.mark.parametrize("transport", ["auto", "ssh_rsync"])
-def test_preparation_transports_share_verified_snapshots_and_pool(tmp_path, transport):
+def test_preparation_transports_share_verified_snapshots_and_pool(
+    tmp_path, transport, pool
+):
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text("{}")
@@ -247,23 +212,41 @@ def test_preparation_transports_share_verified_snapshots_and_pool(tmp_path, tran
     config = ClusterConfig(
         (worker,), tmp_path / "cache", tmp_path / "lock", python=sys.executable
     )
-    pool = TransferPool()
-    try:
-        stager = ModelStager(config, transfers=pool)
-        first = stager.prepare(
-            str(source), validate_sharding=False, transport=transport
-        )
-        second = ModelStager(config, transfers=pool)
-        assert (
-            second.prepare(str(source), validate_sharding=False, transport="jaccl_rdma")
-            == first
-        )
-        assert second.worker_transfers[worker.url]["transport"] == "verified_cache"
-        # Switching transport, including ordinary inference staging, uses the
-        # same snapshot without a connection check or checkpoint retransmission.
-        assert second.prepare(str(source), validate_sharding=False) == first
-    finally:
-        pool.close()
+    stager = ModelStager(config, transfers=pool)
+    updates = []
+    report = lambda phase, **data: updates.append((phase, data))
+    first = stager.prepare(
+        str(source), validate_sharding=False, transport=transport, progress=report
+    )
+    assert stager.worker_transfers[worker.url]["transport"] == "ssh_rsync"
+    assert any(p == "transport_fallback" for p, _ in updates) is (transport == "auto")
+    assert any(p == "verifying_worker" for p, _ in updates)
+    path = Path(stager.worker_paths[(first, worker.url)])
+    assert path.parent == Path(worker.model_dir) and path != Path(first)
+    assert (path / "weights.safetensors").read_bytes() == (
+        source / "weights.safetensors"
+    ).read_bytes()
+    assert not list(Path(worker.model_dir).glob(".partial-*"))
+    pair = next(iter(pool.pairs.values()))
+    pid = pair.remote.pid
+    second = ModelStager(config, transfers=pool)
+    assert (
+        second.prepare(str(source), validate_sharding=False, transport="jaccl_rdma")
+        == first
+    )
+    assert second.worker_transfers[worker.url]["transport"] == "verified_cache"
+    # Switching transport, including ordinary inference staging, uses the
+    # same snapshot without a connection check or checkpoint retransmission.
+    assert (
+        second.prepare(str(source), validate_sharding=False, progress=report) == first
+    )
+    assert pair.remote.pid == pid
+    assert updates[-1][1]["bytes_transferred"] == 0
+    assert updates[-1][1]["bytes_reused"] == sum(
+        p.stat().st_size for p in source.iterdir()
+    )
+    pool.close()
+    assert pair.remote.process.poll() is not None
 
 
 def test_transport_contract_and_topology_validation():
@@ -396,11 +379,10 @@ def test_helper_fallback_requires_explicit_connection_error(checking, code, expe
         TypeError("Unexpected implementation error"),
     ],
 )
-def test_local_helper_startup_errors_do_not_become_fallback(error, monkeypatch):
-    pair = object.__new__(Pair)
-    pair.validated = False
-    pair.config = SimpleNamespace(timeout=1)
-    pair.worker = SimpleNamespace(ssh="peer", rdma={"local_address": "127.0.0.1"})
+def test_local_helper_startup_errors_do_not_become_fallback(
+    connecting_pair, error, monkeypatch
+):
+    pair, _ = connecting_pair
     monkeypatch.setattr(transfer, "Helper", Mock(side_effect=error))
     with pytest.raises(type(error)) as caught:
         pair.connect()
@@ -498,6 +480,7 @@ def test_bind_only_falls_back_for_unavailable_network(
 @pytest.mark.parametrize(
     "error",
     [
+        TransferUnavailable("Connection refused"),
         RuntimeError("Unexpected checkpoint helper command sequence"),
         ValueError("RDMA connection challenge mismatch"),
         TypeError("unexpected backend keyword"),
@@ -505,8 +488,8 @@ def test_bind_only_falls_back_for_unavailable_network(
         InterruptedError("Checkpoint preparation cancelled"),
     ],
 )
-def test_auto_does_not_fallback_on_unclassified_errors(
-    snapshot, tmp_path, monkeypatch, error
+def test_auto_falls_back_only_on_classified_connection_errors(
+    snapshot, tmp_path, monkeypatch, error, pool
 ):
     _, _, root, final, manifest = snapshot
     worker = Worker(
@@ -521,46 +504,9 @@ def test_auto_does_not_fallback_on_unclassified_errors(
     config = ClusterConfig((worker,), root, tmp_path / "lock", python=sys.executable)
     monkeypatch.setattr(Pair, "connect", Mock(side_effect=error))
     updates = []
-    pool = TransferPool()
-    try:
-        with pytest.raises(type(error)) as caught:
-            pool.deliver(
-                config,
-                worker,
-                final,
-                manifest,
-                "auto",
-                lambda phase, **data: updates.append(phase),
-            )
-        assert caught.value is error
-        assert "transport_fallback" not in updates
-        assert not pool.pairs
-        assert not (Path(worker.model_dir) / store.snapshot_id(manifest)).exists()
-    finally:
-        pool.close()
 
-
-def test_auto_falls_back_on_classified_connection_failure(
-    snapshot, tmp_path, monkeypatch
-):
-    _, _, root, final, manifest = snapshot
-    worker = Worker(
-        "http://local-test",
-        model_dir=str(tmp_path / "receiver"),
-        rdma={
-            "local_address": "127.0.0.1",
-            "local_device": "rdma_en4",
-            "remote_device": "rdma_en5",
-        },
-    )
-    config = ClusterConfig((worker,), root, tmp_path / "lock", python=sys.executable)
-    monkeypatch.setattr(
-        Pair, "connect", Mock(side_effect=TransferUnavailable("Connection refused"))
-    )
-    updates = []
-    pool = TransferPool()
-    try:
-        result = pool.deliver(
+    def deliver():
+        return pool.deliver(
             config,
             worker,
             final,
@@ -568,11 +514,19 @@ def test_auto_falls_back_on_classified_connection_failure(
             "auto",
             lambda phase, **data: updates.append((phase, data)),
         )
+
+    if isinstance(error, TransferUnavailable):
+        result = deliver()
         assert result["transport"] == "ssh_rsync" and result["verified"]
-        assert result["fallback_reason"] == "Connection refused"
+        assert result["fallback_reason"] == str(error)
         assert sum(phase == "transport_fallback" for phase, _ in updates) == 1
         assert (Path(result["path"]) / "weights.safetensors").read_bytes() == (
             final / "weights.safetensors"
         ).read_bytes()
-    finally:
-        pool.close()
+    else:
+        with pytest.raises(type(error)) as caught:
+            deliver()
+        assert caught.value is error
+        assert not any(phase == "transport_fallback" for phase, _ in updates)
+        assert not pool.pairs
+        assert not (Path(worker.model_dir) / store.snapshot_id(manifest)).exists()

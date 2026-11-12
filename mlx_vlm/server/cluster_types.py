@@ -2,11 +2,36 @@
 # SPDX-License-Identifier: MIT
 """Public, application-independent cluster management contract."""
 
+import re
 from ipaddress import IPv4Address
 from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+
+def worker_origin(value):
+    url = urlsplit(value)
+    if (
+        url.scheme not in {"http", "https"}
+        or not url.hostname
+        or url.username
+        or url.password
+        or url.query
+        or url.fragment
+        or url.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "Worker endpoint must be an HTTP(S) origin without credentials"
+        )
+    return value.rstrip("/")
+
+
+def model_directory(value):
+    # rsync's remote argument is interpreted by a remote shell as well.
+    if not re.fullmatch(r"/[\w/.-]+", value):
+        raise ValueError("model_dir must be absolute without shell metacharacters")
+    return value
 
 
 class Contract(BaseModel):
@@ -81,18 +106,7 @@ class RegisterNode(Contract):
     @field_validator("endpoint")
     @classmethod
     def origin(cls, value):
-        url = urlsplit(value)
-        if (
-            url.scheme not in {"http", "https"}
-            or not url.hostname
-            or url.username
-            or url.password
-            or url.query
-            or url.fragment
-            or url.path not in {"", "/"}
-        ):
-            raise ValueError("endpoint must be an HTTP(S) origin without credentials")
-        return value.rstrip("/")
+        return worker_origin(value)
 
 
 class UpdateNode(Contract):
@@ -104,7 +118,7 @@ class UpdateNode(Contract):
     @field_validator("endpoint")
     @classmethod
     def origin(cls, value):
-        return RegisterNode.origin(value) if value is not None else None
+        return worker_origin(value) if value is not None else None
 
 
 class Node(Contract):

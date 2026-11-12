@@ -110,8 +110,6 @@ class ClusterManager:
         self.events = deque(maxlen=1024)
         self.event_id = int(time.time() * 1000000)
         self.changed = asyncio.Condition()
-        self.launcher = None
-        self.monitor = None
         self.last_refresh = 0
         self.bootstrapped = False
         self.transfers = None
@@ -385,10 +383,7 @@ class ClusterManager:
             if (
                 not self.bootstrapped
                 and runtime.distributed_coordinator
-                and (
-                    not self.nodes
-                    or getattr(runtime.distributed_coordinator, "launcher", None)
-                )
+                and (not self.nodes or runtime.distributed_coordinator.launcher)
             ):
                 try:
                     await self.bootstrap()
@@ -461,9 +456,7 @@ class ClusterManager:
             ),
             active_requests=coordinator.active if coordinator else 0,
             ownership=(
-                "server"
-                if self.launcher or getattr(coordinator, "launcher", None)
-                else "external"
+                "server" if coordinator and coordinator.launcher else "external"
             ),
             memory=self.aggregate(),
             capabilities=Capabilities(
@@ -747,7 +740,7 @@ class ClusterManager:
         if len(self.selected) < 2:
             fail("members_required", "Select at least two registered workers.", 422)
         previous_state = self.state
-        launcher = monitor = None
+        launcher = None
         try:
             self.state = "starting"
             await self.phase(operation, "validating")
@@ -786,12 +779,11 @@ class ClusterManager:
                     )
                 from .distributed_launch import WorkerLauncher
 
-                launcher = WorkerLauncher(coordinator)
+                coordinator.launcher = launcher = WorkerLauncher(coordinator)
                 await self.phase(operation, "launching")
                 # Keep the failure marker until fresh process identities are checked
                 # below; startup still refuses occupied endpoints or another owner.
                 await launcher.start(recover=True)
-                monitor = asyncio.create_task(launcher.monitor())
             else:
                 for rank, node_id in enumerate(self.selected):
                     info = self.nodes[node_id].identity.worker
@@ -869,18 +861,14 @@ class ClusterManager:
             # Only this attempt's resources are eligible for cleanup. Existing
             # launchers (including CLI-owned groups) must remain untouched.
             try:
-                if monitor:
-                    monitor.cancel()
-                    await asyncio.gather(monitor, return_exceptions=True)
                 if launcher:
-                    await asyncio.to_thread(launcher.stop)
+                    await launcher.close()
             finally:
                 if launcher or self.state == "failed":
                     self.state = "failed"
                 else:
                     self.state = previous_state
             raise
-        self.launcher, self.monitor = launcher, monitor
         runtime.distributed_coordinator = coordinator
         self.running = list(self.selected)
         self.state = "ready"
@@ -931,9 +919,7 @@ class ClusterManager:
                     operation.result = {
                         "state": "stopped",
                         "members": [],
-                        "external_restart_required": not bool(
-                            self.launcher or getattr(coordinator, "launcher", None)
-                        ),
+                        "external_restart_required": coordinator.launcher is None,
                         "collective_disposal_acknowledged": False,
                     }
                 else:
@@ -948,17 +934,14 @@ class ClusterManager:
                         await coordinator.expire_continuations(
                             client, all_sessions=True
                         )
-            launcher = self.launcher or getattr(coordinator, "launcher", None)
+            launcher = coordinator.launcher if coordinator else None
             if launcher:
                 await self.phase(operation, "stopping_owned_workers")
                 destructive = True
-                if self.monitor:
-                    self.monitor.cancel()
-                    await asyncio.gather(self.monitor, return_exceptions=True)
-                await asyncio.to_thread(launcher.stop)
+                await launcher.close()
+                coordinator.launcher = None
             # Detaching an external group never sends a process-stop command.
-            self.monitor = None
-            self.launcher, self.running, self.state = None, [], "stopped"
+            self.running, self.state = [], "stopped"
             self.bootstrapped = True
             self.save()
             await self.emit("cluster.stopped", {"external_processes_stopped": False})
@@ -983,11 +966,9 @@ class ClusterManager:
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        if self.monitor:
-            self.monitor.cancel()
-            await asyncio.gather(self.monitor, return_exceptions=True)
-        if self.launcher:
-            await asyncio.to_thread(self.launcher.stop)
+        coordinator = runtime.distributed_coordinator
+        if coordinator and coordinator.launcher:
+            await coordinator.launcher.close()
         if self.transfers:
             await asyncio.to_thread(self.transfers.close)
 

@@ -11,6 +11,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -202,7 +203,12 @@ def test_start_waits_for_matching_health_and_sends_key_on_stdin(
         )
 
     _transport(monkeypatch, handler)
-    asyncio.run(launcher.start())
+
+    async def run():
+        await launcher.start()
+        assert launcher.monitor_task is not None and not launcher.monitor_task.done()
+
+    asyncio.run(run())
     factory.assert_called_once()
     assert (
         json.loads(process.read())["env"]["MLX_VLM_SERVER_API_KEY"]
@@ -278,7 +284,9 @@ def test_second_owner_cannot_launch(cluster, fake_launch, monkeypatch):
     "failure", [RuntimeError("startup failed"), asyncio.CancelledError()]
 )
 def test_lifespan_rolls_back_failed_or_cancelled_startup(cluster, monkeypatch, failure):
-    instance = Mock(start=AsyncMock(side_effect=failure), stop=Mock())
+    instance = WorkerLauncher(Coordinator(cluster))
+    monkeypatch.setattr(instance, "start", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(instance, "_stop", Mock())
     monkeypatch.setattr(
         distributed_launch, "WorkerLauncher", Mock(return_value=instance)
     )
@@ -289,22 +297,50 @@ def test_lifespan_rolls_back_failed_or_cancelled_startup(cluster, monkeypatch, f
 
     with pytest.raises(type(failure)):
         asyncio.run(run())
-    instance.stop.assert_called_once()
+    instance._stop.assert_called_once()
 
 
 def test_fastapi_lifespan_starts_and_stops_workers(cluster, monkeypatch):
-    async def monitor():
-        await asyncio.Event().wait()
-
-    instance = Mock(start=AsyncMock(), monitor=monitor, stop=Mock())
+    instance = WorkerLauncher(Coordinator(cluster))
+    monkeypatch.setattr(instance, "start", AsyncMock())
+    monkeypatch.setattr(instance, "_stop", Mock())
     monkeypatch.setattr(
         distributed_launch, "WorkerLauncher", Mock(return_value=instance)
     )
     monkeypatch.setattr(runtime, "distributed_coordinator", Coordinator(cluster))
     with TestClient(server.app):
         instance.start.assert_awaited_once()
-        instance.stop.assert_not_called()
-    instance.stop.assert_called_once()
+        instance._stop.assert_not_called()
+    instance._stop.assert_called_once()
+
+
+def test_cancelled_close_waits_for_owned_process_cleanup(cluster, monkeypatch):
+    launcher = WorkerLauncher(Coordinator(cluster))
+    entered, release, stopped = (threading.Event() for _ in range(3))
+
+    def stop():
+        entered.set()
+        assert release.wait(timeout=5)
+        stopped.set()
+
+    monkeypatch.setattr(launcher, "_stop", stop)
+
+    async def run():
+        launcher.monitor_task = asyncio.create_task(asyncio.Event().wait())
+        closing = asyncio.create_task(launcher.close())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            closing.cancel()
+            await asyncio.sleep(0)
+            assert not closing.done() and launcher.monitor_task.done()
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        assert stopped.is_set()
+        await launcher.close()  # Repeated teardown remains safe.
+
+    asyncio.run(run())
 
 
 def test_external_and_local_servers_do_not_launch_workers(cluster, monkeypatch):

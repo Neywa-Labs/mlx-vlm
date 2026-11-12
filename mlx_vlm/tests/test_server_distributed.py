@@ -39,6 +39,13 @@ from mlx_vlm.server.distributed_schedule import RequestScope, request_scope, sch
 from mlx_vlm.server.rsync_progress import RsyncProgress, run_rsync
 from mlx_vlm.server.runtime import runtime
 
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
 
 @pytest.fixture
 def cluster(tmp_path):
@@ -48,6 +55,14 @@ def cluster(tmp_path):
         tmp_path / "cluster.lock",
         python=sys.executable,
     )
+
+
+@pytest.fixture
+def coordinator(cluster, monkeypatch):
+    value = Coordinator(cluster)
+    monkeypatch.setenv(cluster.api_key_env, "key")
+    monkeypatch.setattr(value.stager, "prepare", Mock(return_value="/models/snapshot"))
+    return value
 
 
 @pytest.fixture
@@ -391,6 +406,7 @@ def test_selecting_another_model_stages_new_snapshot(staging_cluster, checkpoint
     [
         {"workers": [{"url": "http://one"}]},
         {"workers": [{"url": "http://one"}, {"url": "http://one"}]},
+        {"workers": [{"url": "http://one"}, {"url": "http://one/"}]},
         {"model_dir": "/tmp/a;touch-b"},
         {
             "workers": [
@@ -450,9 +466,8 @@ def _health(rank):
 
 
 def test_coordinator_waits_for_staging_then_fans_out_identical_requests(
-    cluster, monkeypatch
+    cluster, monkeypatch, coordinator
 ):
-    coordinator = Coordinator(cluster)
     calls = []
     entered = set()
 
@@ -526,9 +541,9 @@ def test_compaction_comparison_uses_decrypted_content(tmp_path):
     )
 
 
-def test_staging_error_never_fans_out_or_poisons_group(cluster, monkeypatch):
-    coordinator = Coordinator(cluster)
-    monkeypatch.setenv(cluster.api_key_env, "key")
+def test_staging_error_never_fans_out_or_poisons_group(
+    cluster, monkeypatch, coordinator
+):
     stage = Mock(side_effect=httpx.ConnectError("Hub unavailable"))
     monkeypatch.setattr(coordinator.stager, "prepare", stage)
 
@@ -545,10 +560,10 @@ def test_staging_error_never_fans_out_or_poisons_group(cluster, monkeypatch):
         pass
 
 
-def test_cancelled_transfer_keeps_lock_until_thread_finishes(cluster, monkeypatch):
-    coordinator = Coordinator(cluster)
+async def test_cancelled_transfer_keeps_lock_until_thread_finishes(
+    cluster, monkeypatch, coordinator
+):
     entered, release = threading.Event(), threading.Event()
-    monkeypatch.setenv(cluster.api_key_env, "key")
 
     def stage(*args):
         entered.set()
@@ -562,25 +577,23 @@ def test_cancelled_transfer_keeps_lock_until_thread_finishes(cluster, monkeypatc
     monkeypatch.setattr(coordinator.stager, "prepare", stage)
     _transport(monkeypatch, handler)
 
-    async def cancel_request():
-        task = asyncio.create_task(
-            coordinator.relay("/v1/responses", {"model": "org/model"})
-        )
-        try:
-            assert await asyncio.to_thread(entered.wait, 3)
-            task.cancel()
-            await asyncio.sleep(0)
-            assert not task.done()
-            with pytest.raises(HTTPException) as error:
-                with cluster_lock(cluster.shared_lock):
-                    pass
-            assert error.value.status_code == 409
-        finally:
-            release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    task = asyncio.create_task(
+        coordinator.relay("/v1/responses", {"model": "org/model"})
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        with pytest.raises(HTTPException) as error:
+            with cluster_lock(cluster.shared_lock):
+                pass
+        assert error.value.status_code == 409
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    asyncio.run(cancel_request())
     assert not coordinator.failure.exists()
     with cluster_lock(cluster.shared_lock):
         pass
@@ -601,11 +614,9 @@ def test_worker_fingerprint_includes_context_limit(cluster, monkeypatch):
 
 @pytest.mark.parametrize("failure", ["mismatch", "transport", "server"])
 def test_failed_rank_poisons_group_and_prevents_next_request(
-    cluster, monkeypatch, failure
+    cluster, monkeypatch, failure, coordinator
 ):
-    coordinator = Coordinator(cluster)
     cluster.model_dir.mkdir()
-    monkeypatch.setenv(cluster.api_key_env, "key")
     stage = Mock(return_value=str(cluster.model_dir / "snapshot"))
     monkeypatch.setattr(coordinator.stager, "prepare", stage)
 
@@ -631,11 +642,9 @@ def test_failed_rank_poisons_group_and_prevents_next_request(
     stage.assert_called_once()
 
 
-def test_worker_rank_mismatch_fails_before_staging(cluster, monkeypatch):
-    coordinator = Coordinator(cluster)
+def test_worker_rank_mismatch_fails_before_staging(monkeypatch, coordinator):
     stage = Mock()
     monkeypatch.setattr(coordinator.stager, "prepare", stage)
-    monkeypatch.setenv(cluster.api_key_env, "key")
     _transport(monkeypatch, lambda request: httpx.Response(200, json=_health(0)))
     with pytest.raises(HTTPException) as error:
         asyncio.run(coordinator.relay("/v1/responses", {"model": "org/model"}))
@@ -643,41 +652,32 @@ def test_worker_rank_mismatch_fails_before_staging(cluster, monkeypatch):
     stage.assert_not_called()
 
 
-def test_failed_rank_does_not_wait_for_peer_blocked_before_headers(
-    cluster, monkeypatch
+async def test_failed_rank_does_not_wait_for_peer_blocked_before_headers(
+    monkeypatch, coordinator
 ):
-    async def check():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *a: "/models/snapshot"
-        )
-        blocked = asyncio.Event()
-        cancelled = set()
+    tasks_before = asyncio.all_tasks()
+    blocked = asyncio.Event()
+    cancelled = set()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            if request.url.path == CANCEL_ROUTE:
-                cancelled.add(rank)
-                return httpx.Response(202, json={})
-            if rank == 0:
-                blocked.set()
-                await asyncio.Event().wait()
-            await blocked.wait()
-            raise httpx.ConnectError("rank disconnected")
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+        if request.url.path == CANCEL_ROUTE:
+            cancelled.add(rank)
+            return httpx.Response(202, json={})
+        if rank == 0:
+            blocked.set()
+            await asyncio.Event().wait()
+        await blocked.wait()
+        raise httpx.ConnectError("rank disconnected")
 
-        _transport(monkeypatch, handler)
-        with pytest.raises(HTTPException) as error:
-            await asyncio.wait_for(
-                coordinator.relay("/v1/responses", {"model": "a"}), 2
-            )
-        assert error.value.status_code == 502 and coordinator.failure.exists()
-        assert coordinator.active == 0 and cancelled == {0, 1}
-        assert len(asyncio.all_tasks()) == 1
-
-    asyncio.run(check())
+    _transport(monkeypatch, handler)
+    with pytest.raises(HTTPException) as error:
+        await asyncio.wait_for(coordinator.relay("/v1/responses", {"model": "a"}), 2)
+    assert error.value.status_code == 502 and coordinator.failure.exists()
+    assert coordinator.active == 0 and cancelled == {0, 1}
+    assert asyncio.all_tasks() == tasks_before
 
 
 @pytest.mark.parametrize("body", ["not-json", "[]", '{"request_id":"invalid"}'])
@@ -697,8 +697,9 @@ def test_worker_cancel_rejects_invalid_bodies(monkeypatch, body):
     "options",
     [{"adapter_path": "adapter"}, {"previous_response_id": "resp"}],
 )
-def test_unsupported_distributed_options_fail_before_staging(cluster, options):
-    coordinator = Coordinator(cluster)
+def test_unsupported_distributed_options_fail_before_staging(
+    cluster, options, coordinator
+):
     with pytest.raises(HTTPException) as error:
         asyncio.run(
             coordinator.relay("/v1/responses", {"model": "org/model", **options})
@@ -916,270 +917,223 @@ def _sse(rank, text, model="/models/snapshot"):
     )
 
 
+@pytest.fixture
+def cancelled_ranks(coordinator, monkeypatch):
+    release = asyncio.Event()
+    cancelled = set()
+
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+        if request.url.path == CANCEL_ROUTE:
+            assert coordinator.active == 1
+            cancelled.add(rank)
+            if len(cancelled) == 2:
+                release.set()
+            return httpx.Response(202, json={})
+
+        async def events():
+            yield _sse(rank, "hello")
+            await release.wait()
+
+        return httpx.Response(200, stream=EventStream(events))
+
+    _transport(monkeypatch, handler)
+    return cancelled
+
+
 @pytest.mark.parametrize("mismatch", [False, True])
-def test_stream_forwards_tokens_before_completion_and_checks_every_rank(
-    cluster, monkeypatch, mismatch
+async def test_stream_forwards_tokens_before_completion_and_checks_every_rank(
+    monkeypatch, mismatch, coordinator
 ):
-    async def check():
-        release = asyncio.Event()
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *a: "/models/snapshot"
+    release = asyncio.Event()
+
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+
+        async def events():
+            yield _sse(rank, "different" if mismatch and rank else "hello")
+            await release.wait()
+            yield "data: [DONE]\n\n"
+
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=EventStream(events),
         )
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-
-            async def events():
-                yield _sse(rank, "different" if mismatch and rank else "hello")
-                await release.wait()
-                yield "data: [DONE]\n\n"
-
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                stream=EventStream(events),
-            )
-
-        _transport(monkeypatch, handler)
-        response = await coordinator.relay(
-            "/v1/chat/completions", {"model": "org/model", "stream": True}
-        )
-        first = await asyncio.wait_for(anext(response.body_iterator), 2)
-        assert "hello" in first and "org/model" in first and "[DONE]" not in first
-        assert coordinator.active == 1 and not release.is_set()
-        release.set()
-        rest = "".join([event async for event in response.body_iterator])
-        assert ("[DONE]" in rest) is not mismatch
-        assert ("distributed_error" in rest) is mismatch
-        assert coordinator.failure.exists() is mismatch
-        assert coordinator.active == 0
-
-    asyncio.run(check())
+    _transport(monkeypatch, handler)
+    response = await coordinator.relay(
+        "/v1/chat/completions", {"model": "org/model", "stream": True}
+    )
+    first = await asyncio.wait_for(anext(response.body_iterator), 2)
+    assert "hello" in first and "org/model" in first and "[DONE]" not in first
+    assert coordinator.active == 1 and not release.is_set()
+    release.set()
+    rest = "".join([event async for event in response.body_iterator])
+    assert ("[DONE]" in rest) is not mismatch
+    assert ("distributed_error" in rest) is mismatch
+    assert coordinator.failure.exists() is mismatch
+    assert coordinator.active == 0
 
 
-def test_stream_disconnect_cancels_all_ranks_and_drains_before_unlock(
-    cluster, monkeypatch
+async def test_stream_disconnect_cancels_all_ranks_and_drains_before_unlock(
+    coordinator, cancelled_ranks
 ):
-    async def check():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *a: "/models/snapshot"
-        )
-        release = asyncio.Event()
-        cancelled = set()
+    tasks_before = asyncio.all_tasks()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            if request.url.path == CANCEL_ROUTE:
-                assert coordinator.active == 1
-                cancelled.add(rank)
-                if len(cancelled) == 2:
-                    release.set()
-                return httpx.Response(202, json={})
-
-            async def events():
-                yield _sse(rank, "hello")
-                await release.wait()
-
-            return httpx.Response(200, stream=EventStream(events))
-
-        _transport(monkeypatch, handler)
-        response = await coordinator.relay(
-            "/v1/chat/completions", {"model": "org/model", "stream": True}
-        )
-        await anext(response.body_iterator)
-        await asyncio.wait_for(response.body_iterator.aclose(), 2)
-        assert cancelled == {0, 1} and coordinator.active == 0
-        assert not coordinator.failure.exists()
-        assert len(asyncio.all_tasks()) == 1
-
-    asyncio.run(check())
+    response = await coordinator.relay(
+        "/v1/chat/completions", {"model": "org/model", "stream": True}
+    )
+    await anext(response.body_iterator)
+    await asyncio.wait_for(response.body_iterator.aclose(), 2)
+    assert cancelled_ranks == {0, 1} and coordinator.active == 0
+    assert not coordinator.failure.exists()
+    assert asyncio.all_tasks() == tasks_before
 
 
-def test_same_model_requests_overlap_and_switch_waits_for_streams(cluster, monkeypatch):
-    async def check():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        stages, seeds = [], []
+async def test_same_model_requests_overlap_and_switch_waits_for_streams(
+    monkeypatch, coordinator
+):
+    stages, seeds = [], []
 
-        def stage(model, revision):
-            stages.append(model)
-            return "/models/" + model
+    def stage(model, revision):
+        stages.append(model)
+        return "/models/" + model
 
-        monkeypatch.setattr(coordinator.stager, "prepare", stage)
-        release = asyncio.Event()
+    monkeypatch.setattr(coordinator.stager, "prepare", stage)
+    release = asyncio.Event()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            body = json.loads(request.content)
-            seeds.append(body["seed"])
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+        body = json.loads(request.content)
+        seeds.append(body["seed"])
 
-            async def events():
-                yield _sse(rank, "hello", body["model"])
-                await release.wait()
-                yield "data: [DONE]\n\n"
+        async def events():
+            yield _sse(rank, "hello", body["model"])
+            await release.wait()
+            yield "data: [DONE]\n\n"
 
-            return httpx.Response(200, stream=EventStream(events))
+        return httpx.Response(200, stream=EventStream(events))
 
-        _transport(monkeypatch, handler)
-        first, second = await asyncio.wait_for(
-            asyncio.gather(
-                *[
-                    coordinator.relay(
-                        "/v1/chat/completions", {"model": "a", "stream": True}
-                    )
-                    for _ in range(2)
-                ]
-            ),
-            2,
-        )
-        assert coordinator.active == 2 and stages == ["a"]
-        assert len(set(seeds)) == 1
-        switching = asyncio.create_task(
-            coordinator.relay("/v1/chat/completions", {"model": "b", "stream": True})
-        )
-        await asyncio.sleep(0.01)
-        assert not switching.done() and stages == ["a"]
-        release.set()
-        for response in (first, second):
-            assert "[DONE]" in "".join(
-                [event async for event in response.body_iterator]
-            )
-        third = await asyncio.wait_for(switching, 2)
-        assert stages == ["a", "b"]
-        assert "[DONE]" in "".join([event async for event in third.body_iterator])
-        assert coordinator.active == 0
-
-    asyncio.run(check())
+    _transport(monkeypatch, handler)
+    first, second = await asyncio.wait_for(
+        asyncio.gather(
+            *[
+                coordinator.relay(
+                    "/v1/chat/completions", {"model": "a", "stream": True}
+                )
+                for _ in range(2)
+            ]
+        ),
+        2,
+    )
+    assert coordinator.active == 2 and stages == ["a"]
+    assert len(set(seeds)) == 1
+    switching = asyncio.create_task(
+        coordinator.relay("/v1/chat/completions", {"model": "b", "stream": True})
+    )
+    await asyncio.sleep(0.01)
+    assert not switching.done() and stages == ["a"]
+    release.set()
+    for response in (first, second):
+        assert "[DONE]" in "".join([event async for event in response.body_iterator])
+    third = await asyncio.wait_for(switching, 2)
+    assert stages == ["a", "b"]
+    assert "[DONE]" in "".join([event async for event in third.body_iterator])
+    assert coordinator.active == 0
 
 
 @pytest.mark.parametrize("spec", ["2.3", "2.4"])
 @pytest.mark.parametrize("disconnect_on", ["http.response.start", "http.response.body"])
-def test_stream_asgi_disconnect_releases_unstarted_or_suspended_iterator(
-    cluster, monkeypatch, spec, disconnect_on
+async def test_stream_asgi_disconnect_releases_unstarted_or_suspended_iterator(
+    spec, disconnect_on, coordinator, cancelled_ranks
 ):
     from starlette.requests import ClientDisconnect
 
-    async def check():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *a: "/models/snapshot"
-        )
-        release, disconnect = asyncio.Event(), asyncio.Event()
-        cancelled = set()
+    tasks_before = asyncio.all_tasks()
+    disconnect = asyncio.Event()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            if request.url.path == CANCEL_ROUTE:
-                assert coordinator.active == 1
-                cancelled.add(rank)
-                if len(cancelled) == 2:
-                    release.set()
-                return httpx.Response(202, json={})
+    response = await coordinator.relay(
+        "/v1/chat/completions", {"model": "org/model", "stream": True}
+    )
 
-            async def events():
-                yield _sse(rank, "hello")
-                await release.wait()
+    async def send(message):
+        if message["type"] == disconnect_on:
+            if spec == "2.4":
+                raise OSError("Client disconnected")
+            disconnect.set()
+            await asyncio.Event().wait()
 
-            return httpx.Response(200, stream=EventStream(events))
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
 
-        _transport(monkeypatch, handler)
-        response = await coordinator.relay(
-            "/v1/chat/completions", {"model": "org/model", "stream": True}
-        )
+    async def serve():
+        try:
+            await response(
+                {"type": "http", "asgi": {"spec_version": spec}}, receive, send
+            )
+        except ClientDisconnect:
+            assert spec == "2.4"
 
-        async def send(message):
-            if message["type"] == disconnect_on:
-                if spec == "2.4":
-                    raise OSError("Client disconnected")
-                disconnect.set()
-                await asyncio.Event().wait()
-
-        async def receive():
-            await disconnect.wait()
-            return {"type": "http.disconnect"}
-
-        async def serve():
-            try:
-                await response(
-                    {"type": "http", "asgi": {"spec_version": spec}}, receive, send
-                )
-            except ClientDisconnect:
-                assert spec == "2.4"
-
-        await asyncio.wait_for(serve(), 2)
-        assert coordinator.active == 0 and cancelled == {0, 1}
-        assert not coordinator.failure.exists()
-        assert len(asyncio.all_tasks()) == 1
-
-    asyncio.run(check())
+    await asyncio.wait_for(serve(), 2)
+    assert coordinator.active == 0 and cancelled_ranks == {0, 1}
+    assert not coordinator.failure.exists()
+    assert asyncio.all_tasks() == tasks_before
 
 
 @pytest.mark.parametrize("phase", ["headers", "body"])
-def test_nonstream_cancellation_drains_workers_without_poisoning_group(
-    cluster, monkeypatch, phase
+async def test_nonstream_cancellation_drains_workers_without_poisoning_group(
+    monkeypatch, phase, coordinator
 ):
-    async def check():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *a: "/models/snapshot"
-        )
-        started, release = asyncio.Event(), asyncio.Event()
-        cancelled, reading = set(), set()
+    tasks_before = asyncio.all_tasks()
+    started, release = asyncio.Event(), asyncio.Event()
+    cancelled, reading = set(), set()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            if request.url.path == CANCEL_ROUTE:
-                assert coordinator.active == 1
-                cancelled.add(rank)
-                if len(cancelled) == 2:
-                    release.set()
-                return httpx.Response(202, json={})
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+        if request.url.path == CANCEL_ROUTE:
+            assert coordinator.active == 1
+            cancelled.add(rank)
+            if len(cancelled) == 2:
+                release.set()
+            return httpx.Response(202, json={})
 
-            async def wait_for_cancel():
-                reading.add(rank)
-                if len(reading) == 2:
-                    started.set()
-                await release.wait()
+        async def wait_for_cancel():
+            reading.add(rank)
+            if len(reading) == 2:
+                started.set()
+            await release.wait()
 
-            if phase == "headers":
-                await wait_for_cancel()
-                return httpx.Response(500, json={"error": "Request cancelled"})
+        if phase == "headers":
+            await wait_for_cancel()
+            return httpx.Response(500, json={"error": "Request cancelled"})
 
-            async def body():
-                await wait_for_cancel()
-                yield '{"error": "Request cancelled"}'
+        async def body():
+            await wait_for_cancel()
+            yield '{"error": "Request cancelled"}'
 
-            return httpx.Response(500, stream=EventStream(body))
+        return httpx.Response(500, stream=EventStream(body))
 
-        _transport(monkeypatch, handler)
-        task = asyncio.create_task(
-            coordinator.relay("/v1/chat/completions", {"model": "a"})
-        )
-        await asyncio.wait_for(started.wait(), 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 2)
-        assert cancelled == {0, 1} and coordinator.active == 0
-        assert not coordinator.failure.exists()
-        assert len(asyncio.all_tasks()) == 1
-
-    asyncio.run(check())
+    _transport(monkeypatch, handler)
+    task = asyncio.create_task(
+        coordinator.relay("/v1/chat/completions", {"model": "a"})
+    )
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert cancelled == {0, 1} and coordinator.active == 0
+    assert not coordinator.failure.exists()
+    assert asyncio.all_tasks() == tasks_before
 
 
 def _state(ready=(), active=(), cancelled=(), request_cancels=()):
@@ -1220,23 +1174,21 @@ def test_scheduler_rejects_divergence_before_model_step(other):
         schedule([_state([("a:1", "hash")]), other], 4)
 
 
-def test_generation_scope_survives_preprocessing_threads(monkeypatch):
+async def test_generation_scope_survives_preprocessing_threads(monkeypatch):
     from mlx_vlm.tests.test_server import _capture_requests, _ready_generator
 
     gen = _ready_generator()
     queued = _capture_requests(gen)
     monkeypatch.setattr(runtime, "distributed_worker", object())
 
-    async def check():
-        token = request_scope.set(RequestScope("a" * 32))
-        try:
-            for _ in range(2):
-                _, iterator = await asyncio.to_thread(gen.generate, "hello")
-                iterator.close()
-        finally:
-            request_scope.reset(token)
+    token = request_scope.set(RequestScope("a" * 32))
+    try:
+        for _ in range(2):
+            _, iterator = await asyncio.to_thread(gen.generate, "hello")
+            iterator.close()
+    finally:
+        request_scope.reset(token)
 
-    asyncio.run(check())
     assert [item.request_id for item in queued] == ["a" * 32 + ":1", "a" * 32 + ":2"]
 
 
@@ -1480,97 +1432,82 @@ def test_distributed_native_continuous_batching(limit):
     ), output
 
 
-def test_progress_cadence_is_not_semantic_rank_divergence(cluster, monkeypatch):
-    async def scenario():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *_: "/models/snapshot"
-        )
+async def test_progress_cadence_is_not_semantic_rank_divergence(
+    monkeypatch, coordinator
+):
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
 
-            async def events():
-                for processed in ([0, 2, 4] if rank == 0 else [0, 1, 2, 3, 4]):
-                    yield "event: response.prompt_progress\ndata: " + json.dumps(
-                        {
-                            "type": "response.prompt_progress",
-                            "response_id": str(rank),
-                            "processed_tokens": processed,
-                            "total_tokens": 4,
-                            "status": "completed" if processed == 4 else "in_progress",
-                        }
-                    ) + "\n\n"
-                yield _sse(rank, "answer")
-                yield "data: [DONE]\n\n"
+        async def events():
+            for processed in ([0, 2, 4] if rank == 0 else [0, 1, 2, 3, 4]):
+                yield "event: response.prompt_progress\ndata: " + json.dumps(
+                    {
+                        "type": "response.prompt_progress",
+                        "response_id": str(rank),
+                        "processed_tokens": processed,
+                        "total_tokens": 4,
+                        "status": "completed" if processed == 4 else "in_progress",
+                    }
+                ) + "\n\n"
+            yield _sse(rank, "answer")
+            yield "data: [DONE]\n\n"
 
-            return httpx.Response(200, stream=EventStream(events))
+        return httpx.Response(200, stream=EventStream(events))
 
-        _transport(monkeypatch, handler)
-        result = await coordinator.relay(
-            "/v1/responses", {"model": "org/model", "stream": True}
-        )
-        output = "".join([value async for value in result.body_iterator])
-        assert output.count('"type": "response.prompt_progress"') == 3
-        assert output.index("response.prompt_progress") < output.index("answer")
-        assert "[DONE]" in output and not coordinator.failure.exists()
-
-    asyncio.run(scenario())
+    _transport(monkeypatch, handler)
+    result = await coordinator.relay(
+        "/v1/responses", {"model": "org/model", "stream": True}
+    )
+    output = "".join([value async for value in result.body_iterator])
+    assert output.count('"type": "response.prompt_progress"') == 3
+    assert output.index("response.prompt_progress") < output.index("answer")
+    assert "[DONE]" in output and not coordinator.failure.exists()
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_resumable_disconnect_pauses_all_ranks_without_cancelling_decoder(
-    cluster, monkeypatch, phase
+async def test_resumable_disconnect_pauses_all_ranks_without_cancelling_decoder(
+    monkeypatch, phase, coordinator
 ):
     from mlx_vlm.server.distributed_sessions import SESSION_ROUTE
 
-    async def scenario():
-        coordinator = Coordinator(cluster)
-        monkeypatch.setenv(cluster.api_key_env, "key")
-        monkeypatch.setattr(
-            coordinator.stager, "prepare", lambda *_: "/models/snapshot"
-        )
-        paused = set()
+    tasks_before = asyncio.all_tasks()
+    paused = set()
 
-        async def handler(request):
-            rank = int(request.url.host[-1])
-            if request.method == "GET":
-                return httpx.Response(200, json=_health(rank))
-            assert request.url.path != CANCEL_ROUTE
-            if request.url.path == SESSION_ROUTE:
-                assert json.loads(request.content)["action"] == "pause"
-                assert coordinator.active == 1
-                paused.add(rank)
-                return httpx.Response(200, json={"state": "paused"})
+    async def handler(request):
+        rank = int(request.url.host[-1])
+        if request.method == "GET":
+            return httpx.Response(200, json=_health(rank))
+        assert request.url.path != CANCEL_ROUTE
+        if request.url.path == SESSION_ROUTE:
+            assert json.loads(request.content)["action"] == "pause"
+            assert coordinator.active == 1
+            paused.add(rank)
+            return httpx.Response(200, json={"state": "paused"})
 
-            async def events():
-                if phase == "prefill":
-                    yield 'event: response.prompt_progress\ndata: {"type":"response.prompt_progress","status":"started","processed_tokens":0,"total_tokens":100}\n\n'
-                else:
-                    yield _sse(rank, "first")
-                await asyncio.Event().wait()
+        async def events():
+            if phase == "prefill":
+                yield 'event: response.prompt_progress\ndata: {"type":"response.prompt_progress","status":"started","processed_tokens":0,"total_tokens":100}\n\n'
+            else:
+                yield _sse(rank, "first")
+            await asyncio.Event().wait()
 
-            return httpx.Response(200, stream=EventStream(events))
+        return httpx.Response(200, stream=EventStream(events))
 
-        _transport(monkeypatch, handler)
-        response = await coordinator.relay(
-            "/v1/responses",
-            {"model": "org/model", "stream": True, "resumable": True},
-            "tenant",
-        )
-        await asyncio.wait_for(anext(response.body_iterator), 2)
-        await asyncio.wait_for(response.body_iterator.aclose(), 2)
-        assert paused == {0, 1} and not coordinator.failure.exists()
-        assert coordinator.active == 0 and coordinator.continuations
-        assert all(
-            not record["active"] for record in coordinator.continuations.values()
-        )
-        assert len(asyncio.all_tasks()) == 1
-
-    asyncio.run(scenario())
+    _transport(monkeypatch, handler)
+    response = await coordinator.relay(
+        "/v1/responses",
+        {"model": "org/model", "stream": True, "resumable": True},
+        "tenant",
+    )
+    await asyncio.wait_for(anext(response.body_iterator), 2)
+    await asyncio.wait_for(response.body_iterator.aclose(), 2)
+    assert paused == {0, 1} and not coordinator.failure.exists()
+    assert coordinator.active == 0 and coordinator.continuations
+    assert all(not record["active"] for record in coordinator.continuations.values())
+    assert asyncio.all_tasks() == tasks_before
 
 
 def test_coordinated_session_pause_resume_and_expiry_use_existing_cache_engine(
@@ -1649,21 +1586,19 @@ def test_resume_uses_synchronized_decoder_history_when_http_consumer_lags():
     assert next(session.reader(2, resumed.lease)).text == "three"
 
 
-def test_expiry_of_old_handle_does_not_dispose_active_resumed_session(cluster):
-    async def scenario():
-        coordinator = Coordinator(cluster)
-        coordinator.continuations = {
-            "old": {"session_id": "session", "active": False, "touched": 0, "ttl": 1},
-            "new": {"session_id": "session", "active": True, "touched": 1, "ttl": 1},
-        }
-        coordinator.session_action = AsyncMock()
-        await coordinator.expire_continuations(None)
-        coordinator.session_action.assert_not_awaited()
-        coordinator.continuations["new"]["active"] = False
-        await coordinator.expire_continuations(None)
-        coordinator.session_action.assert_awaited_once_with(None, "new", "dispose")
-
-    asyncio.run(scenario())
+async def test_expiry_of_old_handle_does_not_dispose_active_resumed_session(
+    coordinator,
+):
+    coordinator.continuations = {
+        "old": {"session_id": "session", "active": False, "touched": 0, "ttl": 1},
+        "new": {"session_id": "session", "active": True, "touched": 1, "ttl": 1},
+    }
+    coordinator.session_action = AsyncMock()
+    await coordinator.expire_continuations(None)
+    coordinator.session_action.assert_not_awaited()
+    coordinator.continuations["new"]["active"] = False
+    await coordinator.expire_continuations(None)
+    coordinator.session_action.assert_awaited_once_with(None, "new", "dispose")
 
 
 def test_management_and_inference_staging_cannot_write_same_peer_concurrently(cluster):

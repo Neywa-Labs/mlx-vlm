@@ -126,6 +126,7 @@ class WorkerLauncher:
         self.closed = False
         self.stopping = threading.Event()
         self.launch_id = secrets.token_hex(16)
+        self.monitor_task = None
 
     def _payload(self):
         key = os.environ.get(self.config.api_key_env)
@@ -318,6 +319,7 @@ class WorkerLauncher:
                         timeout=max(0.001, deadline - time.monotonic()),
                     )
                     logger.info("Distributed worker group is ready")
+                    self.monitor_task = asyncio.create_task(self.monitor())
                     return
                 except Exception as error:
                     last_error = error
@@ -338,6 +340,21 @@ class WorkerLauncher:
         finally:
             # Local requests remain available; never restart a collective mid-request.
             await asyncio.to_thread(self.stop)
+
+    async def close(self):
+        async def cleanup():
+            if self.monitor_task:
+                self.monitor_task.cancel()
+                await asyncio.gather(self.monitor_task, return_exceptions=True)
+            await asyncio.to_thread(self.stop)
+
+        # Shutdown must finish even when startup or an API operation is cancelled.
+        cleanup_task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
 
     def stop(self):
         with self.stop_lock:
@@ -397,18 +414,8 @@ async def managed_workers(coordinator):
         return
     launcher = WorkerLauncher(coordinator)
     coordinator.launcher = launcher
-    monitor = None
     try:
         await launcher.start()
-        monitor = asyncio.create_task(launcher.monitor())
         yield
     finally:
-        if monitor:
-            monitor.cancel()
-            await asyncio.gather(monitor, return_exceptions=True)
-        cleanup = asyncio.create_task(asyncio.to_thread(launcher.stop))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await cleanup
-            raise
+        await launcher.close()

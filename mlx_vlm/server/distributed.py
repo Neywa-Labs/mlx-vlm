@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import secrets
 import time
 from collections import deque
@@ -21,12 +20,12 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
 from .checkpoint_store import MANIFEST
+from .cluster_types import RDMAPair, SSHTransport, model_directory, worker_origin
 from .distributed_launch import LaunchConfig
 
 logger = logging.getLogger("mlx_vlm.server.distributed")
@@ -75,20 +74,13 @@ class Worker:
     rdma: dict | None = None
 
     def __post_init__(self):
+        object.__setattr__(self, "url", worker_origin(self.url))
         if self.rdma is not None:
-            from .cluster_types import RDMAPair
-
             RDMAPair.model_validate(self.rdma)
-        if self.ssh is not None and not re.fullmatch(r"[\w][\w.@-]*", self.ssh):
-            raise ValueError(
-                "SSH destinations must be configured host names or aliases"
-            )
-        if self.model_dir is not None and not re.fullmatch(
-            r"/[\w/.-]+", self.model_dir
-        ):
-            raise ValueError(
-                "SSH model_dir must be absolute without shell metacharacters"
-            )
+        if self.ssh is not None:
+            SSHTransport(destination=self.ssh)
+        if self.model_dir is not None:
+            model_directory(self.model_dir)
 
     def headers(self):
         return {"Authorization": "Bearer " + self.api_key} if self.api_key else {}
@@ -112,30 +104,8 @@ class ClusterConfig:
         workers = tuple(Worker(**item) for item in data["workers"])
         if len(workers) < 2 or len({w.url for w in workers}) != len(workers):
             raise ValueError("Configure at least two distinct worker URLs")
-        for worker in workers:
-            url = urlsplit(worker.url)
-            if (
-                url.scheme not in {"http", "https"}
-                or not url.netloc
-                or url.username
-                or url.password
-                or url.query
-                or url.fragment
-                or url.path not in {"", "/"}
-            ):
-                raise ValueError(
-                    "Worker URLs must be HTTP(S) origins without credentials"
-                )
-            if worker.ssh is not None and not re.fullmatch(r"[\w][\w.@-]*", worker.ssh):
-                raise ValueError(
-                    "SSH destinations must be configured host names or aliases"
-                )
         root = Path(data["model_dir"]).expanduser()
-        # rsync's remote argument is interpreted by a remote shell as well.
-        if not root.is_absolute() or not re.fullmatch(r"/[\w/.-]+", str(root)):
-            raise ValueError(
-                "model_dir must be an absolute path without shell metacharacters"
-            )
+        model_directory(str(root))
         lock = Path(data["shared_lock"]).expanduser()
         if not lock.is_absolute():
             raise ValueError("shared_lock must be an absolute path")
@@ -392,6 +362,7 @@ class Coordinator:
         self.seed = secrets.randbelow(2**31)
         self.failure = config.model_dir / ".cluster-failed.json"
         self.launch_id = None
+        self.launcher = None
         self.draining = False
         self.group_instances = None
         self.continuations = {}
