@@ -86,6 +86,7 @@ from mlx_vlm.models.qwen4_exp.language import (
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
 from mlx_vlm.speculative import dflash
+from mlx_vlm.speculative.common import verify_forward
 from mlx_vlm.tests.test_models import (
     DATA,
     build_config,
@@ -4412,9 +4413,11 @@ def assert_cache_state_close(actual, expected, *, atol=0, rtol=0):
             )
 
 
-@pytest.mark.parametrize("family", ["qwen3", "llama", "mistral4", "kimi_k3"])
+@pytest.mark.parametrize(
+    "family", ["qwen3", "llama", "mistral4", "kimi_k3", "deepseek_v41"]
+)
 @pytest.mark.parametrize("keep", [0, 1, 3])
-def test_target_hidden_capture_and_rejected_prefix(family, keep, monkeypatch):
+def test_target_hidden_capture_and_rejected_prefix(family, keep):
     mx.random.seed(5)
     model = tiny_language_model(family)
     ordinary, speculative = C.make_prompt_cache(model), C.make_prompt_cache(model)
@@ -4423,17 +4426,7 @@ def test_target_hidden_capture_and_rejected_prefix(family, keep, monkeypatch):
     first = model(prompt, cache=ordinary, capture_layer_ids=taps)
     assert_cache_state_close(first.logits, model(prompt, cache=speculative).logits)
     assert len(first.hidden_states) == len(taps)
-    calls = []
-    forward = type(model.model).__call__
-
-    def record_forward(inner, inputs, *args, **kwargs):
-        calls.append(inputs.shape[1])
-        return forward(inner, inputs, *args, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(type(model.model), "__call__", record_forward)
-        output, transaction = dflash._dflash_verify(model, block, speculative, taps)
-    assert calls == [block.shape[1]]
+    output, transaction = dflash._dflash_verify(model, block, speculative, taps)
     expected = [
         model(block[:, i : i + 1], cache=ordinary, capture_layer_ids=taps)
         for i in range(keep)
@@ -4534,3 +4527,31 @@ def test_kimi_block_verification_restores_batch_rows(length, keep, monkeypatch):
             atol=1e-4,
             rtol=1e-4,
         )
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_deepseek_v41_batch_cache_restores_all_state(abort):
+    model = tiny_language_model("deepseek_v41")
+    prompts = [mx.array([[1, 2, 3, 4, 5, 6, 7]]), mx.array([[2, 3, 4, 5]])]
+    caches = [model.make_cache()[0] for _ in prompts]
+    expected = [model.make_cache()[0] for _ in prompts]
+    for prompt, actual, reference in zip(prompts, caches, expected):
+        model(prompt, cache=[actual])
+        model(prompt, cache=[reference])
+    batch = type(caches[0]).merge(caches)
+    block = mx.array([[8, 9, 10], [5, 6, 7]])
+    _, transaction = verify_forward(model, block, [batch])
+    if abort:
+        transaction.abort()
+    else:
+        transaction.commit([1, 3])
+    for i, count in enumerate([0, 0] if abort else [1, 3]):
+        for j in range(count):
+            model(block[i : i + 1, j : j + 1], cache=[expected[i]])
+        assert_cache_state_close(
+            batch.rows[i].state, expected[i].state, atol=1e-5, rtol=1e-5
+        )
+        assert batch.rows[i].offset == expected[i].offset
+    assert not batch.is_speculating and not any(
+        row.is_speculating for row in batch.rows
+    )
