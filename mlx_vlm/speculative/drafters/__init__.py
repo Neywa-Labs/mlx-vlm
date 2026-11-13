@@ -15,6 +15,7 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
     "bailing_hybrid_mtp": "mtp",
+    "mellum_mtp": "mtp",
     "nemotron_h_mtp": "mtp",
     "deepseek_v4_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
