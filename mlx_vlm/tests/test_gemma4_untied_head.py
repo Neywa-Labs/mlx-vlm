@@ -222,3 +222,87 @@ def test_untied_output_head_quantization_round_trip(tmp_path, bits):
     assert mx.allclose(
         reloaded(tokens).logits, model(tokens).logits, atol=1e-5, rtol=1e-5
     ).item()
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "lm_head",
+        "model.lm_head",
+        "language_model.lm_head",
+        "model.language_model.lm_head",
+    ],
+)
+def test_unified_sanitize_keeps_untied_head(prefix):
+    from mlx_vlm.models.gemma4_unified.config import ModelConfig as UnifiedConfig
+    from mlx_vlm.models.gemma4_unified.gemma4_unified import Model as UnifiedModel
+
+    model = UnifiedModel(
+        UnifiedConfig(
+            text_config=text_config(False),
+            vision_config=None,
+            audio_config=None,
+            tie_word_embeddings=False,
+        )
+    )
+    weights = {
+        f"{prefix}.{suffix}": mx.full((2, 2), index + 1)
+        for index, suffix in enumerate(("weight", "scales", "biases"))
+    }
+    sanitized = model.sanitize(weights)
+    assert set(sanitized) == {
+        f"language_model.lm_head.{suffix}" for suffix in ("weight", "scales", "biases")
+    }
+    again = model.sanitize(sanitized)
+    assert set(again) == set(sanitized)
+    for key in sanitized:
+        assert mx.array_equal(again[key], sanitized[key]).item()
+
+
+def test_unified_tied_head_still_discards_redundant_weight():
+    from mlx_vlm.models.gemma4_unified.config import ModelConfig as UnifiedConfig
+    from mlx_vlm.models.gemma4_unified.gemma4_unified import Model as UnifiedModel
+
+    model = UnifiedModel(
+        UnifiedConfig(
+            text_config=text_config(True), vision_config=None, audio_config=None
+        )
+    )
+    assert model.sanitize({"lm_head.weight": mx.ones((64, 32))}) == {}
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_unified_untied_load_model_and_forward(tmp_path, quantized):
+    from mlx_vlm.models.gemma4_unified.config import ModelConfig as UnifiedConfig
+    from mlx_vlm.models.gemma4_unified.gemma4_unified import Model as UnifiedModel
+
+    config = UnifiedConfig(
+        text_config=text_config(False),
+        vision_config=None,
+        audio_config=None,
+        tie_word_embeddings=False,
+    )
+    reference = UnifiedModel(config)
+    if quantized:
+        nn.quantize(
+            reference,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, _: path == "language_model.lm_head",
+        )
+    checkpoint = dict(tree_flatten(reference.parameters()))
+    suffixes = ("weight", "scales", "biases") if quantized else ("weight",)
+    for suffix in suffixes:
+        checkpoint[f"lm_head.{suffix}"] = checkpoint.pop(
+            f"language_model.lm_head.{suffix}"
+        )
+    raw_config = asdict(config)
+    if quantized:
+        raw_config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(raw_config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), checkpoint)
+    loaded = load_model(tmp_path, strict=True)
+    tokens = mx.array([[1, 5, 9]])
+    assert mx.allclose(
+        loaded(tokens).logits, reference(tokens).logits, atol=1e-5, rtol=1e-5
+    ).item()
