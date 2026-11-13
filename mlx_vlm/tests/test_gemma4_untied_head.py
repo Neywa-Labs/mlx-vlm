@@ -3,8 +3,8 @@ from dataclasses import asdict
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.models.gemma4.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.gemma4.gemma4 import Model
