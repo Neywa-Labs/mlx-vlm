@@ -2988,9 +2988,48 @@ def test_dense_model(name):
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
-    fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
+    fields = dict(TINY_DEFAULTS)
+    if "case" in case:
+        base = model_case(case["case"])["config"]
+        fields.update(base.get("text_config", base))
+    fields.update(case["config"] | case.get("profiles", {}).get(profile, {}))
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
+
+
+def tiny_language_model(family):
+    """Build a fresh language model from the shared JSON cases."""
+    config = tiny_config(family)
+    name = TINY_MODELS[family]["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    model = module.LanguageModel(config)
+    if family == "deepseek_v41":
+        from mlx_vlm.models.deepseek_v41.engram import NgramHashState
+
+        model.engram_hash = NgramHashState(
+            config,
+            model.layout,
+            token_map=[
+                i % config.engram_compressed_vocab_size
+                for i in range(config.vocab_size)
+            ],
+        )
+    model.eval()
+    return model
+
+
+@pytest.mark.parametrize("family", ["mellum", "deepseek_v41"])
+def test_native_speculative_hidden_states(family):
+    ids = mx.array([[1, 2, 3]])
+    model = tiny_language_model(family)
+    if family == "deepseek_v41":
+        # V4.1 taps precede the block; the first tap is the token embedding.
+        hidden = model(ids, capture_layer_ids=[0]).hidden_states[0]
+        expected = model.embed_tokens(ids)
+    else:
+        hidden = model(ids, return_hidden=True).hidden_states[-1]
+        expected = model.model(ids)
+    assert mx.array_equal(hidden, expected).item()
 
 
 def _prepare_minimax_distributed(model, dtype):

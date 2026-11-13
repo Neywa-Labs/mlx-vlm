@@ -34,6 +34,7 @@
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
+    - [Bundled native heads](#bundled-native-heads)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -302,6 +303,22 @@ with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
 parity, and DSpark decoding currently requires greedy sampling
 (`temperature=0`).
 
+Official OpenBMB and Red Hat Speculators checkpoints can also be loaded directly:
+
+```sh
+mlx_vlm.generate --model openbmb/MiniCPM5-2B \
+  --draft-model openbmb/MiniCPM5-2B-DSpark \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+
+mlx_vlm.generate --model Qwen/Qwen3-4B \
+  --draft-model RedHatAI/Qwen3-4B-speculator.dspark \
+  --prompt "Explain speculative decoding." --temperature 0
+```
+
+The loader handles nested Speculators configs, reduced draft vocabularies,
+checkpoint-owned output heads, and each checkpoint's anchor convention.
+See [official checkpoint support](docs/speculative-decoding.md#official-checkpoint-support).
+
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
 ```sh
@@ -344,6 +361,20 @@ result = generate(
     draft_kind=draft_kind,
 )
 ```
+
+#### Bundled native heads
+
+Bundled native heads are detected when the same original checkpoint is passed
+as the target and drafter. For example:
+
+```sh
+mlx_vlm.generate --model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --draft-model JetBrains/Mellum2.1-12B-A2.5B-Thinking-MTP \
+  --prompt "Write a Python function that adds two integers." --temperature 0
+```
+
+This also applies to DeepSeek V4.1's bundled DSpark stages. Use
+`mlx_vlm.convert --mtp` to extract a native head alongside a converted target.
 
 #### Gemma 4 MTP
 
