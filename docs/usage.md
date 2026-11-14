@@ -594,6 +594,13 @@ mlx-vlm supports distributed inference across multiple computers. It works by sh
 
 The parallel implementation is compatible with mlx-lm sharding primitives.
 
+Dense Qwen3.5-family models expose `Model.shard(group)` and
+`LanguageModel.shard(group)`. Attention, gated linear attention and MLP
+projections are partitioned across ranks; embeddings and the vocabulary head
+remain replicated. The group size must divide the attention and GDN head
+counts and the MLP width, and row-parallel splits must preserve quantization
+group boundaries. Sharded models reject speculative verification.
+
 The following command shows how you can run Kimi K2.6, a 1T parameter model, on several computers. For a smaller option, you can try `[mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16](https://huggingface.co/mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16)`.
 
 ```bash
