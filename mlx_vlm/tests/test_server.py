@@ -5095,6 +5095,18 @@ class TestCompaction:
         assert mocked.generate.call_count == 1
         assert "Conversation handoff" not in mocked.generate.call_args.kwargs["prompt"]
 
+    def test_distributed_chat_never_restores_rank_local_compaction_cache(
+        self, mocked, client, monkeypatch
+    ):
+        monkeypatch.setattr(server.runtime, "distributed_worker", object())
+        restore = Mock(side_effect=AssertionError("Rank-local compaction cache used"))
+        monkeypatch.setattr(compaction.chat_cache, "restore", restore)
+        monkeypatch.setitem(client.headers, "X-MLX-Distributed-Request", "a" * 32)
+        response = _post(client, distributed=True, max_tokens=64)
+        assert response.status_code == 200, response.text
+        assert mocked.generate.call_count == 1
+        restore.assert_not_called()
+
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "outcome", ["recover", "disabled", "summary-fails", "protected-too-large"]
@@ -6381,7 +6393,8 @@ class TestResponseGenerator:
                 for field in ("token_number=", "token_id=", "text=")
             )
 
-    def test_prefill_progress_logging(self, caplog):
+    @pytest.mark.parametrize("emit_progress", [False, True])
+    def test_prefill_progress_logging_and_events(self, caplog, emit_progress):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
         gen = Generator.__new__(Generator)
         prompt_batch = NS(
@@ -6393,11 +6406,38 @@ class TestResponseGenerator:
             _left_padding_per_row=[0],
             _right_pad_per_row=None,
         )
-        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+        updates = Queue()
+        active = {
+            1: {
+                "request_id": "req-1",
+                "prefill_processed": -1,
+                "emit_prompt_progress": emit_progress,
+                "rqueue": updates,
+            }
+        }
 
         gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
+
+        # Re-polling a chunk must not duplicate events or regress the count.
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        prompt_batch._processed_prompt_columns = 4
+        prompt_batch._inputs_embeds = mx.zeros((1, 2, 8))
+        gen._log_prefill_progress(NS(_prompt_batch=prompt_batch), active)
+        gen._log_prefill_completed(1, active[1], NS(prompt_tokens=6))
+        if emit_progress:
+            tokens = [updates.get_nowait() for _ in range(3)]
+            assert [t.prompt_progress for t in tokens] == [
+                {"status": status, "processed_tokens": count, "total_tokens": 6}
+                for status, count in (
+                    ("in_progress", 2),
+                    ("in_progress", 4),
+                    ("completed", 6),
+                )
+            ]
+            assert all(t.token_count == 0 and t.text == "" for t in tokens)
+        assert updates.empty()
 
     @pytest.mark.parametrize(
         "delayed", [False, True], ids=["timeout-cancels", "delayed-token"]
@@ -10813,3 +10853,75 @@ def test_diffusion_http_checkpoint_replays_without_regeneration(
         assert resumed.status_code == 200
         assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
         worker.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_minimax_thinking_delimiters_at_every_chunk_boundary(started):
+    from mlx_vlm.server.responses_state import ThinkingStreamState
+
+    text = ("" if started else "<mm:think>") + "reasoning" + "</mm:think>\nanswer"
+    for split in range(len(text) + 1):
+        parser = ThinkingStreamState(started)
+        deltas = [parser.feed(text[:split]), parser.feed(text[split:], last=True)]
+        assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+        assert "".join(d.content or "" for d in deltas) == "answer"
+    parser = ThinkingStreamState(started)
+    deltas = [parser.feed(ch) for ch in text] + [parser.feed("", last=True)]
+    assert "".join(d.reasoning or "" for d in deltas) == "reasoning"
+    assert "".join(d.content or "" for d in deltas) == "answer"
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_responses_generation_progress_uses_native_timing_field(client, continuous):
+    chunks = [
+        NS(
+            text=text,
+            emitted_at=when,
+            generation_tokens=count,
+            prompt_tokens=3,
+            finish_reason=finish,
+        )
+        for text, when, count, finish in (
+            ("hello", 10.0, 1, None),
+            (" there", 10.5, 2, "stop"),
+        )
+    ]
+    with _endpoint(chunks=chunks, generator=_streaming(chunks) if continuous else None):
+        wire = _post(client, "responses", stream=True)
+    assert wire.status_code == 200, wire.text
+    events = _data(wire)
+    progress = [e for e in events if e["type"] == "response.generation_progress"]
+    assert [e["output_tokens"] for e in progress] == [1, 2]
+    assert "timings" not in progress[0]  # No measured interval yet.
+    assert progress[1]["timings"] == {"predicted_per_second": 2.0}
+    text = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert text[-1]["timings"] == progress[-1]["timings"]
+    assert events[-1]["type"] == "response.completed"
+
+
+def test_responses_emit_real_prefill_progress_before_first_token(client):
+    tokens = [
+        _token(
+            token_count=0,
+            prompt_progress={
+                "status": status,
+                "processed_tokens": count,
+                "total_tokens": 16,
+            },
+        )
+        for status, count in (("started", 0), ("in_progress", 8), ("completed", 16))
+    ]
+    tokens.append(_token("answer", finish_reason="stop"))
+    with _endpoint(generator=_streaming(tokens, prompt_tokens=16)):
+        response = _post(client, "responses", stream=True)
+    events = _data(response)
+    prompt = [e for e in events if e.get("type") == "response.prompt_progress"]
+    assert [e["processed_tokens"] for e in prompt] == [0, 8, 16]
+    assert all(e["response_id"].startswith("resp_") for e in prompt)
+    first_text = next(
+        i for i, e in enumerate(events) if e.get("type") == "response.output_text.delta"
+    )
+    assert all(events.index(e) < first_text for e in prompt)
+    progress = [e for e in events if e.get("type") == "response.generation_progress"]
+    assert progress[-1]["output_tokens"] == 1
+    assert events[-1]["response"]["usage"]["output_tokens"] == 1

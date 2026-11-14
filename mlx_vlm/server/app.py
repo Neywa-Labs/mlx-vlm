@@ -1,13 +1,14 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from types import SimpleNamespace
 from typing import Annotated, List, Literal, Optional, Tuple
 
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse, Response
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
@@ -427,6 +429,20 @@ def load_audio_model(model_path: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    from .distributed_launch import managed_workers
+
+    async with managed_workers(runtime.distributed_coordinator):
+        async with _application_lifespan(app):
+
+            try:
+                yield
+            finally:
+                if runtime.cluster_manager is not None:
+                    await runtime.cluster_manager.close()
+
+
+@asynccontextmanager
+async def _application_lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
@@ -621,7 +637,29 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
+_distributed_model_load_lock = RLock()
+
+
 def get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+    revision: str | None = None,
+):
+    # Token-count warmup runs off the worker's HTTP event loop. Serialize cache
+    # initialization with other requests so concurrent callers reuse one loader.
+    with (
+        _distributed_model_load_lock
+        if runtime.distributed_worker is not None
+        else nullcontext()
+    ):
+        return _get_cached_model(
+            model_path, adapter_path, model_kind=model_kind, revision=revision
+        )
+
+
+def _get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
     *,
@@ -1222,6 +1260,102 @@ async def add_server_header(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def route_distributed_request(request: Request, call_next):
+    from .distributed import CANCEL_ROUTE, REQUEST_HEADER, ROUTES
+
+    path = request.url.path
+    worker = runtime.distributed_worker
+    if path == "/internal/distributed/session":
+        return await call_next(request)
+    if path == CANCEL_ROUTE and request.method == "POST" and worker is not None:
+        try:
+            _require_management_api_key(request)
+            body = await request.json()
+            request_id = body.get("request_id") if isinstance(body, dict) else None
+            if (
+                not isinstance(request_id, str)
+                or len(request_id) != 32
+                or any(c not in "0123456789abcdef" for c in request_id)
+            ):
+                raise HTTPException(422, "Invalid distributed request ID")
+            worker.remember_cancellations([request_id])
+            from . import continuation
+
+            with continuation.CHECKPOINTS.lock:
+                record = continuation.CHECKPOINTS.records.get(request_id)
+            if (
+                record is not None
+                and record.session is not None
+                and record.lease == record.session.lease
+            ):
+                record.session.dispose("Distributed request cancelled")
+            return JSONResponse({"cancelled": request_id}, 202)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"detail": "Invalid cancellation body"}, 422)
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, error.status_code)
+    if request.method != "POST":
+        if worker is not None and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            return JSONResponse(
+                {"detail": "Distributed worker settings are fixed at startup"}, 400
+            )
+        return await call_next(request)
+    if path not in ROUTES:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "This endpoint is unavailable on a distributed worker"}, 400
+            )
+        return await call_next(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return await call_next(request)
+    if not isinstance(body, dict):
+        return await call_next(request)
+    requested = body.get("distributed", False)
+    if not isinstance(requested, bool):
+        return JSONResponse({"detail": "distributed must be a boolean"}, 422)
+    if not requested:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "Send requests through the distributed coordinator"}, 400
+            )
+        return await call_next(request)
+    try:
+        # Authenticate before downloading, transferring or loading anything.
+        _require_management_api_key(request)
+        if worker is not None:
+            from .distributed_schedule import RequestScope, request_scope
+
+            request_id = request.headers.get(REQUEST_HEADER, "")
+            if len(request_id) != 32 or any(
+                c not in "0123456789abcdef" for c in request_id
+            ):
+                raise HTTPException(
+                    400, "Send requests through the distributed coordinator"
+                )
+            token = request_scope.set(RequestScope(request_id))
+            try:
+                return await call_next(request)
+            finally:
+                request_scope.reset(token)
+        coordinator = runtime.distributed_coordinator
+        if coordinator is None:
+            raise HTTPException(
+                503, "Configure --distributed-config to use distributed=true"
+            )
+        result = await coordinator.relay(path, body, _read_tenant_id(request))
+        if isinstance(result, Response):
+            return result
+        payload, status = result
+        return JSONResponse(payload, status_code=status)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+        )
+
+
 @app.get("/health")
 async def health_check(request: Request):
     """
@@ -1229,7 +1363,7 @@ async def health_check(request: Request):
     """
     _require_management_api_key(request)
     runtime = _server_runtime_snapshot()
-    return {
+    result = {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
         "loaded_adapter": runtime["loaded_adapter"],
@@ -1241,6 +1375,11 @@ async def health_check(request: Request):
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
     }
+    from .runtime import runtime as server_runtime
+
+    if server_runtime.distributed_worker is not None:
+        result["distributed_worker"] = server_runtime.distributed_worker.info()
+    return result
 
 
 @app.get("/metrics")
@@ -1366,3 +1505,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _require_cluster_api_key(request: HTTPConnection) -> None:
+    # Mutation and worker identity must never silently become unauthenticated.
+    if _server_api_key() is None:
+        raise HTTPException(
+            503, "Set MLX_VLM_SERVER_API_KEY to enable cluster management"
+        )
+    _require_management_api_key(request)
+
+
+from .cluster import router as _cluster_router
+
+app.include_router(_cluster_router(_require_cluster_api_key))
+
+from .distributed_sessions import router as _session_router
+
+app.include_router(_session_router(_require_cluster_api_key))
+
+
+_cluster_openapi = app.openapi
+
+
+def _openapi_with_stream_events():
+    schema = _cluster_openapi()
+    from .cluster_types import ClusterEvent, GenerationProgress, PromptProgress
+
+    for event in (ClusterEvent, GenerationProgress, PromptProgress):
+        schema["components"]["schemas"][event.__name__] = event.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+    return schema
+
+
+app.openapi = _openapi_with_stream_events
