@@ -452,6 +452,98 @@ async def test_external_attach_validates_group_then_exposes_rank_zero(
     assert runtime.distributed_coordinator.draining
 
 
+@pytest.mark.parametrize("status", [200, 503])
+async def test_loading_progress_is_visible_before_relay_finishes(
+    control, monkeypatch, status
+):
+    await register_pair(control)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    monkeypatch.setattr(
+        control, "stage_model", AsyncMock(return_value="/models/digest")
+    )
+    release = asyncio.Event()
+
+    async def relay(*args, **kwargs):
+        await release.wait()
+        return {}, status
+
+    def health(request):
+        return httpx.Response(
+            200,
+            json={
+                "distributed_worker": {
+                    "load_progress": {
+                        "model": "/models/digest",
+                        "stage": "evaluating_layers",
+                        "completed_layers": 3,
+                        "total_layers": 47,
+                        "elapsed_seconds": 1.2,
+                    }
+                }
+            },
+        )
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(management.Coordinator, "relay", relay)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: original(**kw, transport=httpx.MockTransport(health)),
+    )
+    operation = await control.begin("start", StartGroup(model="org/model"), None)
+    try:
+        async with asyncio.timeout(3):
+            while operation.phase != "loading_model":
+                await asyncio.sleep(0)
+        assert operation.status == "running"
+        progress = operation.result["progress"]
+        assert progress["workers_ready"] == 0 and progress["total_workers"] == 2
+        assert [n["node_id"] for n in progress["nodes"]] == ["a", "b"]
+        assert all(n["completed_layers"] == 3 for n in progress["nodes"])
+        assert control.events[-1].data["result"]["progress"] == progress
+    finally:
+        release.set()
+        await asyncio.gather(*control.tasks)
+    assert operation.status == ("succeeded" if status == 200 else "failed")
+    assert "progress" in operation.result  # Keep measurements in the terminal result.
+
+
+async def test_loading_warmup_does_not_block_worker_health(control, monkeypatch):
+    from mlx_vlm.server import openai
+
+    entered, release = threading.Event(), threading.Event()
+
+    def loading(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        raise HTTPException(400, "test checkpoint unavailable")
+
+    monkeypatch.setattr(runtime, "distributed_worker", NS(info=lambda: {}))
+    monkeypatch.setattr(openai, "get_cached_model", loading)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.app),
+        base_url="http://server",
+        headers={"Authorization": "Bearer public-secret"},
+    ) as client:
+        task = asyncio.create_task(
+            client.post(
+                "/v1/responses/input_tokens",
+                json={"model": "test", "input": "hello", "distributed": True},
+                headers={"X-MLX-Distributed-Request": "a" * 32},
+            )
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert not task.done()
+            assert (await client.get("/health")).status_code == 200
+            assert not task.done()
+        finally:
+            release.set()
+            response = await task
+        assert response.status_code == 400
+
+
 async def test_external_reconfiguration_is_observable_without_launching(control):
     await register_pair(control)
     control.probe = AsyncMock(return_value=info("a", worker=None))
@@ -721,7 +813,9 @@ async def test_transfer_bytes_are_observable_while_copy_is_still_running(
         await asyncio.gather(*control.tasks)
     assert operation.status == "succeeded", operation.error
     if kind == "start":
-        assert operation.result == {"state": "ready", "members": ["a", "b"]}
+        assert operation.result["state"] == "ready"
+        assert operation.result["members"] == ["a", "b"]
+        assert operation.result["progress"]["total_workers"] == 2
 
 
 async def test_failed_delivery_does_not_fail_running_inference_group(

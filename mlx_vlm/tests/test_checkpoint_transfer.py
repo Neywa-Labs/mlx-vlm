@@ -3,6 +3,7 @@
 import ctypes
 import errno
 import hashlib
+import io
 import json
 import os
 import queue
@@ -26,6 +27,49 @@ from mlx_vlm.server.checkpoint_transfer import (
 )
 from mlx_vlm.server.cluster_types import PrepareModel, RDMAPair
 from mlx_vlm.server.distributed import ClusterConfig, ModelStager, Worker
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_terminal_progress_reuse_verification_and_cancellation(
+    monkeypatch, interactive
+):
+    output = io.StringIO()
+    output.isatty = lambda: interactive
+    monkeypatch.setattr(sys, "stderr", output)
+    with pytest.raises(InterruptedError), transfer.TransferProgress() as progress:
+        progress.update(
+            "peer",
+            "transferring",
+            dict(
+                bytes_transferred=25,
+                bytes_reused=25,
+                total_bytes=100,
+                transport="jaccl_rdma",
+                throughput_bytes_per_second=10,
+            ),
+        )
+        if interactive:
+            assert progress.bars["peer"].n == 50
+            assert "50%" in output.getvalue() and "ETA 00:05" in output.getvalue()
+        progress.update(
+            "peer",
+            "verifying_worker",
+            dict(
+                bytes_transferred=75,
+                bytes_reused=25,
+                bytes_verified=60,
+                total_bytes=100,
+            ),
+        )
+        if interactive:
+            assert progress.bars["peer"].n == 60
+        raise InterruptedError("cancelled")
+    if interactive:
+        assert "peer: cancelled" in output.getvalue()
+        assert "worker ready" not in output.getvalue()
+        assert all(bar.disable for bar in progress.bars.values())
+    else:
+        assert output.getvalue() == ""
 
 
 @pytest.fixture

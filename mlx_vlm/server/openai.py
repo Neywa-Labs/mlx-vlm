@@ -765,9 +765,18 @@ async def responses_input_tokens_endpoint(request: Request):
         )
         _ensure_effective_input(chat_messages, images=images)
 
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
-        )
+        if runtime.distributed_worker is not None:
+            # Keep authenticated health/progress polling responsive during the
+            # coordinator's model-loading warmup. MLX still loads on its owner thread.
+            model, processor, config = await asyncio.to_thread(
+                get_cached_model,
+                openai_request.model,
+                _adapter_path_or_inherit(openai_request),
+            )
+        else:
+            model, processor, config = get_cached_model(
+                openai_request.model, _adapter_path_or_inherit(openai_request)
+            )
         del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(

@@ -202,9 +202,13 @@ def test_start_waits_for_matching_health_and_sends_key_on_stdin(
         )
 
     _transport(monkeypatch, handler)
+    progress = []
+
+    async def report(**data):
+        progress.append(data)
 
     async def run():
-        await launcher.start()
+        await launcher.start(progress=report)
         assert launcher.monitor_task is not None and not launcher.monitor_task.done()
 
     asyncio.run(run())
@@ -215,6 +219,11 @@ def test_start_waits_for_matching_health_and_sends_key_on_stdin(
     )
     assert launcher.coordinator.primary == 0
     assert launcher.coordinator.launch_id == launcher.launch_id
+    assert progress[0]["stage"] == "checking_endpoints"
+    assert progress[0]["workers_ready"] == 0
+    assert progress[-1]["stage"] == "ready"
+    assert progress[-1]["supervisors_ready"] == progress[-1]["workers_ready"] == 2
+    assert all(p["total_workers"] == 2 for p in progress)
 
 
 @pytest.mark.parametrize(

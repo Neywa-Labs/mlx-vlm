@@ -6,9 +6,9 @@ import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from types import SimpleNamespace
 from typing import Annotated, List, Literal, Optional, Tuple
 
@@ -637,7 +637,29 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
+_distributed_model_load_lock = RLock()
+
+
 def get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+    revision: str | None = None,
+):
+    # Token-count warmup runs off the worker's HTTP event loop. Serialize cache
+    # initialization with other requests so concurrent callers reuse one loader.
+    with (
+        _distributed_model_load_lock
+        if runtime.distributed_worker is not None
+        else nullcontext()
+    ):
+        return _get_cached_model(
+            model_path, adapter_path, model_kind=model_kind, revision=revision
+        )
+
+
+def _get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
     *,

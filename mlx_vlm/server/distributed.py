@@ -181,6 +181,7 @@ class ModelStager:
         # Management preparation and inference can target the same immutable
         # snapshot. Serialize staging even when their coordinator caches differ.
         from .checkpoint_store import cancelled
+        from .checkpoint_transfer import TransferProgress
 
         staging_lock = Path(str(self.config.shared_lock) + ".staging")
         staging_lock.parent.mkdir(parents=True, exist_ok=True)
@@ -192,17 +193,19 @@ class ModelStager:
                     break
                 except BlockingIOError:
                     time.sleep(0.1)
-            return self._prepare(
-                model,
-                revision,
-                validate_sharding=validate_sharding,
-                progress=progress,
-                transport=transport,
-                stop=stop,
-            )
+            with TransferProgress() as terminal:
+                return self._prepare(
+                    model,
+                    revision,
+                    validate_sharding=validate_sharding,
+                    progress=progress,
+                    transport=transport,
+                    stop=stop,
+                    terminal=terminal,
+                )
 
     def _prepare(
-        self, model, revision, *, validate_sharding, progress, transport, stop
+        self, model, revision, *, validate_sharding, progress, transport, stop, terminal
     ):
         from ..utils import get_model_and_args, load_config
         from .checkpoint_store import prepare_snapshot
@@ -212,7 +215,8 @@ class ModelStager:
             raise ValueError("Unsupported checkpoint transport")
         self.worker_transfers.clear()
 
-        def report(phase, **data):
+        def report(phase, *, target="Source", **data):
+            terminal.update(target, phase, data)
             if progress:
                 progress(phase, **data)
 
@@ -275,7 +279,12 @@ class ModelStager:
                     source,
                     names,
                     transport,
-                    lambda phase, **data: report(phase, node_id=first.node_id, **data),
+                    lambda phase, **data: report(
+                        phase,
+                        target=first.node_id or first.url,
+                        node_id=first.node_id,
+                        **data,
+                    ),
                     verifying,
                     stop,
                 )
@@ -283,10 +292,20 @@ class ModelStager:
                 final, manifest = prepare_snapshot(
                     source, names, self.config.model_dir, stop=stop, progress=verifying
                 )
+            total = sum(record["size"] for record in manifest["files"].values())
+            terminal.update(
+                "Source", "source_ready", dict(total_bytes=total, bytes_verified=total)
+            )
             for worker in self.config.workers:
 
                 def worker_report(phase, **data):
-                    report(phase, node_id=worker.node_id, snapshot=final.name, **data)
+                    report(
+                        phase,
+                        target=worker.node_id or worker.url,
+                        node_id=worker.node_id,
+                        snapshot=final.name,
+                        **data,
+                    )
 
                 result = first_result if worker is first else None
                 if result is None:
@@ -1081,6 +1100,7 @@ class DistributedWorker:
             raise ValueError("Distributed workers require at least two ranks")
         self.backend = backend
         self.instance_id = secrets.token_hex(16)
+        self.load_progress = None
         self._cancel_lock = Lock()
         self._cancelled_requests = set()
         digest = hashlib.sha256()
@@ -1135,9 +1155,32 @@ class DistributedWorker:
             "backend": self.backend,
             "launch_id": os.environ.get("MLX_VLM_WORKER_LAUNCH_ID"),
             "fingerprint": hashlib.sha256(signature.encode()).hexdigest(),
+            "load_progress": getattr(self, "load_progress", None),
         }
 
     def load(self, model_path, adapter_path, trust_remote_code=False):
+        started = time.monotonic()
+
+        def report(stage, **counts):
+            # Replace the snapshot atomically: the HTTP thread only reads it.
+            self.load_progress = {
+                "model": str(Path(model_path).resolve()),
+                "stage": stage,
+                "elapsed_seconds": time.monotonic() - started,
+                "updated_at": time.time(),
+                **counts,
+            }
+
+        report("loading_checkpoint")
+        try:
+            result = self._load(model_path, adapter_path, trust_remote_code, report)
+        except BaseException:
+            report("failed")
+            raise
+        report("ready")
+        return result
+
+    def _load(self, model_path, adapter_path, trust_remote_code, report):
         import mlx.core as mx
 
         from ..generate.diffusion import is_diffusion_model
@@ -1164,13 +1207,23 @@ class DistributedWorker:
             raise ValueError("This model does not support distributed sharding")
         if is_diffusion_model(model):
             raise ValueError("Distributed serving requires an autoregressive model")
+        report("sharding")
         model.shard(self.group)
         lm = getattr(model, "language_model", model)
-        for layer in getattr(lm, "layers", []):
+        layers = getattr(lm, "layers", [])
+        report("evaluating_layers", completed_layers=0, total_layers=len(layers))
+        for index, layer in enumerate(layers):
             mx.eval(layer.parameters())
             mx.clear_cache()
+            report(
+                "evaluating_layers",
+                completed_layers=index + 1,
+                total_layers=len(layers),
+            )
         # Include vision/audio/projector parameters without assuming their names.
+        report("evaluating_remaining_parameters")
         mx.eval(model.parameters())
         model.eval()
+        report("synchronizing")
         mx.eval(mx.distributed.all_sum(mx.array(1.0), group=self.group, stream=mx.cpu))
         return model, processor

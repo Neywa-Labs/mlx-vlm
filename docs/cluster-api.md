@@ -65,6 +65,39 @@ returns `idempotency_conflict`; an overlapping management operation returns
 `status` is `succeeded` or `failed`. A 202 response alone does not imply success.
 Interrupted operations become explicitly failed after a coordinator restart.
 
+During `start`, polling the operation or subscribing to `operation.updated`
+also exposes `result.progress`:
+
+* `launching`: `stage` (`checking_endpoints`, `starting_supervisors`,
+  `waiting_for_workers`, `ready`), `supervisors_ready`, `workers_ready`,
+  `total_workers`, `elapsed_seconds`, and `nodes` with stable `node_id`, `rank`
+  and stage. A supervisor connection is not a ready inference worker; workers
+  become ready only after the existing authenticated group checks pass.
+* `loading_model`: `workers_ready`, `total_workers`, `elapsed_seconds`, and
+  per-node loading measurements. Worker stages are `loading_checkpoint`,
+  `sharding`, `evaluating_layers`, `evaluating_remaining_parameters`,
+  `synchronizing`, and `ready`. `initializing_generator` covers the remaining
+  server setup after weights load. `waiting_for_load`, `unavailable` and `failed`
+  are explicit rather than being reported as completed work.
+
+For example, while a worker is materializing its parameters:
+
+```json
+{"phase":"loading_model","result":{"progress":{"elapsed_seconds":4.2,"workers_ready":0,"total_workers":2,"nodes":[{"node_id":"worker-b","rank":1,"stage":"evaluating_layers","completed_layers":12,"total_layers":47,"elapsed_seconds":3.8,"updated_at":1794657000.0}]}}}
+```
+
+The `nodes` array contains every selected worker (only one is shown above).
+Layer counts advance **after** evaluation completes, preserving the existing
+bounded-memory loading order. They measure that stage only, not overall load
+percentage, bytes read, or an estimated remaining duration. Checkpoint parsing,
+conversion, sharding and final synchronization may take time without a layer
+counter. The enclosing elapsed time continues to update, while each worker's
+`updated_at` identifies its last measurement. Progress is sampled at roughly
+twice per second and the last snapshot is retained in the terminal operation
+result; only a successful operation means the group is ready for inference.
+The existing authenticated worker health/identity responses expose the same
+worker measurements under `distributed_worker.load_progress`/`worker.load_progress`.
+
 SSE records use `id`, `event`, and a JSON `ClusterEvent` containing
 `id`, `type`, `timestamp`, and `data`. Reconnect with `Last-Event-ID`. Events are
 bounded in memory (1024); an expired cursor, a future cursor, or a coordinator
@@ -290,6 +323,15 @@ rsync retains its twice-per-second interval. `verifying_source`,
 `worker_ready` distinguish hashing, connection setup, delivery and durable
 publication. Counters reset for each attempt/target; source preparation has its
 own counters. Copy completion alone is not readiness.
+
+When the coordinator's stderr is a terminal, preparation also displays `tqdm`
+byte-progress bars for the source and each worker. This covers both explicit
+`models/prepare` calls and preparation triggered by inference. Bars show the
+current phase and actual transport; transfer speed and ETA use the reported
+logical-copy/payload rate, not measured cable traffic. Unknown totals display byte
+counts without a percentage. Verification and publication remain separate phases,
+and only `worker ready` indicates readiness. Redirected logs do not contain bars;
+applications continue to consume the operation/events endpoints above.
 
 Cancellation returns 202 and is observed through the original operation. A
 cancelled preparation finishes as `failed` with `preparation_cancelled`; a retry

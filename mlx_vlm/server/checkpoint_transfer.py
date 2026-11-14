@@ -6,6 +6,7 @@ import concurrent.futures
 import errno
 import hashlib
 import json
+import logging
 import os
 import queue
 import secrets
@@ -20,9 +21,90 @@ import uuid
 from collections import deque
 from pathlib import Path
 
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 from . import checkpoint_store as store
 from ._worker_supervisor import worker_environment
 from .rsync_progress import run_rsync
+
+
+class TransferProgress:
+    """Terminal-only view of the same measurements published by preparation."""
+
+    def __init__(self):
+        self.enabled = sys.stderr.isatty()
+        self.bars = {}
+        self.phases = {}
+        self.lock = threading.Lock()
+
+    def __enter__(self):
+        self.logging = logging_redirect_tqdm(
+            loggers=(
+                [logging.getLogger(name) for name in ("", "uvicorn", "uvicorn.access")]
+                if self.enabled
+                else []
+            )
+        )
+        self.logging.__enter__()
+        return self
+
+    def update(self, target, phase, data):
+        if not self.enabled:
+            return
+        with self.lock:
+            bar = self.bars.get(target)
+            changed = self.phases.get(target) != phase
+            if bar is None:
+                bar = self.bars[target] = tqdm(
+                    total=data.get("total_bytes"),
+                    unit="B",
+                    unit_scale=True,
+                    dynamic_ncols=True,
+                    position=len(self.bars),
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]",
+                )
+            elif self.phases[target] != phase:
+                bar.reset(total=data.get("total_bytes", bar.total))
+            self.phases[target] = phase
+            bar.set_description_str(
+                f"{target}: {phase.replace('_', ' ')}", refresh=False
+            )
+            field = {
+                "verifying_source": "bytes_verified",
+                "verifying_worker": "bytes_verified",
+                "worker_ready": "bytes_verified",
+                "source_ready": "bytes_verified",
+                "checking_partial": "bytes_checked",
+            }.get(phase)
+            count = (
+                data.get(field, 0)
+                if field
+                else data.get("bytes_transferred", 0) + data.get("bytes_reused", 0)
+            )
+            bar.total = data.get("total_bytes", bar.total)
+            details = data.get("transport", "")
+            rate = data.get("throughput_bytes_per_second", 0)
+            if phase == "transferring" and rate > 0:
+                details += f", {tqdm.format_sizeof(rate)}B/s logical"
+                if bar.total and count < bar.total:
+                    details += (
+                        f", ETA {tqdm.format_interval((bar.total - count) / rate)}"
+                    )
+            bar.set_postfix_str(details, refresh=False)
+            if not bar.update(max(0, count - bar.n)) and changed:
+                bar.refresh()
+
+    def __exit__(self, kind, error, traceback):
+        with self.lock:
+            for target, bar in self.bars.items():
+                if self.phases[target] not in {"worker_ready", "source_ready"}:
+                    status = "prepared" if error is None else "failed"
+                    if isinstance(error, InterruptedError):
+                        status = "cancelled"
+                    bar.set_description_str(f"{target}: {status}", refresh=False)
+                bar.close()
+        self.logging.__exit__(kind, error, traceback)
 
 
 class TransferUnavailable(RuntimeError):

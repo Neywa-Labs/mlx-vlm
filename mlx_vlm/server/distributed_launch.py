@@ -239,9 +239,43 @@ class WorkerLauncher:
             except (OSError, ValueError):
                 return  # Supervisors expire their leases if transport is lost.
 
-    async def start(self, *, recover=False):
+    async def start(self, *, recover=False, progress=None):
         import httpx
 
+        started = time.monotonic()
+        reported = None
+
+        async def report(stage):
+            nonlocal reported
+            ranks = sorted(self.ready_ranks)
+            now = time.monotonic()
+            if progress and (
+                reported is None
+                or (stage, ranks) != reported[:2]
+                or now - reported[2] >= 0.5
+            ):
+                await progress(
+                    stage=stage,
+                    elapsed_seconds=now - started,
+                    total_workers=len(self.config.workers),
+                    supervisors_ready=len(ranks),
+                    workers_ready=len(ranks) if stage == "ready" else 0,
+                    nodes=[
+                        {
+                            "node_id": worker.node_id,
+                            "rank": rank,
+                            "stage": (
+                                ("ready" if stage == "ready" else "supervisor_ready")
+                                if rank in ranks
+                                else "waiting_for_supervisor"
+                            ),
+                        }
+                        for rank, worker in enumerate(self.config.workers)
+                    ],
+                )
+                reported = (stage, ranks, now)
+
+        await report("checking_endpoints")
         payload = self._payload()
         self.launch.validate_hosts(self.config.workers)
         if self.coordinator.failure.exists() and not recover:
@@ -294,6 +328,7 @@ class WorkerLauncher:
             # Do not send secrets while any remote PTY could still echo input.
             expected = set(range(len(self.config.workers)))
             while self.ready_ranks != expected:
+                await report("starting_supervisors")
                 if self.process.poll() is not None:
                     raise RuntimeError(
                         "mlx.launch exited before supervisors were ready; inspect worker logs"
@@ -306,8 +341,10 @@ class WorkerLauncher:
             os.write(self.process.stdin.fileno(), payload)
             self.heartbeat = threading.Thread(target=self._renew, daemon=True)
             self.heartbeat.start()
+            await report("waiting_for_workers")
             last_error = None
             while time.monotonic() < deadline:
+                await report("waiting_for_workers")
                 if self.process.poll() is not None:
                     raise RuntimeError(
                         "mlx.launch exited before workers were ready; inspect worker logs"
@@ -318,6 +355,7 @@ class WorkerLauncher:
                         timeout=max(0.001, deadline - time.monotonic()),
                     )
                     logger.info("Distributed worker group is ready")
+                    await report("ready")
                     self.monitor_task = asyncio.create_task(self.monitor())
                     return
                 except Exception as error:

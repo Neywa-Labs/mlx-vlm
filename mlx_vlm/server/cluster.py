@@ -619,7 +619,9 @@ class ClusterManager:
             task.add_done_callback(self.tasks.discard)
             return operation
 
-    async def phase(self, operation, phase):
+    async def phase(self, operation, phase, *, progress=None):
+        if progress is not None:
+            operation.result = {"progress": progress}
         operation.phase, operation.updated_at = phase, time.time()
         self.save()
         await self.emit("operation.updated", operation.model_dump())
@@ -746,6 +748,73 @@ class ClusterManager:
             finally:
                 raise
 
+    async def load_model(self, operation, coordinator, body, staged):
+        """Observe worker measurements while the existing relay loads the model."""
+        started = time.monotonic()
+        task = asyncio.create_task(
+            coordinator.relay(
+                "/v1/responses/input_tokens",
+                {
+                    "model": body.model,
+                    "input": ".",
+                    "distributed_revision": body.revision,
+                },
+            )
+        )
+        try:
+            async with httpx.AsyncClient(trust_env=False, timeout=1) as client:
+                while True:
+                    checks = await asyncio.gather(
+                        *[
+                            client.get(
+                                w.url.rstrip("/") + "/health", headers=w.headers()
+                            )
+                            for w in coordinator.config.workers
+                        ],
+                        return_exceptions=True,
+                    )
+                    nodes = []
+                    for rank, (worker, check) in enumerate(
+                        zip(coordinator.config.workers, checks)
+                    ):
+                        node = {
+                            "node_id": worker.node_id,
+                            "rank": rank,
+                            "stage": "unavailable",
+                        }
+                        if isinstance(check, httpx.Response) and check.is_success:
+                            data = check.json()
+                            info = data.get("distributed_worker") or {}
+                            expected = coordinator.stager.worker_paths.get(
+                                (staged, worker.url), staged
+                            )
+                            measured = info.get("load_progress") or {}
+                            node["stage"] = "waiting_for_load"
+                            if measured.get("model") == expected:
+                                node.update(measured)
+                                if node["stage"] == "ready":
+                                    node["stage"] = "initializing_generator"
+                            if data.get("loaded_model") == expected:
+                                node["stage"] = "ready"
+                        nodes.append(node)
+                    await self.phase(
+                        operation,
+                        "loading_model",
+                        progress={
+                            "elapsed_seconds": time.monotonic() - started,
+                            "total_workers": len(nodes),
+                            "workers_ready": sum(n["stage"] == "ready" for n in nodes),
+                            "nodes": nodes,
+                        },
+                    )
+                    if task.done():
+                        return await task
+                    await asyncio.wait({task}, timeout=0.5)
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def start(self, operation, body):
         await self.refresh()
         if self.running:
@@ -796,10 +865,13 @@ class ClusterManager:
                 from .distributed_launch import WorkerLauncher
 
                 coordinator.launcher = launcher = WorkerLauncher(coordinator)
-                await self.phase(operation, "launching")
+
+                async def launching(**progress):
+                    await self.phase(operation, "launching", progress=progress)
+
                 # Keep the failure marker until fresh process identities are checked
                 # below; startup still refuses occupied endpoints or another owner.
-                await launcher.start(recover=True)
+                await launcher.start(recover=True, progress=launching)
             else:
                 for rank, node_id in enumerate(self.selected):
                     info = self.nodes[node_id].identity.worker
@@ -855,18 +927,10 @@ class ClusterManager:
                 coordinator.failure.unlink()
             if body.model:
                 await self.phase(operation, "preparing_model")
-                await self.stage_model(
+                staged = await self.stage_model(
                     operation, coordinator.stager, body.model, body.revision
                 )
-                await self.phase(operation, "loading_model")
-                _, status = await coordinator.relay(
-                    "/v1/responses/input_tokens",
-                    {
-                        "model": body.model,
-                        "input": ".",
-                        "distributed_revision": body.revision,
-                    },
-                )
+                _, status = await self.load_model(operation, coordinator, body, staged)
                 if status >= 400:
                     fail(
                         "model_load_failed",
@@ -888,7 +952,11 @@ class ClusterManager:
         runtime.distributed_coordinator = coordinator
         self.running = list(self.selected)
         self.state = "ready"
-        operation.result = {"state": self.state, "members": self.running}
+        operation.result = {
+            **(operation.result or {}),
+            "state": self.state,
+            "members": self.running,
+        }
         self.save()
         await self.emit("cluster.ready", self.snapshot().model_dump())
 

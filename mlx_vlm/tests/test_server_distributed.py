@@ -4,6 +4,7 @@
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -338,6 +339,9 @@ def test_real_rsync_progress_reuses_existing_files_and_counts_payload(tmp_path):
 def test_staging_progress_is_live_per_worker_and_readiness_requires_verification(
     staging_cluster, checkpoint, monkeypatch, bad_checksum
 ):
+    terminal = io.StringIO()
+    terminal.isatty = lambda: True
+    monkeypatch.setattr(sys, "stderr", terminal)
     stager = ModelStager(staging_cluster)
     updates = []
 
@@ -366,12 +370,19 @@ def test_staging_progress_is_live_per_worker_and_readiness_requires_verification
             )
         assert staging_cluster.workers[1].url not in stager.worker_transfers
         assert updates[-1][0] == "verifying_worker"
+        assert "b: failed" in terminal.getvalue()
+        assert "b: worker ready" not in terminal.getvalue()
     else:
         stager.prepare(
             str(checkpoint),
             progress=lambda phase, **data: updates.append((phase, data)),
         )
         assert updates[-1][0] == "worker_ready"
+        assert "b: worker ready" in terminal.getvalue()
+    output = terminal.getvalue()
+    assert "Source: source ready" in output and "a: worker ready" in output
+    assert "b: transferring" in output and "b: verifying worker" in output
+    assert "ssh_rsync" in output and "B/s logical" in output
     copying = [data for phase, data in updates if phase == "transferring"]
     assert len(copying) == 3 and all(data["node_id"] == "b" for data in copying)
     assert copying[0]["bytes_transferred"] == 0
@@ -799,7 +810,7 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
     (path / MANIFEST).write_text("{}")
     calls = []
     model = NS(
-        language_model=NS(layers=[]),
+        language_model=NS(layers=[NS(parameters=lambda: "layer-parameters")]),
         shard=lambda group: calls.append("shard"),
         parameters=lambda: "all-parameters-including-vision",
         eval=lambda: calls.append("eval-mode"),
@@ -809,7 +820,14 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
         side_effect=lambda *a, **k: (calls.append("load") or (model, processor))
     )
     monkeypatch.setattr(utils, "load", native)
-    monkeypatch.setattr(mx, "eval", lambda *a: calls.append(a[0]))
+    measurements = []
+
+    def evaluate(*args):
+        calls.append(args[0])
+        measurements.append(worker.load_progress.copy())
+
+    monkeypatch.setattr(mx, "eval", evaluate)
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
     monkeypatch.setattr(mx.distributed, "all_sum", lambda *a, **k: "barrier")
     worker = DistributedWorker.__new__(DistributedWorker)
     worker.model_dir = cluster.model_dir
@@ -825,10 +843,20 @@ def test_worker_uses_native_lazy_loader_before_sharding(cluster, monkeypatch):
     assert calls == [
         "load",
         "shard",
+        "layer-parameters",
         "all-parameters-including-vision",
         "eval-mode",
         "barrier",
     ]
+    assert measurements[0]["stage"] == "evaluating_layers"
+    assert measurements[0]["completed_layers"] == 0  # Not counted before mx.eval.
+    assert measurements[0]["total_layers"] == 1
+    assert measurements[-1]["stage"] == "synchronizing"
+    assert worker.load_progress["stage"] == "ready"
+    native.side_effect = RuntimeError("broken checkpoint")
+    with pytest.raises(RuntimeError, match="broken checkpoint"):
+        worker.load(str(path), None)
+    assert worker.load_progress["stage"] == "failed"
 
 
 def test_worker_startup_disables_independent_caches_and_hub_access(
