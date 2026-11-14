@@ -360,8 +360,11 @@ contents, since encryption produces different ciphertext on each rank.
 
 The coordinator returns the primary worker's response after comparing rank
 outputs, excluding generated identifiers and timing metadata. A failed rank,
-timeout, or disagreement writes `.cluster-failed.json` in the staging directory
-and blocks further distributed requests. Local requests remain available.
+inference timeout, or disagreement writes `.cluster-failed.json` in the staging
+directory and blocks further distributed requests. Local requests remain available.
+An identity-poll timeout marks node telemetry stale (`telemetry_timeout`) and is
+retried without failing the group. Connection failures or identity mismatches
+still fail the group; successful later polling does not clear that failure.
 
 Inspect that marker and worker logs, stop/restart the **entire affected worker
 group**, and confirm no old request is running. The cluster start API clears a

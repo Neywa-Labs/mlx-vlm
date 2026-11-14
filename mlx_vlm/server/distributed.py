@@ -33,8 +33,11 @@ ROUTES = {
     "/v1/chat/completions",
     "/chat/completions",
     "/v1/responses",
+    "/responses",
     "/v1/responses/input_tokens",
+    "/responses/input_tokens",
     "/v1/responses/compact",
+    "/responses/compact",
 }
 CANCEL_ROUTE = "/internal/distributed/cancel"
 REQUEST_HEADER = "X-MLX-Distributed-Request"
@@ -234,10 +237,12 @@ class ModelStager:
             and p.suffix in MODEL_SUFFIXES
             and not any(part.startswith(".") for part in p.relative_to(source).parts)
         )
-        if "config.json" not in names or not any(
+        if not {"config.json", "params.json"}.intersection(names) or not any(
             n.endswith(".safetensors") for n in names
         ):
-            raise ValueError("Model must contain config.json and safetensors weights")
+            raise ValueError(
+                "Model must contain config.json or params.json and safetensors weights"
+            )
         for name in names:
             if "\n" in name or "\r" in name:
                 raise ValueError("Model filenames cannot contain newlines")

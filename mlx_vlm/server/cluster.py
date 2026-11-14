@@ -367,6 +367,14 @@ class ClusterManager:
                     False,
                     None,
                 )
+            except httpx.TimeoutException:
+                # Loading can delay telemetry without losing an inference rank.
+                node.reachable, node.stale = False, True
+                node.error = ClusterError(
+                    code="telemetry_timeout",
+                    message="Worker identity check timed out; telemetry is stale.",
+                    retryable=True,
+                )
             except Exception:
                 node.reachable, node.stale = False, True
                 node.error = ClusterError(
@@ -386,11 +394,16 @@ class ClusterManager:
             ):
                 try:
                     await self.bootstrap()
+                except httpx.TimeoutException:
+                    pass  # Retry registration when worker telemetry responds.
                 except Exception:
                     self.state = "failed"
             self.last_refresh = time.monotonic()
             await asyncio.gather(*(one(node) for node in self.nodes.values()))
-            if self.running and any(not self.nodes[n].reachable for n in self.running):
+            if any(
+                self.nodes[n].error and self.nodes[n].error.code == "node_unreachable"
+                for n in self.running
+            ):
                 self.state = "failed"
                 if runtime.distributed_coordinator:
                     runtime.distributed_coordinator.failed(
@@ -516,6 +529,7 @@ class ClusterManager:
         if not model:
             return
         from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import RemoteEntryNotFoundError
 
         from ..utils import load_config
 
@@ -531,7 +545,10 @@ class ClusterManager:
                 return load_config(local)
             if model.startswith(("/", "~", ".")):
                 fail("model_not_found", "Local model directory does not exist.", 422)
-            path = hf_hub_download(model, "config.json", revision=revision)
+            try:
+                path = hf_hub_download(model, "config.json", revision=revision)
+            except RemoteEntryNotFoundError:
+                path = hf_hub_download(model, "params.json", revision=revision)
             return json.loads(Path(path).read_text())
 
         validate_model(await asyncio.to_thread(metadata), len(self.selected))

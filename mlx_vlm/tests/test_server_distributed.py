@@ -93,9 +93,11 @@ def checkpoint(tmp_path, monkeypatch):
     return source
 
 
+@pytest.mark.parametrize("config_file", ["config.json", "params.json"])
 def test_staging_reuses_local_content_and_resolves_hub_only_once(
-    staging_cluster, checkpoint, monkeypatch
+    staging_cluster, checkpoint, monkeypatch, config_file
 ):
+    (checkpoint / "config.json").rename(checkpoint / config_file)
     resolve = Mock(return_value=checkpoint)
     monkeypatch.setattr(utils, "get_model_path", resolve)
     stager = ModelStager(staging_cluster)
@@ -707,7 +709,12 @@ def test_unsupported_distributed_options_fail_before_staging(
     assert not cluster.model_dir.exists()
 
 
-def test_http_flag_and_authentication_preserve_local_routes(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+@pytest.mark.parametrize("suffix", ["", "/input_tokens", "/compact"])
+def test_http_flag_and_authentication_preserve_local_routes(
+    monkeypatch, prefix, suffix
+):
+    path = prefix + "/responses" + suffix
     relay = AsyncMock(return_value=({"answer": "distributed"}, 200))
     monkeypatch.setattr(
         runtime, "distributed_coordinator", NS(relay=relay, config=NS(launch=None))
@@ -717,22 +724,19 @@ def test_http_flag_and_authentication_preserve_local_routes(monkeypatch):
     headers = {"Authorization": "Bearer coordinator-key"}
     body = {"model": "org/model", "input": "hello", "distributed": True}
     with TestClient(server.app) as client:
-        assert client.post("/v1/responses", json=body).status_code == 401
+        assert client.post(path, json=body).status_code == 401
         relay.assert_not_called()
-        assert client.post("/v1/responses", headers=headers, json=body).json() == {
+        assert client.post(path, headers=headers, json=body).json() == {
             "answer": "distributed"
         }
-        relay.assert_awaited_once()
+        assert relay.await_args.args[:2] == (path, body)
         # Invalid local input reaches the normal Pydantic route, without forwarding.
         for payload in ({}, {"distributed": False}):
-            assert (
-                client.post("/v1/responses", headers=headers, json=payload).status_code
-                == 422
-            )
+            assert client.post(path, headers=headers, json=payload).status_code == 422
         assert relay.await_count == 1
         assert (
             client.post(
-                "/v1/responses", headers=headers, json={**body, "distributed": "true"}
+                path, headers=headers, json={**body, "distributed": "true"}
             ).status_code
             == 422
         )

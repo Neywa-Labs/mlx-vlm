@@ -7,9 +7,16 @@ import time
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from huggingface_hub.errors import (
+    HfHubHTTPError,
+    LocalEntryNotFoundError,
+    RemoteEntryNotFoundError,
+    RepositoryNotFoundError,
+)
 
 import mlx_vlm.server as server
 from mlx_vlm.server import cluster as management
@@ -456,19 +463,42 @@ async def test_external_reconfiguration_is_observable_without_launching(control)
     assert runtime.distributed_coordinator is None and control.state == "stopped"
 
 
-async def test_node_loss_marks_distributed_group_failed_without_local_loader_changes(
-    control, monkeypatch
+@pytest.mark.parametrize(
+    "result, failed",
+    [
+        (OSError("offline"), True),
+        (httpx.ReadTimeout("busy loading"), False),
+        (info("changed-identity"), True),
+    ],
+)
+async def test_telemetry_failure_preserves_local_loader_and_distinguishes_timeouts(
+    control, monkeypatch, result, failed
 ):
     await register_pair(control)
     coordinator = management.Coordinator(control.config())
     monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
     local = runtime.response_generator
     control.running = ["a", "b"]
-    control.probe = AsyncMock(side_effect=OSError("offline"))
+    control.state = "ready"
+    healthy_probe = control.probe
+    control.probe = (
+        AsyncMock(side_effect=result)
+        if isinstance(result, Exception)
+        else AsyncMock(return_value=result)
+    )
     await control.refresh(force=True)
-    assert control.state == "failed" and coordinator.failure.exists()
+    expected_state = "failed" if failed else "ready"
+    assert control.state == expected_state
+    assert coordinator.failure.exists() == failed
     assert runtime.response_generator is local
-    assert all(not node.reachable for node in control.nodes.values())
+    assert all(not node.reachable and node.stale for node in control.nodes.values())
+    if not failed:
+        assert control.nodes["a"].error.code == "telemetry_timeout"
+    control.probe = healthy_probe
+    await control.refresh(force=True)
+    assert all(node.reachable and not node.stale for node in control.nodes.values())
+    assert control.state == expected_state
+    assert coordinator.failure.exists() == failed
 
 
 async def test_events_replay_and_reset_after_retention_gap(control):
@@ -486,6 +516,59 @@ async def test_events_replay_and_reset_after_retention_gap(control):
     response = await endpoint(last_event_id=0, interval_seconds=1)
     assert "cluster.snapshot" in await anext(response.body_iterator)
     await response.body_iterator.aclose()
+
+
+@pytest.mark.parametrize("config_file", ["config.json", "params.json"])
+async def test_hub_model_preflight_accepts_both_config_names(
+    control, monkeypatch, tmp_path, config_file
+):
+    config = {"model_type": "mistral_large4"}
+    path = tmp_path / config_file
+    path.write_text(json.dumps(config))
+    download = Mock(
+        side_effect=(
+            [str(path)]
+            if config_file == "config.json"
+            else [
+                RemoteEntryNotFoundError(
+                    "missing config.json", response=NS(headers={}, request=None)
+                ),
+                str(path),
+            ]
+        )
+    )
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    validate = Mock()
+    monkeypatch.setattr(management, "validate_model", validate)
+    control.selected = ["a", "b"]
+    await control.check_model("org/model", "revision-a")
+    assert [call.args[1] for call in download.call_args_list] == (
+        ["config.json"]
+        if config_file == "config.json"
+        else ["config.json", "params.json"]
+    )
+    assert all(
+        call.kwargs == {"revision": "revision-a"} for call in download.call_args_list
+    )
+    validate.assert_called_once_with(config, 2)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RepositoryNotFoundError("unauthorized", response=NS(headers={}, request=None)),
+        LocalEntryNotFoundError("offline"),
+        HfHubHTTPError("server error", response=NS(headers={}, request=None)),
+    ],
+)
+async def test_hub_model_preflight_does_not_hide_download_errors(
+    control, monkeypatch, error
+):
+    download = Mock(side_effect=error)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    with pytest.raises(type(error)):
+        await control.check_model("org/model", None)
+    download.assert_called_once_with("org/model", "config.json", revision=None)
 
 
 def test_model_member_count_errors_are_actionable(monkeypatch):
