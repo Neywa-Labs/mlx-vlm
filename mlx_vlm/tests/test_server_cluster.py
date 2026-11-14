@@ -492,10 +492,13 @@ async def test_loading_progress_is_visible_before_relay_finishes(
         lambda **kw: original(**kw, transport=httpx.MockTransport(health)),
     )
     operation = await control.begin("start", StartGroup(model="org/model"), None)
+
+    async def wait_for_loading():
+        while operation.phase != "loading_model":
+            await asyncio.sleep(0)
+
     try:
-        async with asyncio.timeout(3):
-            while operation.phase != "loading_model":
-                await asyncio.sleep(0)
+        await asyncio.wait_for(wait_for_loading(), timeout=3)
         assert operation.status == "running"
         progress = operation.result["progress"]
         assert progress["workers_ready"] == 0 and progress["total_workers"] == 2
