@@ -108,14 +108,16 @@ class CacheMemory:
         return self.fixed_bytes + ceil(capacity * self.bytes_per_token)
 
 
-def cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
+def cache_nbytes(value: Any, seen: Optional[dict[int, Any]] = None) -> int:
     """Account cache buffers without evaluating or cloning their contents."""
     if value is None:
         return 0
-    seen = set() if seen is None else seen
+    seen = {} if seen is None else seen
     if id(value) in seen:
         return 0
-    seen.add(id(value))
+    # State properties can create temporary views; keep them alive so their
+    # object IDs cannot be reused by a later layer during this traversal.
+    seen[id(value)] = value
     if isinstance(value, dict):
         return sum(cache_nbytes(v, seen) for v in value.values())
     if isinstance(value, (list, tuple)):
@@ -2752,6 +2754,12 @@ class BatchQuantizedKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return sum(array.nbytes for array in (*self.keys, *self.values))
 
     @property
     def batch_size(self):
