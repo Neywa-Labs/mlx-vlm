@@ -7839,6 +7839,7 @@ def test_local_loading_progress_is_observable_during_warmup(
                 health = await asyncio.wait_for(client.get("/health"), 1)
                 progress = health.json()["model_load_progress"]
                 assert progress["stage"] == "evaluating_layers"
+                assert progress["stage_percent"] == 50.0
                 assert (
                     progress["completed_layers"] == 1 and progress["total_layers"] == 2
                 )
@@ -7853,6 +7854,7 @@ def test_local_loading_progress_is_observable_during_warmup(
             assert len(generators) == 1
             progress = (await client.get("/health")).json()["model_load_progress"]
             assert progress["stage"] == ("failed" if fail else "ready")
+            assert progress["stage_percent"] is None
             if fail:
                 assert generators[0].stopped
             else:

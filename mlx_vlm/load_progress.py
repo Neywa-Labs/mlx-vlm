@@ -20,9 +20,22 @@ class LoadingProgress:
         self.update({"stage": stage, **counts})
 
     def update(self, event):
+        unit = {
+            "loading_checkpoint": "files",
+            "evaluating_layers": "layers",
+        }.get(event["stage"])
+        completed = event.get(f"completed_{unit}")
+        total = event.get(f"total_{unit}")
+        # A stage percentage is a count ratio, never an estimate of total load time.
+        stage_percent = (
+            round(100 * completed / total, 2)
+            if total and completed is not None
+            else None
+        )
         # Publish a new snapshot; observers may read it from another thread.
         self.snapshot = {
             **event,
+            "stage_percent": stage_percent,
             "model": self.model,
             "elapsed_seconds": time.monotonic() - self.started,
             "updated_at": time.time(),

@@ -4424,6 +4424,10 @@ def test_load_keeps_loader_options_out_of_processor_kwargs(tmp_path, lazy):
     assert events[0]["stage"] == "resolving_model"
     assert events[-1]["stage"] == "loaded" and events[-1]["lazy"] is lazy
     assert any(e.get("completed_files") == e.get("total_files") == 1 for e in events)
+    file_progress = [e for e in events if "completed_files" in e]
+    assert [e["stage_percent"] for e in file_progress] == [0.0, 100.0]
+    assert events[-1]["stage_percent"] is None
+    assert all(e["stage_percent"] is None for e in events if e.get("total_layers") == 0)
     assert any(e["stage"] == "evaluating_remaining_parameters" for e in events) != lazy
     assert all(e["model"] == str(tmp_path) for e in events)
     elapsed = [e["elapsed_seconds"] for e in events]
@@ -4436,7 +4440,7 @@ def test_load_keeps_loader_options_out_of_processor_kwargs(tmp_path, lazy):
 
 
 def test_layer_loading_progress_follows_evaluation(monkeypatch):
-    from mlx_vlm.load_progress import evaluate_model
+    from mlx_vlm.load_progress import LoadingProgress, evaluate_model
 
     model = nn.Module()
     model.layers = [nn.Linear(4, 4), nn.Linear(4, 4)]
@@ -4450,13 +4454,10 @@ def test_layer_loading_progress_follows_evaluation(monkeypatch):
         original_eval(*args)
 
     monkeypatch.setattr(mx, "eval", evaluate)
-    evaluate_model(model, events.append)
+    evaluate_model(model, LoadingProgress("demo", events.append).update)
     assert [e.get("completed_layers") for e in before_eval] == [0, 1, None]
-    assert events[-2] == {
-        "stage": "evaluating_layers",
-        "completed_layers": 2,
-        "total_layers": 2,
-    }
+    assert [e["stage_percent"] for e in events] == [0.0, 50.0, 100.0, None]
+    assert events[-2]["completed_layers"] == events[-2]["total_layers"] == 2
     assert events[-1]["stage"] == "evaluating_remaining_parameters"
     for key, value in tree_flatten(model.parameters()):
         assert value.dtype == expected[key].dtype
