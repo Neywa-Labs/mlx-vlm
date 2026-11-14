@@ -713,10 +713,15 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.model = Gemma4TextModel(config)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
 
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        logits = self.model.embed_tokens.as_linear(hidden)
+        if self.config.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.lm_head(hidden)
         if self.final_logit_softcapping is not None:
             logits = logit_softcap(self.final_logit_softcapping, logits)
         return logits
