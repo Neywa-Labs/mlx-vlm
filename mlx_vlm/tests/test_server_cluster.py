@@ -393,8 +393,18 @@ async def test_api_restarts_cli_group_and_shutdown_closes_only_owned_workers(
     from dataclasses import replace
 
     await register_pair(control)
+    rdma = {
+        "local_address": "192.0.2.1",
+        "local_device": "rdma_en4",
+        "remote_device": "rdma_en5",
+    }
+    config = control.config()
     initial = management.Coordinator(
-        replace(control.config(), launch=NS(backend="jaccl"))
+        replace(
+            config,
+            workers=(config.workers[0], replace(config.workers[1], rdma=rdma)),
+            launch=NS(backend="jaccl"),
+        )
     )
     monkeypatch.setattr(runtime, "distributed_coordinator", initial)
     monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
@@ -407,6 +417,10 @@ async def test_api_restarts_cli_group_and_shutdown_closes_only_owned_workers(
     monkeypatch.setattr(WorkerLauncher, "start", start)
     async with managed_workers(initial):
         await control.refresh(force=True)
+        assert control.nodes["a"].ssh.rdma is None
+        assert control.nodes["b"].ssh.rdma.model_dump() == rdma
+        restored = ClusterManager(control.root)
+        assert [worker.rdma for worker in restored.config().workers] == [None, rdma]
         first = initial.launcher
         stopped = await control.begin("stop", StopGroup(), None)
         await asyncio.gather(*control.tasks)
@@ -417,6 +431,7 @@ async def test_api_restarts_cli_group_and_shutdown_closes_only_owned_workers(
         restarted = await control.begin("start", StartGroup(mode="launch"), None)
         await asyncio.gather(*control.tasks)
         assert restarted.status == "succeeded", restarted.error
+        assert runtime.distributed_coordinator.config.workers[1].rdma == rdma
         second = runtime.distributed_coordinator.launcher
         assert second is not first and not second.monitor_task.done()
         assert control.snapshot().ownership == "server"

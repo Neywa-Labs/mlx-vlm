@@ -338,6 +338,7 @@ class ClusterManager:
                     SSHTransport(
                         destination=worker.ssh,
                         python=worker.python or coordinator.config.python,
+                        rdma=worker.rdma,
                     )
                     if worker.ssh
                     else None
