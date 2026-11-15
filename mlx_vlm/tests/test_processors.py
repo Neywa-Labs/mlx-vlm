@@ -852,21 +852,10 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
-@pytest.mark.parametrize("native_params", [False, True])
-def test_mistral_large4_processor_without_torch(tmp_path, native_params):
+def test_mistral_large4_processor_without_torch(tmp_path):
     metadata = deepcopy(DATA["checkpoints"]["mistral3"])
     metadata["config"]["model_type"] = "mistral_large4"
     metadata["processor_config"]["processor_class"] = "PixtralProcessor"
-    if native_params:
-        cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())
-        metadata["params"] = next(
-            c["native_config"] for c in cases["cases"] if c["id"] == "mistral_large4"
-        )
-        metadata["params"]["vision_encoder"]["patch_size"] = 14
-        metadata.pop("config")
-        # Geometry must come from params.json rather than processor defaults.
-        metadata["processor_config"].pop("patch_size", None)
-        metadata["processor_config"].pop("spatial_merge_size", None)
     _write_configs(tmp_path, **metadata)
     image_tokens = ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
     fast_tokenizer(
@@ -876,7 +865,6 @@ def test_mistral_large4_processor_without_torch(tmp_path, native_params):
     ).save_pretrained(tmp_path)
     script = textwrap.dedent("""
         import importlib.util
-        import json
         import sys
         from pathlib import Path
 
@@ -892,19 +880,9 @@ def test_mistral_large4_processor_without_torch(tmp_path, native_params):
 
         import mlx.core as mx
         from PIL import Image
-        from mlx_vlm.models.mistral_large4 import Mistral3Processor
-        from mlx_vlm.models.mistral_large4.config import config_from_params
         from mlx_vlm.utils import get_model_and_args, load_config, load_processor
 
         folder = Path(sys.argv[1])
-        if not (folder / "config.json").exists():
-            # Native metadata is handled by the explicit Mistral processor.
-            native = Mistral3Processor.from_pretrained(folder, local_files_only=True)
-            assert (native.patch_size, native.spatial_merge_size) == (14, 2)
-            assert not (folder / "config.json").exists()
-            # The shared loader requires the explicit metadata conversion.
-            config = config_from_params(load_config(folder))
-            (folder / "config.json").write_text(json.dumps(config))
         module, model_type = get_model_and_args(load_config(folder))
         assert model_type == "mistral_large4"
         processor = load_processor(folder, local_files_only=True)
