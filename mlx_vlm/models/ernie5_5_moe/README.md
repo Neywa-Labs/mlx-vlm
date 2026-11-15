@@ -48,10 +48,10 @@ Use the same checkpoint and checkout on each host:
 mlx.launch --hostfile hosts.json --backend jaccl \
   python examples/sharded_generate.py \
   --model ./ERNIE-5.5-Flash-Base-MXFP8 \
-  --draft-model ./ERNIE-5.5-Flash-Base-MXFP8 \
-  --draft-kind mtp --draft-block-size 3 --raw-prompt \
   --prompt "Large language models are" --max-tokens 128
 ```
+
+This example runs ordinary decoding. Distributed ECHO is available through the Python API.
 
 Attention heads and FFN intermediate dimensions are partitioned; ECHO reuses the sharded final decoder layer. Its auxiliary weights, latent caches, routers, embeddings and vocabulary head are replicated. Rank counts must divide the attention output groups and preserve whole quantization groups (2, 4 or 8 for the released checkpoint). Pipeline parallelism is not supported.
 
