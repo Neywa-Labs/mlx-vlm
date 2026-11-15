@@ -3630,7 +3630,7 @@ def test_distributed_model(family, dtype, world_size):
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("mode", ["affine", "mxfp8", "nvfp4"])
-def test_ernie55_distributed_quantized(mode, dtype, world_size):
+def test_distributed_model_ernie55_quantized(mode, dtype, world_size):
     _run_distributed_model_test("ernie5_5_moe", dtype, world_size, mode)
 
 
