@@ -1536,6 +1536,58 @@ def mistral_large4_case():
     return module, build_config(module, case["config"])
 
 
+@pytest.mark.parametrize("quantization", ["dense", "nvfp4", "fp8"])
+def test_mistral_large4_native_config(tmp_path, mistral_large4_case, quantization):
+    from mlx_vlm.models.mistral_large4.config import config_from_params
+
+    module, reference = mistral_large4_case
+    params = model_case("mistral_large4")["native_config"]
+    params["mtp"] = {"n_layers": 3, "dspark": {"markov_rank": 16}}
+    if quantization == "nvfp4":
+        params["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {"layers.1.experts": {"quant_algo": "NVFP4"}},
+        }
+    elif quantization == "fp8":
+        params["quantization"] = {
+            "qformat_weight": "fp8_e4m3",
+            "qscheme_weight": "BLOCK",
+            "block_size_out": 128,
+            "block_size_in": 128,
+            "use_ue8m0_for_qscales": True,
+        }
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    assert load_config(tmp_path) == params  # The shared reader stays unchanged.
+    config = config_from_params(params)
+    direct = module.ModelConfig.from_dict(params)
+    expected = asdict(reference.text_config)
+    expected.update(nvfp4=quantization == "nvfp4", mtp_config=params["mtp"])
+    assert asdict(direct.text_config) == config["text_config"] == expected
+    assert (
+        asdict(direct.vision_config)
+        == config["vision_config"]
+        == asdict(reference.vision_config)
+    )
+    assert config["model_type"] == "mistral_large4"
+    assert config["image_token_index"] == 10 and config["spatial_merge_size"] == 2
+    if quantization == "fp8":
+        assert "quantization" not in config
+        assert config["quantization_config"] == {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "scale_key": "qscale_weight",
+        }
+    elif quantization == "nvfp4":
+        assert config["quantization_config"] == params["quantization_config"]
+    assert not (tmp_path / "config.json").exists()
+    assert json.loads((tmp_path / "params.json").read_text()) == params
+    assert config_from_params(config) == config
+    (tmp_path / "params.json").write_text(json.dumps(config))
+    assert load_config(tmp_path) == config  # Already-normalized metadata is stable.
+
+
 @pytest.mark.parametrize("prefix", [0, 255])
 @pytest.mark.parametrize("per_head_mask", [False, True])
 def test_mistral_large4_decode_cache_matches_unfused_attention(
@@ -1838,7 +1890,16 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     config["quantization_config"] = {
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {"layers.1.experts": {"quant_algo": "NVFP4"}},
     }
+    if config_filename == "params.json":
+        from mlx_vlm.models.mistral_large4.config import config_from_params
+
+        params = model_case("mistral_large4")["native_config"]
+        params["moe"]["num_experts"] = expert_count
+        config = config_from_params(
+            {**params, "quantization_config": config["quantization_config"]}
+        )
     (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
@@ -1915,6 +1976,7 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
             check_partition(rank)
 
     # Native staging uses global expert IDs, including nonzero starting ranks.
+    config = load_config(tmp_path)
     config["text_config"].update(expert_start=2, expert_end=5)
     (tmp_path / config_filename).write_text(json.dumps(config))
     partition = load_model(tmp_path)
@@ -1980,29 +2042,66 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         config = copy.deepcopy(full_config)
 
 
+@pytest.mark.parametrize("native_params", [False, True])
 def test_mistral_large4_early_sharding_native_fp8_experts(
-    tmp_path, mistral_large4_case
+    tmp_path, mistral_large4_case, native_params
 ):
     module, args = mistral_large4_case
     mx.random.seed(45)
     native = {}
+    dense_experts = {}
     for key, value in tree_flatten(module.Model(args).parameters()):
         if ".experts." not in key:
             native[key] = value.astype(mx.bfloat16)
             continue
         prefix, projection = key.split(".experts.")
+        decoded = []
         for i in range(args.text_config.n_routed_experts):
             name = f"{prefix}.experts.{i}.{projection}"
             native[name] = mx.to_fp8(value[i])
-            native[name.removesuffix(".weight") + ".weight_scale"] = mx.array(0.5)
-    config = asdict(args)
-    config["quantization_config"] = {
-        "quant_method": "modelopt",
-        "quant_algo": "MIXED_PRECISION",
-    }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+            suffix = ".qscale_weight" if native_params else ".weight_scale"
+            scale = 2.0 ** (i - 4) if native_params else 0.5
+            native[name.removesuffix(".weight") + suffix] = mx.array(
+                [[scale]] if native_params else scale
+            )
+            decoded.append(mx.from_fp8(native[name], dtype=mx.bfloat16) * scale)
+        dense_experts[key] = mx.stack(decoded)
+    if native_params:
+        from mlx_vlm.models.mistral_large4.config import config_from_params
+
+        config = model_case("mistral_large4")["native_config"]
+        config["quantization"] = {
+            "qformat_weight": "fp8_e4m3",
+            "qscheme_weight": "BLOCK",
+            "block_size_out": 128,
+            "block_size_in": 128,
+            "use_ue8m0_for_qscales": True,
+        }
+        config = config_from_params(config)
+    else:
+        config = asdict(args)
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+        }
+    (tmp_path / ("params.json" if native_params else "config.json")).write_text(
+        json.dumps(config)
+    )
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
-    expected = dict(tree_flatten(load_model(tmp_path).parameters()))
+    full = load_model(tmp_path)
+    expected = dict(tree_flatten(full.parameters()))
+    for key, decoded in dense_experts.items():
+        actual = expected[key]
+        if native_params:
+            actual = mx.dequantize(
+                actual,
+                expected[key.removesuffix(".weight") + ".scales"],
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            )
+        assert mx.array_equal(actual, decoded), key
+    assert mx.all(mx.isfinite(full(mx.array([[1, 2]])).logits))
     for rank in range(3):
         group = NS(rank=lambda: rank, size=lambda: 3)
         model = load_model(tmp_path, sharding_group=group)
