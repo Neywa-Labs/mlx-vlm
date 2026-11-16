@@ -171,7 +171,18 @@ class MiniMaxH3ImagePipeline:
         max_sequence_length=4096,
         upsample_prompt=None,
         prompt_expansion_model=None,
+        progress_callback=None,
     ):
+        """Generate one image.
+
+        ``progress_callback(stage, completed, total)`` is called after each
+        unit of work has been evaluated:
+
+        - ``"cache_adaln"``: AdaLN projections for the fixed schedule, built
+          once per loaded transformer. Later calls report it complete.
+        - ``"denoise"``: the six denoising steps, ``0`` before the first.
+        - ``"decode"``: VAE decoding, ``0`` before and ``1`` after.
+        """
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("H3-Image requires a non-empty prompt")
         if steps != 6 or guidance != 1:
@@ -255,18 +266,40 @@ class MiniMaxH3ImagePipeline:
         rows = mx.concatenate([*references, target], axis=0)
         timesteps, sigmas = sampling_schedule()
         tables = [mx.stack([t, mx.array(0.999, mx.float32)]) for t in timesteps]
+        cache_work_per_table = len(transformer.transformer_blocks) + 1
+        total_cache_work = len(tables) * cache_work_per_table
         if self._adaln_caches is None:
             # The schedule never changes. Materialize the tiny timestep tables once,
             # then release ~26 GB of raw AdaLN projection weights.
-            self._adaln_caches = [
-                transformer.build_adaln_cache(table) for table in tables
-            ]
+            if progress_callback is not None:
+                progress_callback("cache_adaln", 0, total_cache_work)
+            caches = []
+            for index, table in enumerate(tables):
+
+                def report_cache_progress(completed, total, index=index):
+                    if progress_callback is not None and completed:
+                        progress_callback(
+                            "cache_adaln",
+                            index * total + completed,
+                            total_cache_work,
+                        )
+
+                caches.append(
+                    transformer.build_adaln_cache(
+                        table, progress_callback=report_cache_progress
+                    )
+                )
+            self._adaln_caches = caches
             transformer.drop_adaln_weights()
             gc.collect()
             mx.clear_cache()
+        elif progress_callback is not None:
+            progress_callback("cache_adaln", total_cache_work, total_cache_work)
         row_indices = mx.zeros((tags.shape[0],), mx.int32)
         if reference_rows:
             row_indices = row_indices.at[image_indices[:reference_rows]].add(1)
+        if progress_callback is not None:
+            progress_callback("denoise", 0, 6)
         for step in range(6):
             velocity = transformer(
                 rows[None],
@@ -285,9 +318,13 @@ class MiniMaxH3ImagePipeline:
             ) * velocity[reference_rows:].astype(mx.float32)
             rows = mx.concatenate([rows[:reference_rows], target], axis=0)
             mx.eval(rows)
+            if progress_callback is not None:
+                progress_callback("denoise", step + 1, 6)
         latents = unpatchify_video_tokens(
             rows[reference_rows:], 1, lh, lw, config.in_channels, config.patch_size
         )[:, :, 0]
+        if progress_callback is not None:
+            progress_callback("decode", 0, 1)
         vae = self.vae
         mean = mx.array(vae.config.latents_mean).reshape(1, -1, 1, 1)
         std = mx.array(vae.config.latents_std).reshape(1, -1, 1, 1)
@@ -300,4 +337,6 @@ class MiniMaxH3ImagePipeline:
         ).astype(mx.uint8)
         image = resize_lanczos(image, height, width)
         mx.eval(image)
+        if progress_callback is not None:
+            progress_callback("decode", 1, 1)
         return image
