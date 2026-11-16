@@ -357,7 +357,7 @@ class Model(nn.Module):
         for k, v in weights.items():
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
                 continue
-            if k == "lm_head.weight":
+            if k == "lm_head.weight" and self.config.text_config.tie_word_embeddings:
                 continue
             if self.embed_audio is None and "embed_audio" in k:
                 continue
@@ -367,8 +367,10 @@ class Model(nn.Module):
             else:
                 new_key = k
 
+            if new_key.startswith("lm_head."):
+                new_key = "language_model." + new_key
             if new_key.startswith("language_model.") and not new_key.startswith(
-                "language_model.model."
+                ("language_model.model.", "language_model.lm_head.")
             ):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
