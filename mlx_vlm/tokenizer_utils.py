@@ -326,12 +326,15 @@ class _ServerTokenStreamer:
     def _emit_text(self, text: str) -> str:
         if text and not self._started:
             if self._trim_space:
-                # Strip the leading SPM space artifact. A standalone "▁"
-                # token decodes to a lone " ", so trimming it leaves the chunk
-                # empty; stay unstarted so the space on the following token is
-                # also trimmed, matching SPMStreamingDetokenizer.
+                # Strip the leading SPM space artifact. A standalone "▁" token
+                # decodes to a lone " ", so trimming it leaves the chunk empty;
+                # in SPM mode stay unstarted so the space on the following token
+                # is also trimmed, matching SPMStreamingDetokenizer (which keeps
+                # self.text empty and defers the single-space trim to the first
+                # real segment). BPE instead trims only the first space, so it
+                # must flip _started here even when the trimmed chunk is empty.
                 text = _remove_space(text)
-                if not text:
+                if not text and self._mode == "spm":
                     return text
             self._started = True
         return text
