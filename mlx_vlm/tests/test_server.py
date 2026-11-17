@@ -10960,6 +10960,116 @@ def test_tool_examples_in_reasoning_are_not_executed(
     assert calls == ([("get_weather", {"city": "Warsaw"})] if real_call else [])
 
 
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_longcat_tool_call_inside_unterminated_thinking(
+    client, api, batching, stream
+):
+    # LongCat-Flash-Lite's template pre-opens <longcat_think> and the model
+    # can finish a real call without closing the think block: the wire then
+    # carried the markup in reasoning_content with content='' and no
+    # tool_calls. Those calls must be executed — unlike examples inside a
+    # closed thinking block (see the test above).
+    prompt = (
+        "<longcat_user>Research the Antikythera mechanism."
+        "<longcat_assistant><longcat_think>"
+    )
+    text = (
+        "I should search first. Let me start with the web search."
+        "<longcat_tool_call>web_search\n"
+        "<longcat_arg_key>query</longcat_arg_key>\n"
+        "<longcat_arg_value>Antikythera mechanism</longcat_arg_value>\n"
+        "</longcat_tool_call>\n"
+    )
+    tokens = [_token(text, finish_reason="stop")]
+    schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+    }
+    tools = (
+        [dict(name="web_search", description="Search", input_schema=schema)]
+        if api == "messages"
+        else [
+            dict(
+                type="function",
+                function=dict(
+                    name="web_search", description="Search", parameters=schema
+                ),
+            )
+        ]
+    )
+    with _endpoint(
+        parser=load_tool_module("longcat"),
+        template=prompt,
+        result=_result(text, finish_reason="stop"),
+        chunks=[_result(text, finish_reason="stop")],
+        generator=_streaming(tokens) if batching else None,
+    ):
+        response = _post(client, api, tools=tools, stream=stream)
+    assert response.status_code == 200, response.text
+    if api == "responses":
+        body = _completed_response(response) if stream else response.json()
+        calls = [
+            (c["name"], json.loads(c["arguments"]))
+            for c in body["output"]
+            if c["type"] == "function_call"
+        ]
+    elif api == "chat":
+        if stream:
+            events = _data(response)
+            choices = [e["choices"][0] for e in events if e.get("choices")]
+            assert choices[-1]["finish_reason"] == "tool_calls"
+            fragments = [
+                c for choice in choices for c in choice["delta"].get("tool_calls") or []
+            ]
+            calls = (
+                [
+                    (
+                        fragments[0]["function"]["name"],
+                        json.loads(
+                            "".join(
+                                c["function"].get("arguments", "") for c in fragments
+                            )
+                        ),
+                    )
+                ]
+                if fragments
+                else []
+            )
+        else:
+            message = response.json()["choices"][0]["message"]
+            assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+            assert message["content"] is None
+            assert message["reasoning_content"].startswith("I should search first.")
+            calls = [
+                (c["function"]["name"], json.loads(c["function"]["arguments"]))
+                for c in message.get("tool_calls") or []
+            ]
+    elif stream:
+        events = _data(response)
+        assert events[-1]["type"] == "message_stop"
+        blocks = [
+            e["content_block"]
+            for e in events
+            if e["type"] == "content_block_start"
+            and e["content_block"]["type"] == "tool_use"
+        ]
+        arguments = "".join(
+            e["delta"].get("partial_json", "")
+            for e in events
+            if e["type"] == "content_block_delta"
+        )
+        calls = [(b["name"], json.loads(arguments)) for b in blocks]
+    else:
+        calls = [
+            (b["name"], b["input"])
+            for b in response.json()["content"]
+            if b["type"] == "tool_use"
+        ]
+    assert calls == [("web_search", {"query": "Antikythera mechanism"})]
+
+
 def test_prefill_memory_error_only_fails_the_refused_request():
     from queue import Queue
     from types import SimpleNamespace

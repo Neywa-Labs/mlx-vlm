@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from transformers.utils.chat_parsing.response_templates import load_response_template
 
 from ..prompt_utils import _normalize_tool_message
-from ..tools import process_tool_calls
+from ..tools import ParseResult, process_tool_calls
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -559,16 +559,25 @@ def parse_assistant_tool_calls(
     """Parse executable calls from the same content seen by the streaming parser.
 
     Response-template parsers may consume tool regions, so split reasoning with
-    the delimiter state instead. Examples inside reasoning are never tool calls.
+    the delimiter state instead. Examples inside a closed thinking block are
+    never tool calls; an unterminated block is different: LongCat-Flash-Lite
+    pre-opens ``<longcat_think>`` and can finish a real call without closing
+    it, so when generation still sits inside thinking, a complete call in the
+    reasoning text is executed (the model repo's parse_model_response.py
+    parses calls from the whole response in that case too).
     """
-    content = (
-        ThinkingStreamState(
-            starts_in_thinking, thinking_start_token, thinking_end_token
-        )
-        .feed(text, last=True)
-        .content
+    state = ThinkingStreamState(
+        starts_in_thinking, thinking_start_token, thinking_end_token
     )
-    return process_tool_calls(content or "", tool_module, tools)
+    delta = state.feed(text, last=True)
+    result = process_tool_calls(delta.content or "", tool_module, tools)
+    if not result.calls and delta.reasoning and state.in_thinking:
+        # The calls came from the reasoning channel, which callers keep as the
+        # reasoning text (streamed reasoning already carried the markup); the
+        # content remainder is still whatever the content pass left.
+        reasoning = process_tool_calls(delta.reasoning, tool_module, tools)
+        return ParseResult(calls=reasoning.calls, remaining_text=result.remaining_text)
+    return result
 
 
 def _response_output_items_from_text(
