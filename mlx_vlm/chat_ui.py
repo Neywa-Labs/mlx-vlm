@@ -14,7 +14,9 @@ import mlx.core as mx
 
 from mlx_vlm import load
 
+from .chat_media import extract_media_from_message
 from .generate import PromptCacheState, stream_generate
+from .generate.video import resolve_video_inputs
 from .prompt_utils import get_chat_template, get_message_json
 from .utils import load_config, load_image_processor
 from .vision_cache import VisionFeatureCache
@@ -163,24 +165,26 @@ def refresh_model_list():
     return gr.update(choices=models, value=state.current_model_name)
 
 
-def extract_image_from_message(message):
-    """Extract image file path from various message formats."""
-    if isinstance(message, dict):
-        if "files" in message and message["files"]:
-            img = message["files"][-1]
-            if isinstance(img, dict) and "path" in img:
-                return img["path"]
-            elif isinstance(img, str):
-                return img
-        if "file" in message and message["file"]:
-            f = message["file"]
-            if isinstance(f, dict) and "path" in f:
-                return f["path"]
-            elif isinstance(f, str):
-                return f
-    elif isinstance(message, str):
-        return message if message else ""
-    return ""
+def resolve_message_media(message):
+    """Split a message's attachments into image, video and audio inputs.
+
+    Videos the processor cannot consume natively become sampled frames sent
+    as images, the same fallback the CLI and server use.
+    """
+    media = extract_media_from_message(message)
+    images, videos = media.images, media.videos
+    if videos:
+        resolution = resolve_video_inputs(
+            state.processor, videos, images=images, fps=2.0, max_frames=16
+        )
+        images, videos = resolution.images, resolution.videos
+        if resolution.used_fallback:
+            print(
+                f"{state.processor.__class__.__name__} has no native video "
+                f"support; sending {resolution.selected_count} of "
+                f"{resolution.sampled_count} sampled frames as ordered images."
+            )
+    return images, videos, media.audio
 
 
 def extract_text_from_message(message):
@@ -217,9 +221,8 @@ def chat(
     global stop_generation
     stop_generation.clear()
 
-    image_file = extract_image_from_message(message)
-    num_images = 1 if image_file else 0
-    image = [image_file] if image_file else None
+    images, videos, audio = resolve_message_media(message)
+    has_media = bool(images or videos or audio)
 
     if state.config["model_type"] != "paligemma":
         chat_history = []
@@ -266,19 +269,21 @@ def chat(
             {"role": "user", "content": extract_text_from_message(message)}
         )
 
-        # Build messages with image token only on the last user message
+        # Build messages with media tokens only on the last user message
         messages = []
         for i, m in enumerate(chat_history):
-            skip_token = True
-            if i == len(chat_history) - 1 and m["role"] == "user" and image_file:
-                skip_token = False
+            attach = i == len(chat_history) - 1 and m["role"] == "user" and has_media
+            media_kwargs = {"video": videos} if attach and videos else {}
             messages.append(
                 get_message_json(
                     state.config["model_type"],
                     m["content"],
                     role=m["role"],
-                    skip_image_token=skip_token,
-                    num_images=num_images if not skip_token else 0,
+                    skip_image_token=not attach,
+                    skip_audio_token=not attach,
+                    num_images=len(images) if attach else 0,
+                    num_audios=len(audio) if attach else 0,
+                    **media_kwargs,
                 )
             )
 
@@ -308,7 +313,9 @@ def chat(
         state.model,
         state.processor,
         prompt,
-        image=image,
+        image=images or None,
+        audio=audio or None,
+        video=videos or None,
         **gen_kwargs,
     ):
         if stop_generation.is_set():
