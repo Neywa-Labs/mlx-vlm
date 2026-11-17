@@ -49,6 +49,10 @@ class ThinkingStreamState:
         ("<think>", "</think>"),
         ("<mm:think>", "</mm:think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
+        # LongCat-Flash-Lite's chat template pre-opens <longcat_think> when
+        # enable_thinking is set (its tokenizer has no response_template; the
+        # model repo's parse_model_response.py splits on this pair).
+        ("<longcat_think>", "</longcat_think>"),
     )
 
     def __init__(

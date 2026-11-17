@@ -7146,6 +7146,19 @@ def test_thinking_text(text, preopened, expected, tags):
     assert server._count_thinking_tag_tokens(text) == tags
 
 
+def test_longcat_thinking_markers():
+    text = "17 * 20 is 340, plus 17 * 3 is 51</longcat_think>\n\n391"
+    assert server._split_thinking(text) == (
+        "17 * 20 is 340, plus 17 * 3 is 51",
+        "391",
+    )
+    prompt = (
+        "<longcat_user>What is 17*23? /think_on "
+        "<longcat_assistant><longcat_think>\n"
+    )
+    assert server.prompt_has_open_thinking(prompt, True)
+
+
 def _feed_thinking(state, chunks, last=False):
     return [
         state.feed(text, last=last and i == len(chunks) - 1)
