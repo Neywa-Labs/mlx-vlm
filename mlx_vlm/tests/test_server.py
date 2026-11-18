@@ -73,7 +73,11 @@ from mlx_vlm.server.responses_state import (
 )
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
-from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.tokenizer_utils import (
+    BPEStreamingDetokenizer,
+    SPMStreamingDetokenizer,
+    _ServerTokenStreamer,
+)
 from mlx_vlm.tools import load_tool_module, process_tool_calls
 
 
@@ -6521,6 +6525,80 @@ class TestResponseGenerator:
         )
         assert streamer.advance(0, None) == streamer.advance(1, None) == ""
         assert streamer.finalize() == "\ufffd"
+
+    def test_streamer_leading_space_matches_batch_for_spm_and_bpe(self):
+        """Per-token streaming must match batch detokenization at stream start.
+
+        The leading-space trim lives in the shared ``_ServerTokenStreamer.
+        _emit_text`` helper, which serves both SPM and BPE modes. The two modes
+        disagree on purpose: SPM absorbs leading boundary spaces up to the first
+        real segment (a standalone ``U+2581`` decodes to a lone space that must
+        be swallowed, not emitted, so ``" Hello"`` becomes ``"Hello"``), while
+        BPE trims only the first leading space. A broader version of the SPM fix
+        once flipped ``_started`` for the empty ``U+2581`` chunk and leaked a
+        spurious leading space; it also had to leave BPE untouched. This test
+        pins BOTH behaviors in one place so a future edit to the shared helper
+        cannot silently regress either mode.
+        """
+        underscore = "\u2581"
+
+        def batch_text(detok, ids):
+            detok.reset()
+            for tok in ids:
+                detok.add_token(tok)
+            detok.finalize()
+            return detok.text
+
+        def stream_text(detokenizer, ids):
+            streamer = _ServerTokenStreamer(
+                NS(), server.make_streaming_detokenizer(NS(detokenizer=detokenizer))
+            )
+            parts = [streamer.advance(tok, None) for tok in ids]
+            parts.append(streamer.finalize())
+            return "".join(parts)
+
+        # SPM: a standalone U+2581 first token is a lone space that batch
+        # detokenization swallows; the following U+2581-prefixed token carries
+        # the real segment. The stream must reproduce "world", not " world".
+        spm_tok = NS(vocab={underscore: 0, underscore + "world": 1})
+        spm_ids = [0, 1]
+        assert batch_text(SPMStreamingDetokenizer(spm_tok), spm_ids) == "world"
+        assert stream_text(SPMStreamingDetokenizer(spm_tok), spm_ids) == "world"
+
+        # SPM without trimming keeps every boundary space in both paths: the
+        # lone U+2581 and the U+2581 on "world" each decode to a space.
+        spm_notrim = batch_text(
+            SPMStreamingDetokenizer(spm_tok, trim_space=False), spm_ids
+        )
+        assert spm_notrim == "  world"
+        assert (
+            stream_text(SPMStreamingDetokenizer(spm_tok, trim_space=False), spm_ids)
+            == "  world"
+        )
+
+        # BPE counter-example: the shared-helper narrowing must NOT touch BPE.
+        # ByteLevel marks a leading space with U+0120; BPE trims only the FIRST
+        # leading space, so " Hello world" becomes "Hello world" (the inner
+        # space before "world" is preserved) in both batch and stream paths.
+        g = "\u0120"
+        bpe_tok = NS(
+            vocab={g + "Hello": 0, g + "world": 1},
+            convert_ids_to_tokens=lambda i: {0: g + "Hello", 1: g + "world"}[i],
+        )
+        bpe_ids = [0, 1]
+        assert (
+            batch_text(BPEStreamingDetokenizer(bpe_tok, trim_space=True), bpe_ids)
+            == "Hello world"
+        )
+        assert (
+            stream_text(BPEStreamingDetokenizer(bpe_tok, trim_space=True), bpe_ids)
+            == "Hello world"
+        )
+
+        # BPE's default (trim_space=False) keeps the first space in both paths,
+        # unchanged by this fix.
+        assert batch_text(BPEStreamingDetokenizer(bpe_tok), bpe_ids) == " Hello world"
+        assert stream_text(BPEStreamingDetokenizer(bpe_tok), bpe_ids) == " Hello world"
 
     def test_run_batches_eight_streaming_requests(self, monkeypatch):
         gen, batches = _worker_setup(monkeypatch, steps=2)
