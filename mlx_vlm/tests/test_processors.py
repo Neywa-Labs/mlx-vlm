@@ -3055,6 +3055,44 @@ def test_invalid_calls(name, text, error):
             _weather_tools(zip="string", days="integer"),
         ),
         (
+            "glm47",
+            dict,
+            "write_file<arg_key>path</arg_key><arg_value>a.py</arg_value>"
+            "<arg_key>content</arg_key><arg_value>    return x\n</arg_value>",
+            _call("write_file", path="a.py", content="    return x\n"),
+            [
+                dict(
+                    type="function",
+                    function=dict(
+                        name="write_file",
+                        parameters=dict(
+                            type="object",
+                            properties=dict(
+                                path=dict(type="string"),
+                                content=dict(type="string"),
+                            ),
+                        ),
+                    ),
+                )
+            ],
+        ),
+        (
+            "glm47",
+            dict,
+            "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            "<arg_key>days</arg_key><arg_value>\n3\n</arg_value>",
+            _call("get_weather", city="Paris", days=3),
+            WEATHER_TOOLS,
+        ),
+        (
+            "glm47",
+            dict,
+            "write_file<arg_key>content</arg_key><arg_value>    return x\n</arg_value>"
+            "<arg_key>mode</arg_key><arg_value> 420 </arg_value>",
+            _call("write_file", content="    return x\n", mode=420),
+            None,
+        ),
+        (
             "qwen3_coder",
             dict,
             '<function=configure>\n<parameter=options>\n{"depth": 2}\n</parameter>\n'
@@ -3183,6 +3221,9 @@ def test_invalid_calls(name, text, error):
         "cohere-object",
         "cohere-array-escape",
         "glm-newline",
+        "glm-string-whitespace",
+        "glm-typed-whitespace",
+        "glm-untyped-whitespace",
         "qwen-untyped",
         "qwen-line-start-parameter-tag",
         "qwen-unclosed-last",
