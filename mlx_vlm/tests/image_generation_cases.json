@@ -448,6 +448,13 @@
     ],
     "local_variant": [
       {
+        "id": "flux-mixed-case-cache-snapshot",
+        "family": "flux2",
+        "path": "models--mlx-community--FLUX.2-Klein-4B-3bit/snapshots/hash",
+        "layout": false,
+        "expected": {"name": "flux2-klein-4b"}
+      },
+      {
         "id": "flux-9b",
         "family": "flux2",
         "metadata": {"transformer/config.json": {"num_layers": 8, "num_attention_heads": 32}},

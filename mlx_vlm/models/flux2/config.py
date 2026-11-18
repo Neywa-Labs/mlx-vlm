@@ -150,11 +150,12 @@ def get_variant(name: str | Flux2Variant = "flux2-klein-4b") -> Flux2Variant:
 
 def variant_from_local_path(model_path: str | Path) -> Flux2Variant:
     root = Path(model_path).expanduser()
-    name = root.name.lower()
+    name = root.name
     if root.parent.name == "snapshots" and root.parent.parent.name.startswith(
         "models--"
     ):
         name = root.parent.parent.name.removeprefix("models--").replace("--", "/")
+    name = name.lower()
     if "kv" in name or (root / "flux-2-klein-9b-kv.safetensors").exists():
         return VARIANTS["flux2-klein-9b-kv"]
     if "base" in name and "9b" in name:
