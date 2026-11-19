@@ -12,6 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from .._generation_stream import on_generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -612,10 +613,12 @@ def parse_arguments():
     )
     parser.add_argument(
         "--enable-thinking",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable thinking in the chat template. Templates that use "
-            "thinking_mode receive thinking_mode='enabled'."
+            "Enable or disable thinking in the chat template. When omitted, "
+            "use the model's template default. Templates that use thinking_mode "
+            "receive 'enabled' or 'disabled'."
         ),
     )
     parser.add_argument(
@@ -811,6 +814,7 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
 from .ar import generate_step
 
 
+@on_generation_stream
 def stream_generate(
     model: nn.Module,
     processor: ProcessorLike | PreTrainedTokenizer,
@@ -854,7 +858,8 @@ def stream_generate(
     thinking_start_token = kwargs.pop(
         "thinking_start_token", DEFAULT_THINKING_START_TOKEN
     )
-    enable_thinking = kwargs.pop("enable_thinking", False)
+    # With no override, track thinking only when a delimiter actually opens it.
+    enable_thinking = kwargs.pop("enable_thinking", None) is not False
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -1039,9 +1044,16 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        prompt_preopens_thinking = (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        prompt_preopens_thinking = False
+        for token_id in reversed(full_input_ids_list):
+            if token_id == thinking_start_token_id:
+                prompt_preopens_thinking = True
+                break
+            if token_id == thinking_end_token_id:
+                break
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=thinking_budget,
@@ -1507,7 +1519,9 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    chat_template_kwargs = {}
+    if args.enable_thinking is not None:
+        chat_template_kwargs["enable_thinking"] = args.enable_thinking
     if output_modality == "audio":
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
@@ -1556,7 +1570,8 @@ def main():
         kwargs.update(args.gen_kwargs)
 
     # Add thinking kwargs
-    kwargs["enable_thinking"] = args.enable_thinking
+    if args.enable_thinking is not None:
+        kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token
