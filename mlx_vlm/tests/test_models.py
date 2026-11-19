@@ -8083,3 +8083,220 @@ def test_ernie55_fp8_tail_blocks_use_shared_decoder():
         out["language_model.model.layers.0.attn.wq_a.weight"].astype(mx.float32),
         expected,
     )
+
+
+QWEN2_IMAGE_TOKEN = 31
+QWEN2_VIDEO_TOKEN = 30
+QWEN2_VISION_START = 28
+QWEN2_VISION_END = 29
+
+
+def _qwen2_mixed_model(model_name):
+    module = importlib.import_module("mlx_vlm.models." + model_name)
+    fields = model_case(f"TestGetInputEmbeddings.{model_name}_input_embeddings")[
+        "config"
+    ]
+    fields["video_token_id"] = QWEN2_VIDEO_TOKEN
+    fields["vision_start_token_id"] = QWEN2_VISION_START
+    if model_name == "qwen2_5_vl":
+        fields["vision_end_token_id"] = QWEN2_VISION_END
+        # The tiny case's window_size=14 gives a zero window unit
+        # (window_size // spatial_merge_size // patch_size); use one full window.
+        fields["vision_config"]["window_size"] = 28
+    config = build_config(module, fields)
+    mx.random.seed(23)
+    model = module.Model(config)
+    model.eval()
+    return model, config
+
+
+def _qwen2_media(config, grid, batch):
+    vc = config.vision_config
+    patch_width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+    pixels = mx.random.normal((batch * math.prod(grid), patch_width))
+    return pixels, mx.array([grid] * batch)
+
+
+def _qwen2_expected_embeds(model, ids, streams):
+    expected = model.language_model.model.embed_tokens(ids)
+    hidden = expected.shape[-1]
+    flat_ids = np.array(ids).reshape(-1)
+    flat = expected.reshape(-1, hidden)
+    for token_id, features in streams:
+        positions = mx.array(np.where(flat_ids == token_id)[0].astype(np.uint32))
+        flat[positions] = features
+    return flat.reshape(expected.shape)
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_mixed_prompt_embeds_both_modalities(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    image_grid, video_grid = (1, 2, 2), (2, 2, 2)
+    n_img = math.prod(image_grid) // config.vision_config.spatial_merge_size**2
+    n_vid = math.prod(video_grid) // config.vision_config.spatial_merge_size**2
+    rows = [
+        [1, QWEN2_VISION_START]
+        + [QWEN2_IMAGE_TOKEN] * n_img
+        + [QWEN2_VISION_END, QWEN2_VISION_START]
+        + [QWEN2_VIDEO_TOKEN] * n_vid
+        + [QWEN2_VISION_END, 2],
+        [1, QWEN2_VISION_START]
+        + [QWEN2_VIDEO_TOKEN] * n_vid
+        + [QWEN2_VISION_END, QWEN2_VISION_START]
+        + [QWEN2_IMAGE_TOKEN] * n_img
+        + [QWEN2_VISION_END, 3],
+    ]
+    ids = mx.array(rows)
+    image_pixels, image_thw = _qwen2_media(config, image_grid, batch=2)
+    video_pixels, video_thw = _qwen2_media(config, video_grid, batch=2)
+    result = model.get_input_embeddings(
+        ids,
+        pixel_values=image_pixels,
+        pixel_values_videos=video_pixels,
+        image_grid_thw=image_thw,
+        video_grid_thw=video_thw,
+    )
+    image_features = model.vision_tower(
+        image_pixels, image_thw, output_hidden_states=False
+    )
+    video_features = model.vision_tower(
+        video_pixels, video_thw, output_hidden_states=False
+    )
+    expected = _qwen2_expected_embeds(
+        model,
+        ids,
+        [(QWEN2_IMAGE_TOKEN, image_features), (QWEN2_VIDEO_TOKEN, video_features)],
+    )
+    np.testing.assert_allclose(
+        np.array(result.inputs_embeds), np.array(expected), atol=1e-5, rtol=1e-5
+    )
+    assert result.position_ids.shape == (3, 2, len(rows[0]))
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_video_only_prompt_keeps_video_features(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    video_grid = (2, 2, 2)
+    n_vid = math.prod(video_grid) // config.vision_config.spatial_merge_size**2
+    ids = mx.array(
+        [[1, QWEN2_VISION_START] + [QWEN2_VIDEO_TOKEN] * n_vid + [QWEN2_VISION_END, 2]]
+    )
+    video_pixels, video_thw = _qwen2_media(config, video_grid, batch=1)
+    result = model.get_input_embeddings(
+        ids, pixel_values_videos=video_pixels, video_grid_thw=video_thw
+    )
+    video_features = model.vision_tower(
+        video_pixels, video_thw, output_hidden_states=False
+    )
+    expected = _qwen2_expected_embeds(model, ids, [(QWEN2_VIDEO_TOKEN, video_features)])
+    np.testing.assert_allclose(
+        np.array(result.inputs_embeds), np.array(expected), atol=1e-5, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_image_only_prompt_keeps_image_features(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    image_grid = (1, 2, 2)
+    n_img = math.prod(image_grid) // config.vision_config.spatial_merge_size**2
+    ids = mx.array(
+        [[1, QWEN2_VISION_START] + [QWEN2_IMAGE_TOKEN] * n_img + [QWEN2_VISION_END, 2]]
+    )
+    image_pixels, image_thw = _qwen2_media(config, image_grid, batch=1)
+    result = model.get_input_embeddings(
+        ids, pixel_values=image_pixels, image_grid_thw=image_thw
+    )
+    image_features = model.vision_tower(
+        image_pixels, image_thw, output_hidden_states=False
+    )
+    expected = _qwen2_expected_embeds(model, ids, [(QWEN2_IMAGE_TOKEN, image_features)])
+    np.testing.assert_allclose(
+        np.array(result.inputs_embeds), np.array(expected), atol=1e-5, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_mixed_batch_row_without_video_tokens(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    image_grid, video_grid = (1, 2, 2), (2, 2, 2)
+    n_img = math.prod(image_grid) // config.vision_config.spatial_merge_size**2
+    n_vid = math.prod(video_grid) // config.vision_config.spatial_merge_size**2
+    rows = [
+        [1, QWEN2_VISION_START]
+        + [QWEN2_IMAGE_TOKEN] * n_img
+        + [QWEN2_VISION_END, QWEN2_VISION_START]
+        + [QWEN2_VIDEO_TOKEN] * n_vid
+        + [QWEN2_VISION_END, 2],
+        [1, QWEN2_VISION_START]
+        + [QWEN2_IMAGE_TOKEN] * n_img
+        + [QWEN2_VISION_END, 4, 5, 6, 7, 8],
+    ]
+    ids = mx.array(rows)
+    image_pixels, image_thw = _qwen2_media(config, image_grid, batch=2)
+    video_pixels, video_thw = _qwen2_media(config, video_grid, batch=1)
+    result = model.get_input_embeddings(
+        ids,
+        pixel_values=image_pixels,
+        pixel_values_videos=video_pixels,
+        image_grid_thw=image_thw,
+        video_grid_thw=video_thw,
+    )
+    image_features = model.vision_tower(
+        image_pixels, image_thw, output_hidden_states=False
+    )
+    video_features = model.vision_tower(
+        video_pixels, video_thw, output_hidden_states=False
+    )
+    expected = _qwen2_expected_embeds(
+        model,
+        ids,
+        [(QWEN2_IMAGE_TOKEN, image_features), (QWEN2_VIDEO_TOKEN, video_features)],
+    )
+    np.testing.assert_allclose(
+        np.array(result.inputs_embeds), np.array(expected), atol=1e-5, rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_mixed_prompt_validates_video_feature_count(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    image_grid, video_grid = (1, 2, 2), (2, 2, 2)
+    rows = [
+        [1, QWEN2_VISION_START, QWEN2_IMAGE_TOKEN, QWEN2_VISION_END]
+        + [QWEN2_VISION_START]
+        + [QWEN2_VIDEO_TOKEN] * 3
+        + [QWEN2_VISION_END],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    ]
+    ids = mx.array(rows)
+    image_pixels, image_thw = _qwen2_media(config, image_grid, batch=2)
+    video_pixels, video_thw = _qwen2_media(config, video_grid, batch=1)
+    with pytest.raises(ValueError, match="video token positions"):
+        model.get_input_embeddings(
+            ids,
+            pixel_values=image_pixels,
+            pixel_values_videos=video_pixels,
+            image_grid_thw=image_thw,
+            video_grid_thw=video_thw,
+        )
+
+
+@pytest.mark.parametrize("model_name", ["qwen2_vl", "qwen2_5_vl"])
+def test_qwen2_legacy_video_alias_with_pixel_values(model_name):
+    model, config = _qwen2_mixed_model(model_name)
+    video_grid = (2, 2, 2)
+    n_vid = math.prod(video_grid) // config.vision_config.spatial_merge_size**2
+    ids = mx.array(
+        [[1, QWEN2_VISION_START] + [QWEN2_VIDEO_TOKEN] * n_vid + [QWEN2_VISION_END, 2]]
+    )
+    video_pixels, video_thw = _qwen2_media(config, video_grid, batch=1)
+    result = model.get_input_embeddings(
+        ids, pixel_values=video_pixels, video_grid_thw=video_thw
+    )
+    video_features = model.vision_tower(
+        video_pixels, video_thw, output_hidden_states=False
+    )
+    expected = _qwen2_expected_embeds(model, ids, [(QWEN2_VIDEO_TOKEN, video_features)])
+    np.testing.assert_allclose(
+        np.array(result.inputs_embeds), np.array(expected), atol=1e-5, rtol=1e-5
+    )

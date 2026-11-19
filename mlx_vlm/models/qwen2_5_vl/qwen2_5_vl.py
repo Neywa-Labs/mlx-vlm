@@ -23,8 +23,10 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        mixed_modalities = pixel_values is not None and pixel_values_videos is not None
         if pixel_values is None:
-            pixel_values = kwargs.get("pixel_values_videos", None)
+            pixel_values = pixel_values_videos
 
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
@@ -48,22 +50,42 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         cached = kwargs.get("cached_image_features", None)
-        if cached is not None:
-            hidden_states = cached
-        else:
-            # Get the ouptut hidden states from the vision model
-            hidden_states = self.vision_tower(
-                pixel_values, grid_thw, output_hidden_states=False
+        if mixed_modalities and cached is None:
+            # Encode images and videos separately so each placeholder type
+            # receives its own visual features.
+            image_features = self.vision_tower(
+                pixel_values, image_grid_thw, output_hidden_states=False
             )
+            video_features = self.vision_tower(
+                pixel_values_videos.astype(dtype),
+                video_grid_thw,
+                output_hidden_states=False,
+            )
+            final_inputs_embeds = self.merge_input_ids_with_image_and_video_features(
+                self.config.image_token_id,
+                self.config.video_token_id,
+                image_features,
+                video_features,
+                inputs_embeds,
+                input_ids,
+            )
+        else:
+            if cached is not None:
+                hidden_states = cached
+            else:
+                # Get the ouptut hidden states from the vision model
+                hidden_states = self.vision_tower(
+                    pixel_values, grid_thw, output_hidden_states=False
+                )
 
-        # Insert special image tokens in the input_ids
-        final_inputs_embeds = self.merge_input_ids_with_image_features(
-            self.config.image_token_id,
-            self.config.video_token_id,
-            hidden_states,
-            inputs_embeds,
-            input_ids,
-        )
+            # Insert special image tokens in the input_ids
+            final_inputs_embeds = self.merge_input_ids_with_image_features(
+                self.config.image_token_id,
+                self.config.video_token_id,
+                hidden_states,
+                inputs_embeds,
+                input_ids,
+            )
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, image_grid_thw, video_grid_thw, mask
@@ -147,6 +169,78 @@ class Model(nn.Module):
             batch_outputs.append(batch_output)
 
         # Stack all batch outputs
+        return mx.stack(batch_outputs, axis=0)
+
+    @staticmethod
+    def merge_input_ids_with_image_and_video_features(
+        image_token_id,
+        video_token_id,
+        image_features,
+        video_features,
+        inputs_embeds,
+        input_ids,
+    ):
+        """Merge image and video features at their own placeholder positions.
+
+        Used for mixed-modality prompts: image features fill image tokens and
+        video features fill video tokens, each stream consumed in row order.
+
+        Args:
+            image_token_id: The token ID for image placeholders
+            video_token_id: The token ID for video placeholders
+            image_features: Vision features for images [num_image_features, hidden_dim]
+            video_features: Vision features for videos [num_video_features, hidden_dim]
+            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
+            input_ids: Input token IDs [batch_size, seq_len]
+
+        Returns:
+            Updated input embeddings with both feature types inserted
+        """
+        image_positions = input_ids == image_token_id
+        video_positions = input_ids == video_token_id
+        batch_size, seq_len = input_ids.shape
+
+        def scatter_row(row, token_mask, features, feature_start_idx, kind, batch_idx):
+            num_positions = mx.sum(token_mask).item()
+            if num_positions == 0:
+                return row, feature_start_idx
+            batch_features = features[
+                feature_start_idx : feature_start_idx + num_positions
+            ]
+            if batch_features.shape[0] != num_positions:
+                raise ValueError(
+                    f"Number of {kind} token positions ({num_positions}) does not match "
+                    f"number of {kind} features ({batch_features.shape[0]}) for batch {batch_idx}"
+                )
+            cumsum = mx.cumsum(token_mask.astype(mx.int32))
+            feature_indices = mx.where(token_mask, cumsum - 1, 0)
+            gathered_features = batch_features[feature_indices]
+            row = mx.where(mx.expand_dims(token_mask, axis=-1), gathered_features, row)
+            return row, feature_start_idx + num_positions
+
+        batch_outputs = []
+        image_start_idx = 0
+        video_start_idx = 0
+        for batch_idx in range(batch_size):
+            batch_output = inputs_embeds[batch_idx]
+            batch_output, image_start_idx = scatter_row(
+                batch_output,
+                image_positions[batch_idx],
+                image_features,
+                image_start_idx,
+                "image",
+                batch_idx,
+            )
+            batch_output, video_start_idx = scatter_row(
+                batch_output,
+                video_positions[batch_idx],
+                video_features,
+                video_start_idx,
+                "video",
+                batch_idx,
+            )
+            batch_outputs.append(batch_output)
+
         return mx.stack(batch_outputs, axis=0)
 
     @property
