@@ -150,6 +150,7 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self.offset = 0
         self._unflushed = ""
         self._byte_buffer = bytearray()
+        self._started = False
         self.text = ""
         self.tokens = []
 
@@ -163,6 +164,15 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
                 # If decoding fails, use replacement character
                 self._unflushed += self._byte_buffer.decode("utf-8", errors="replace")
             self._byte_buffer = bytearray()
+
+    def _flush_text(self):
+        text = self._unflushed.replace("\u2581", " ")
+        if text and not self._started:
+            self._started = True
+            if self.trim_space:
+                text = _remove_space(text)
+        self.text += text
+        self._unflushed = ""
 
     def add_token(self, token, skip_special_token_ids: List[int] = []):
         if token in skip_special_token_ids:
@@ -178,23 +188,14 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 
         v = self.tokenmap[token]
         if v and v[0] == "\u2581":
-            if self.text or not self.trim_space:
-                self.text += self._unflushed.replace("\u2581", " ")
-            else:
-                self.text = _remove_space(self._unflushed.replace("\u2581", " "))
+            self._flush_text()
             self._unflushed = v
         else:
             self._unflushed += v
 
     def finalize(self):
-        # Flush any remaining bytes
         self._flush_bytes()
-
-        if self.text or not self.trim_space:
-            self.text += self._unflushed.replace("\u2581", " ")
-        else:
-            self.text = _remove_space(self._unflushed.replace("\u2581", " "))
-        self._unflushed = ""
+        self._flush_text()
 
 
 class BPEStreamingDetokenizer(StreamingDetokenizer):
@@ -325,18 +326,9 @@ class _ServerTokenStreamer:
 
     def _emit_text(self, text: str) -> str:
         if text and not self._started:
-            if self._trim_space:
-                # Strip the leading SPM space artifact. A standalone "▁" token
-                # decodes to a lone " ", so trimming it leaves the chunk empty;
-                # in SPM mode stay unstarted so the space on the following token
-                # is also trimmed, matching SPMStreamingDetokenizer (which keeps
-                # self.text empty and defers the single-space trim to the first
-                # real segment). BPE instead trims only the first space, so it
-                # must flip _started here even when the trimmed chunk is empty.
-                text = _remove_space(text)
-                if not text and self._mode == "spm":
-                    return text
             self._started = True
+            if self._trim_space:
+                text = _remove_space(text)
         return text
 
     def _fallback_decode(self, token: int) -> str:
