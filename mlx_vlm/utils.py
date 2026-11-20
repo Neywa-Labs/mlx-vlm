@@ -8,6 +8,7 @@ import math
 import struct
 import warnings
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -23,6 +24,12 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
+from .load_progress import (
+    LoadingProgress,
+    ModelLoadCancelled,
+    ProgressCallback,
+    evaluate_model,
+)
 from .models.base import BaseImageProcessor
 from .quantization.checkpoint import (
     merge_quantization_configs,
@@ -40,6 +47,8 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "llava_onevision2": "mage_vl",
+    "muse_spark_open": "muse_spark",
     "nemotron_h_puzzle": "nemotron_h",
     "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
@@ -78,6 +87,9 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+
+# LiquidAI d1 decision checkpoints (D1Model) by their backbone's model_type
+D1_MODEL_TYPES = {"lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
 
 GENERATION_CONFIG_DEFAULT_KEYS = (
     "eos_token_id",
@@ -152,6 +164,7 @@ def skip_multimodal_module(path: str) -> bool:
         "sam_model",
         "audio_model",
         "audio_tower",
+        "embed_audio",
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
@@ -203,16 +216,37 @@ def get_model_type(config: dict) -> Optional[str]:
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    auto_model = str((config.get("auto_map") or {}).get("AutoModel", ""))
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or auto_model.endswith("D1Model")
+    ):
+        model_type = D1_MODEL_TYPES[model_type]
+
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
     if "Lfm2BidirectionalForMaskedLM" in architectures:
         model_type = "lfm2_encoder"
+    elif "RadioMBartPrefixForCausalLM" in architectures:
+        model_type = "nemotron_parse_v3_5"
     elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
+    elif model_type == "qwen3_5" and (
+        "Qwen3_5ForSequenceClassification" in architectures
+        or config.get("problem_type") == "single_label_classification"
+    ):
+        # Jev's source checkpoint declares a causal architecture despite having
+        # a two-class score head. Preserve the classification task when loading.
+        model_type = "minicpm_ocr_jev"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif "Gemma4DSparkModel" in architectures:
         model_type = "gemma4_dspark"
+    elif (
+        "Qwen3DSparkModel" in architectures
+        or config.get("speculators_model_type") == "dspark"
+    ):
+        model_type = "dspark"
     elif model_type == "lfm2_vl" and str(
         (config.get("auto_map") or {}).get("AutoModel", "")
     ).endswith("D1Model"):
@@ -324,6 +358,7 @@ def get_model_path(
     revision: Optional[str] = None,
     force_download: bool = False,
     allow_patterns: Optional[List[str]] = None,
+    local_files_only: bool = False,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -354,6 +389,7 @@ def get_model_path(
                     "*.jinja",
                 ],
                 force_download=force_download,
+                local_files_only=local_files_only,
             )
         )
     return model_path
@@ -362,6 +398,8 @@ def get_model_path(
 def load_model(
     model_path: Path,
     lazy: bool = False,
+    sharding_group: Optional[mx.distributed.Group] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     **kwargs,
 ) -> nn.Module:
     """
@@ -372,6 +410,11 @@ def load_model(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        sharding_group: Optional group passed to ``model.shard(group, weights=...)``
+            before conversion when the architecture supports checkpoint weights.
+            Call ``model.shard(group)`` afterwards to complete distributed loading.
+        progress_callback: Optional observer receiving measured stage snapshots.
+            Called synchronously on the loading thread; not passed to processors.
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
@@ -385,6 +428,8 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    report = LoadingProgress(model_path, progress_callback)
+    report("loading_checkpoint")
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -433,8 +478,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         raise FileNotFoundError(message)
 
     weights = {}
-    for wf in weight_files:
+    report("loading_checkpoint", completed_files=0, total_files=len(weight_files))
+    for index, wf in enumerate(weight_files):
         weights.update(_load_safetensors(wf))
+        report(
+            "loading_checkpoint",
+            completed_files=index + 1,
+            total_files=len(weight_files),
+        )
 
     model_class, _ = get_model_and_args(config=config, model_path=model_path)
 
@@ -460,6 +511,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     model = model_class.Model(model_config)
 
+    # Architectures accepting checkpoint weights can shard before conversion
+    # and stacking. Others retain the usual post-load model.shard(group) path.
+    shard = getattr(model, "shard", None)
+    if (
+        sharding_group is not None
+        and callable(shard)
+        and "weights" in inspect.signature(shard).parameters
+    ):
+        weights = shard(sharding_group, weights=weights)
+
     quantization_config = config.get("quantization_config", None)
     if quantization_config is None:
         quantization_config = config.get("text_config", {}).get(
@@ -468,6 +529,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         if quantization_config is not None:
             config["quantization_config"] = quantization_config
 
+    report("converting_weights")
     weights, transformed_quantization = transform_quantized_weights(
         weights, quantization_config
     )
@@ -489,7 +551,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             hf_quant_path = model_path / "hf_quant_config.json"
             if hf_quant_path.exists():
                 with open(hf_quant_path) as f:
-                    hf_quant = json.load(f).get("quantization", {})
+                    hf_metadata = json.load(f)
+                hf_quant = hf_metadata.get("quantization", {})
                 if hf_quant.get("quant_algo") == "NVFP4":
                     # nvfp4 implies group_size=16
                     config["quantization"] = config["quantization_config"] = {
@@ -497,6 +560,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                         "bits": 4,
                         "mode": "nvfp4",
                     }
+                elif hasattr(model, "quantization_from_metadata"):
+                    native_quantization = model.quantization_from_metadata(hf_metadata)
+                    if native_quantization is not None:
+                        config["quantization"] = config["quantization_config"] = (
+                            native_quantization
+                        )
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
@@ -508,6 +577,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method == "mxfp8":
+                # Preserve architecture metadata such as MiniMax's NVFP4 MoE
+                # layout while selecting MXFP8 for the remaining linear layers.
+                quantization = {
+                    **quantization_config,
+                    "group_size": 32,
+                    "bits": 8,
+                    "mode": "mxfp8",
+                }
             elif quant_method == "fp8":
                 from .fp8 import transform_fp8_weights
 
@@ -517,6 +595,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     from .models.deepseek_v4.language import make_quantization_config
 
                     quantization = make_quantization_config(model)
+            elif (
+                quant_method == "modelopt"
+                and quantization_config.get("quant_algo") == "NVFP4"
+            ):
+                # Some ModelOpt MoE exports use fused, underscore-delimited
+                # tensor names handled by the model's sanitizer below.
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"
@@ -540,6 +625,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
 
+    report("sanitizing_weights")
     weights = sanitize_weights(model, weights)
 
     if hasattr(model_class, "VisionModel"):
@@ -574,6 +660,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights,
         model_path,
         lazy=lazy,
+        progress_callback=report.update if progress_callback is not None else None,
         declared_keys=declared_keys,
         is_offload_dir=(model_path / "offload_index.json").exists(),
         **kwargs,
@@ -587,6 +674,7 @@ def load_model_weights(
     model_path: Path,
     *,
     lazy: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
     strict: bool = True,
     declared_keys: Optional[set] = None,
     is_offload_dir: bool = False,
@@ -597,6 +685,8 @@ def load_model_weights(
     Pass declared_keys for full checkpoints that may omit multimodal modules.
     Prepared drafters retain every module so strict loading detects missing weights.
     """
+    report = LoadingProgress(model_path, progress_callback)
+    report("installing_weights")
     if is_offload_dir:
         strict = False
     if (quantization := config.get("quantization", None)) is not None:
@@ -701,7 +791,7 @@ def load_model_weights(
         )
 
     if not lazy:
-        mx.eval(model.parameters())
+        evaluate_model(model, report.update if progress_callback is not None else None)
 
     model.model_path = model_path
     model.eval()
@@ -789,6 +879,8 @@ def load(
     lazy: bool = False,
     revision: Optional[str] = None,
     strict: bool = True,
+    sharding_group: Optional[mx.distributed.Group] = None,
+    progress_callback: Optional[ProgressCallback] = None,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -807,6 +899,14 @@ def load(
             a tag, or a commit hash. Default: ``None``.
         strict (bool): Whether or not to raise an exception if weights don't
             match. Default: ``True``.
+        sharding_group: Optional group for architecture-specific checkpoint
+            preparation before conversion. Passed only to the model loader;
+            callers still complete sharding with ``model.shard(group)``.
+        progress_callback: Optional callable receiving stage, elapsed time and
+            measured file/layer counts. Callbacks run on the loading thread.
+            ``loaded`` means model/processor loading finished; with lazy=True,
+            parameter evaluation is still deferred. ModelLoadCancelled reports
+            ``cancelled``; other exceptions report ``failed``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -818,25 +918,45 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    force_download = kwargs.get("force_download", False)
-    model_path = get_model_path(
-        path_or_hf_repo, force_download=force_download, revision=revision
-    )
-    model = load_model(model_path, lazy, strict=strict, **kwargs)
-    if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
-        model.eval()
+    report = LoadingProgress(path_or_hf_repo, progress_callback)
+    try:
+        report("resolving_model")
+        force_download = kwargs.get("force_download", False)
+        model_path = get_model_path(
+            path_or_hf_repo, force_download=force_download, revision=revision
+        )
+        model = load_model(
+            model_path,
+            lazy,
+            strict=strict,
+            sharding_group=sharding_group,
+            progress_callback=report.update if progress_callback is not None else None,
+            **kwargs,
+        )
+        if adapter_path is not None:
+            report("loading_adapter")
+            model = apply_lora_layers(model, adapter_path)
+            model.eval()
 
-    image_processor = load_image_processor(model_path, **kwargs)
+        report("loading_processor")
+        image_processor = load_image_processor(model_path, **kwargs)
 
-    # Get the eos_token_id from the model config
-    eos_token_id = getattr(model.config, "eos_token_id", None)
-
-    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
-
-    if image_processor is not None:
-        processor.image_processor = image_processor
-
+        # Get the eos_token_id from the model config
+        eos_token_id = getattr(model.config, "eos_token_id", None)
+        processor = load_processor(
+            model_path, True, eos_token_ids=eos_token_id, **kwargs
+        )
+        if image_processor is not None:
+            processor.image_processor = image_processor
+        if hasattr(model, "attach_processor"):
+            model.attach_processor(processor)
+        report("loaded", lazy=lazy)
+    except ModelLoadCancelled:
+        report("cancelled")
+        raise
+    except BaseException:
+        report("failed")
+        raise
     return model, processor
 
 
@@ -848,12 +968,12 @@ def sharded_load(
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
 
-    # Lazy load model to figure out what type of sharding we can do and which
-    # weights we need to download.
-    model = load_model(model_path, lazy=True, strict=False)
-    config = model.config.to_dict()
-
-    has_tensor_parallel = hasattr(model, "shard")
+    # Resolve the group before loading so architectures can select their weights
+    # before conversion and expert stacking.
+    architecture, _ = get_model_and_args(
+        config=load_config(model_path), model_path=model_path
+    )
+    has_tensor_parallel = hasattr(architecture.Model, "shard")
 
     if tensor_group is not None and not has_tensor_parallel:
         raise ValueError(
@@ -863,6 +983,9 @@ def sharded_load(
     if tensor_group is None and pipeline_group is None:
         if has_tensor_parallel:
             tensor_group = mx.distributed.init()
+
+    model = load_model(model_path, lazy=True, strict=False, sharding_group=tensor_group)
+    config = model.config.to_dict()
 
     processor = load_processor(
         model_path, True, eos_token_ids=config.get("eos_token_id", None)
@@ -904,7 +1027,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         dict: Model configuration
 
     Raises:
-        FileNotFoundError: If config.json is not found at the path
+        FileNotFoundError: If neither config.json nor params.json is found
     """
     if isinstance(model_path, str):
         model_path = get_model_path(
@@ -914,7 +1037,10 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         )
 
     try:
-        with open(model_path / "config.json", encoding="utf-8") as f:
+        config_file = (
+            "config.json" if (model_path / "config.json").exists() else "params.json"
+        )
+        with open(model_path / config_file, encoding="utf-8") as f:
             config = json.load(f)
 
         generation_config_file = model_path / "generation_config.json"
@@ -1230,10 +1356,15 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
+def load_image(
+    image_source: Union[str, Path, BytesIO, Image.Image],
+    timeout: int = 10,
+    *,
+    mode: str = "RGB",
+):
     """
     Helper function to load an image from either a URL, file path, data URI,
-    or BytesIO object.
+    or BytesIO object. Use mode="RGBA" to preserve transparency.
     """
     import base64
 
@@ -1269,13 +1400,17 @@ def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: in
         raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    return image.convert("RGB")
+    return image.convert(mode)
 
 
 def resize_image(img, max_size):
+    if max_size[0] <= 0 or max_size[1] <= 0:
+        raise ValueError("resize target dimensions must be positive")
 
     ratio = min(max_size[0] / img.width, max_size[1] / img.height)
-    new_size = (int(img.width * ratio), int(img.height * ratio))
+    # Extreme aspect ratios truncate one side to zero; PIL rejects 0-size
+    # images, so keep at least one pixel on each axis.
+    new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
     return img.resize(new_size)
 
 
@@ -1503,10 +1638,13 @@ def load_audio(
     else:
         audio, sample_rate = read_audio(file, dtype="float32")
 
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        source = file if isinstance(file, str) else "the audio data"
+        raise ValueError(f"Decoding {source} returned no samples")
     # Downmix before resampling: read_audio returns (samples, channels), and
     # resample_audio works on the last axis, so resampling stereo first would
     # resample the channel axis and leave the samples at the source rate.
-    audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sample_rate != sr:
@@ -1814,6 +1952,22 @@ def process_inputs_with_fallback(
         raise ValueError(f"Failed to process inputs with error: {e}")
 
 
+@lru_cache(maxsize=128)
+def _tokenizer_length_kwargs(cls):
+    try:
+        params = inspect.signature(cls.__call__).parameters.values()
+    except (TypeError, ValueError):
+        return set()
+
+    names = {"truncation", "max_length"}
+    if any(p.kind == p.VAR_KEYWORD for p in params):
+        return names
+
+    return names.intersection(
+        p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    )
+
+
 def prepare_inputs(
     processor,
     images=None,
@@ -1837,7 +1991,9 @@ def prepare_inputs(
     has_videos = videos is not None and (
         not hasattr(videos, "__len__") or len(videos) > 0
     )
-    if not has_images and not has_audio and not has_videos:
+    # prior speech given as codes still needs the processor to expand its placeholders
+    has_audio_out = kwargs.get("audio_out_codes") is not None
+    if not has_images and not has_audio and not has_videos and not has_audio_out:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1850,6 +2006,10 @@ def prepare_inputs(
             padding=padding,
             padding_side=padding_side,
             return_tensors=return_tensors,
+            **{
+                key: kwargs[key]
+                for key in kwargs.keys() & _tokenizer_length_kwargs(type(tokenizer))
+            },
         )
         input_ids = (
             inputs.input_ids
@@ -1876,9 +2036,8 @@ def prepare_inputs(
         )
         images = [process_image(img, resize_shape, image_processor) for img in images]
 
-        # For batching, we need uniform image sizes. Instead of padding to the
-        # largest image (which adds white borders that hurt accuracy), we resize
-        # all images to the model's expected input size.
+        # Use a fixed input size only when the processor declares dimensions.
+        # Otherwise pad to the largest image and let the processor size it.
         if len(images) > 1 and pad_to_uniform_size:
             # Get target size from image processor if available
             target_size = None
@@ -1887,7 +2046,9 @@ def prepare_inputs(
                 if isinstance(size, tuple):
                     target_size = size
                 elif isinstance(size, dict):
-                    target_size = (size.get("height", 384), size.get("width", 384))
+                    # Edge and pixel-area bounds are not fixed dimensions.
+                    if "height" in size and "width" in size:
+                        target_size = (size["height"], size["width"])
                 elif isinstance(size, int):
                     target_size = (size, size)
 

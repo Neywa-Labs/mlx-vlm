@@ -12,6 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from .._generation_stream import on_generation_stream
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -41,9 +42,11 @@ from .common import (
     DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
+from .three_d import run_3d_generation_cli
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
@@ -94,7 +97,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text, an image, a video, or audio with a supported model."
+        description="Generate text, images, video, audio, or 3D with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -105,18 +108,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image", "video", "audio"),
+        choices=("text", "image", "video", "audio", "3d"),
         default="text",
         help=(
             "Generate text with a VLM, an image with a supported image model, "
-            "a video with a supported video model, or speech with an omni model."
+            "a video, speech with an omni model, or 3D Gaussian splats from an image."
         ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image, video, or audio generation (.wav for audio).",
+        help="Output path for image, video, audio (.wav), or 3D (.ply) generation.",
     )
     parser.add_argument(
         "--ref-audio",
@@ -146,7 +149,7 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Number of inference steps. Uses the model default for images "
+            "Number of inference steps. Uses the model default for images and 3D "
             f"and {DEFAULT_VIDEO_STEPS} for videos when omitted."
         ),
     )
@@ -194,7 +197,7 @@ def parse_arguments():
         "--guidance",
         type=float,
         default=None,
-        help="Classifier-free guidance for image generation/editing.",
+        help="Classifier-free guidance for image generation/editing or 3D generation.",
     )
     parser.add_argument(
         "--prompt-expansion-model",
@@ -202,7 +205,7 @@ def parse_arguments():
         default=None,
         help=(
             "Prompt expansion model path or Hugging Face repo. Overrides the "
-            "Flux3 upsampler, or enables Ideogram 4 JSON caption expansion."
+            "Flux3 or MiniMax-H3-Image upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(
@@ -389,21 +392,25 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling. Zero is greedy; positive values below 0.01 are clamped to 0.01.",
+        default=None,
+        help="Temperature for sampling. Defaults to the checkpoint setting, "
+        f"or {DEFAULT_TEMPERATURE} if unset. Zero is greedy; positive values below "
+        "0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=DEFAULT_TOP_P,
+        default=None,
         help="Nucleus sampling: keep the smallest set of tokens whose "
-        "probabilities sum to this. 1.0 disables it.",
+        "probabilities sum to this. 1.0 disables it. Defaults to the checkpoint "
+        f"setting, or {DEFAULT_TOP_P} if unset.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=DEFAULT_TOP_K,
-        help="Keep only the k most probable tokens. 0 disables it.",
+        default=None,
+        help="Keep only the k most probable tokens. 0 disables it. Defaults "
+        f"to the checkpoint setting, or {DEFAULT_TOP_K} if unset.",
     )
     parser.add_argument(
         "--min-p",
@@ -606,10 +613,12 @@ def parse_arguments():
     )
     parser.add_argument(
         "--enable-thinking",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable thinking in the chat template. Templates that use "
-            "thinking_mode receive thinking_mode='enabled'."
+            "Enable or disable thinking in the chat template. When omitted, "
+            "use the model's template default. Templates that use thinking_mode "
+            "receive 'enabled' or 'disabled'."
         ),
     )
     parser.add_argument(
@@ -619,6 +628,17 @@ def parse_arguments():
         help=(
             "Set the chat-template thinking mode when supported. "
             "Choices: enabled, disabled, adaptive."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        default=None,
+        help=(
+            "Reasoning effort forwarded to the chat template (for example "
+            "low, medium, high). Templates that use reasoning_strength "
+            "receive the same value, matching the server's reasoning_effort "
+            "handling. When omitted, the template default is left untouched."
         ),
     )
     parser.add_argument(
@@ -794,6 +814,7 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
 from .ar import generate_step
 
 
+@on_generation_stream
 def stream_generate(
     model: nn.Module,
     processor: ProcessorLike | PreTrainedTokenizer,
@@ -837,7 +858,8 @@ def stream_generate(
     thinking_start_token = kwargs.pop(
         "thinking_start_token", DEFAULT_THINKING_START_TOKEN
     )
-    enable_thinking = kwargs.pop("enable_thinking", False)
+    # With no override, track thinking only when a delimiter actually opens it.
+    enable_thinking = kwargs.pop("enable_thinking", None) is not False
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -860,6 +882,14 @@ def stream_generate(
     )
 
     if is_diffusion_model(model, kwargs):
+        kwargs["temperature"], kwargs["top_p"], kwargs["top_k"] = (
+            resolve_sampling_defaults(
+                model.config,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                top_k=kwargs.get("top_k"),
+            )
+        )
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
@@ -1014,9 +1044,16 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        prompt_preopens_thinking = (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        prompt_preopens_thinking = False
+        for token_id in reversed(full_input_ids_list):
+            if token_id == thinking_start_token_id:
+                prompt_preopens_thinking = True
+                break
+            if token_id == thinking_end_token_id:
+                break
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=thinking_budget,
@@ -1049,7 +1086,7 @@ def stream_generate(
             exact_checkpoint_lengths = [
                 n - reused_prefix_len
                 for n in apc_coordinator.checkpoint_lengths(
-                    full_input_ids_list, multimodal_token_ids
+                    full_input_ids_list, multimodal_token_ids, extra_hash=apc_extra_hash
                 )
                 if n > reused_prefix_len
             ]
@@ -1087,7 +1124,7 @@ def stream_generate(
             generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            if thinking_criteria is not None and kwargs.get("draft_model") is None:
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
@@ -1199,7 +1236,9 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
+       temperature (float, optional): Sampling temperature. Unset temperature,
+           top_p, and top_k use the checkpoint defaults, then 0.0, 1.0, and 0.
+           An explicit temperature overrides the checkpoint's do_sample flag.
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
@@ -1320,6 +1359,9 @@ def main():
     if output_modality == "video":
         run_video_generation_cli(args)
         return
+    if output_modality == "3d":
+        run_3d_generation_cli(args)
+        return
     if output_modality == "audio":
         if getattr(args, "output", None) is None:
             raise ValueError(
@@ -1368,6 +1410,12 @@ def main():
         max_kv_size=args.max_kv_size,
     )
     config = model.config
+    args.temperature, args.top_p, args.top_k = resolve_sampling_defaults(
+        config,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
 
     draft_model = None
     if args.draft_model is not None:
@@ -1471,11 +1519,17 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    chat_template_kwargs = {}
+    if args.enable_thinking is not None:
+        chat_template_kwargs["enable_thinking"] = args.enable_thinking
     if output_modality == "audio":
         chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
+    if args.reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
+        # Muse Glimmer's chat template reads the reasoning_strength alias.
+        chat_template_kwargs["reasoning_strength"] = args.reasoning_effort
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
@@ -1516,7 +1570,8 @@ def main():
         kwargs.update(args.gen_kwargs)
 
     # Add thinking kwargs
-    kwargs["enable_thinking"] = args.enable_thinking
+    if args.enable_thinking is not None:
+        kwargs["enable_thinking"] = args.enable_thinking
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

@@ -1,9 +1,8 @@
-import gc
 import logging
 import os
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -29,13 +28,21 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
     DEFAULT_TOP_P,
     BatchGenerator,
     _make_cache,
+    wired_limit,
 )
+from ..generate.common import DiffusionRNG, generation_stream
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from ..load_progress import ModelLoadCancelled
+from ..models.cache import cache_nbytes
 from ..sample_utils import (
+    apply_p_less,
     apply_top_k,
+    apply_top_n_sigma,
+    apply_top_p,
+    apply_typical_p,
     clamp_temperature,
     make_logits_processors,
     make_sampler,
@@ -47,6 +54,7 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from ..vision_cache import processed_image_key
 from .runtime import runtime
+from .sessions import DecodeProgress, InferenceSession
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -55,6 +63,7 @@ DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+_DRAFT_BLOCK_SIZE_FROM_ENV = object()
 
 
 class PromptTooLongError(ValueError):
@@ -64,6 +73,27 @@ class PromptTooLongError(ValueError):
 def _get_draft_block_size_from_env():
     draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
     return int(draft_block_size_str) if draft_block_size_str else None
+
+
+def load_local_drafter(target, path, kind, block_size):
+    """Load a local drafter, retaining autoregressive fallback on incompatibility."""
+    path = path or os.environ.get("MLX_VLM_DRAFT_MODEL")
+    kind = kind or os.environ.get("MLX_VLM_DRAFT_KIND")
+    if not path:
+        return None, None
+    from ..speculative.drafters import load_drafter, validate_drafter_compatibility
+
+    draft, resolved_kind = load_drafter(path, kind=kind)
+    try:
+        validate_drafter_compatibility(target, draft, resolved_kind)
+    except ValueError as exc:
+        logger.warning(
+            "Speculative drafter is incompatible with the target model; "
+            "falling back to autoregressive generation: %s",
+            exc,
+        )
+        return None, None
+    return draft, resolved_kind
 
 
 def _notify_queues(queues, *items):
@@ -164,18 +194,33 @@ class _PositionedTargetSampler:
         top_p: float,
         top_k: int = 0,
         seed: Optional[int],
+        top_n_sigma: float = 0,
+        p_less: bool = False,
+        typical_p: float = 1,
     ):
         self.temperature = clamp_temperature(float(temperature))
         self.top_p = float(top_p)
         self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
+        self.top_n_sigma, self.p_less, self.typical_p = top_n_sigma, p_less, typical_p
+        # Match _make_sampler: special filters use make_sampler's unscaled
+        # top-p before top-k; ordinary sampling uses temperature-scaled top-p.
+        self._top_p_after_temperature = not (top_n_sigma > 0 or p_less or typical_p < 1)
 
-    def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+    def _apply_filters(self, logprobs: mx.array) -> mx.array:
+        if self.top_n_sigma > 0:
+            logprobs = apply_top_n_sigma(logprobs, self.top_n_sigma)
+        elif self.p_less:
+            logprobs = apply_p_less(logprobs, self.temperature)
+        elif self.typical_p < 1:
+            logprobs = apply_typical_p(logprobs, self.typical_p)
+        if not self._top_p_after_temperature and 0 < self.top_p < 1:
+            logprobs = apply_top_p(logprobs, self.top_p)
         return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        logprobs = self._apply_top_k(logprobs)
-        if self.top_p > 0 and self.top_p < 1.0:
+        logprobs = self._apply_filters(logprobs)
+        if self._top_p_after_temperature and 0 < self.top_p < 1:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
 
@@ -188,9 +233,9 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
-        logprobs = self._apply_top_k(logprobs)
+        logprobs = self._apply_filters(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
+        if self._top_p_after_temperature and 0 < self.top_p < 1:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
@@ -514,6 +559,7 @@ def _build_metrics_envelope(
     token_times: Optional[List[float]] = None,
     prompt_tps: Optional[float] = None,
     generation_tps: Optional[float] = None,
+    decode_elapsed_s: Optional[float] = None,
     peak_memory_gb: Optional[float] = None,
     finish_reason: Optional[str] = None,
     image_count: int = 0,
@@ -525,9 +571,10 @@ def _build_metrics_envelope(
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
-    decode_elapsed_s = _decode_elapsed_from_metrics(
-        token_times, generated_tokens, generation_tps
-    )
+    if decode_elapsed_s is None:
+        decode_elapsed_s = _decode_elapsed_from_metrics(
+            token_times, generated_tokens, generation_tps
+        )
     decode_tok_s = None
     if generation_tps is not None and generation_tps > 0:
         decode_tok_s = generation_tps
@@ -571,7 +618,9 @@ def _build_metrics_envelope(
     }
 
 
-def load_model_resources(model_path: str, adapter_path: Optional[str]):
+def load_model_resources(
+    model_path: str, adapter_path: Optional[str], *, progress_callback=None
+):
     """
     Loads model, processor, and config based on paths.
     Handles potential loading errors.
@@ -584,16 +633,36 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
-        model, processor = load(
-            model_path,
-            adapter_path,
-            trust_remote_code=trust_remote_code,
-            expert_cache_gb=get_expert_cache_gb(),
-            max_kv_size=get_configured_context_limit(),
+        progress_kwargs = (
+            {"progress_callback": progress_callback}
+            if progress_callback is not None
+            else {}
         )
+        if runtime.distributed_worker is not None:
+            model, processor = runtime.distributed_worker.load(
+                model_path,
+                adapter_path,
+                trust_remote_code=trust_remote_code,
+                **progress_kwargs,
+            )
+        else:
+            model, processor = load(
+                model_path,
+                adapter_path,
+                trust_remote_code=trust_remote_code,
+                expert_cache_gb=get_expert_cache_gb(),
+                max_kv_size=get_configured_context_limit(),
+                **progress_kwargs,
+            )
+        if hasattr(model, "system_one"):
+            from ..models.d1_lfm3_vl.d1 import REFUSAL
+
+            raise ValueError(REFUSAL)
         config = model.config
         logger.info("Model and processor loaded successfully.")
         return model, processor, config
+    except ModelLoadCancelled:
+        raise
     except Exception as e:
         logger.exception("Error loading model %s: %s", model_path, e)
         raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
@@ -653,6 +722,10 @@ class GenerationArguments:
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     resize_shape: Optional[Tuple[int, int]] = None
+    # Internal rendered boundary, never accepted as an unchecked token offset.
+    cache_prefix: Optional[str] = None
+    cache_checkpoint_len: int = 0
+    emit_prompt_progress: bool = False
 
     def __post_init__(self):
         self.temperature = clamp_temperature(self.temperature)
@@ -782,6 +855,7 @@ class QueuedGenerationRequest:
     apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
+    session: Optional[InferenceSession] = None
 
 
 @dataclass
@@ -797,6 +871,7 @@ class GenerationMetrics:
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
     first_chunk_tokens: int = 0
+    decode_progress: Optional[DecodeProgress] = None
     draft_kind: Optional[str] = None
     draft_rounds: Optional[int] = None
     draft_n_accepted: Optional[int] = None
@@ -822,11 +897,18 @@ class GenerationMetrics:
                 self.last_chunk_rate = emitted_tokens / (now - self.last_chunk_at)
             self.last_chunk_at = now
             self.token_times.append(now)
+        progress = getattr(chunk, "decode_progress", None)
+        if progress is not None:
+            self.decode_progress = progress
+            self.generated_tokens = progress.tokens
+            self.last_chunk_rate = progress.chunk_rate if emitted_tokens else None
         self.record_result(chunk)
         return self.last_chunk_rate
 
     @property
     def rate(self) -> Optional[float]:
+        if self.decode_progress is not None:
+            return self.decode_progress.rate
         if len(self.token_times) < 2:
             return None
         elapsed = self.token_times[-1] - self.token_times[0]
@@ -883,6 +965,7 @@ class StreamingToken:
     cached_tokens: int = 0
     token_count: int = 1
     emitted_at: Optional[float] = None
+    prompt_progress: Optional[dict] = None
 
 
 class _DiffusionBlockEmitter:
@@ -1027,8 +1110,12 @@ class ResponseGenerator:
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
+        load_progress_callback=None,
+        draft_block_size=_DRAFT_BLOCK_SIZE_FROM_ENV,
+        draft_loader=load_local_drafter,
     ):
         self.model_path = model_path
+        self.load_progress_callback = load_progress_callback
         self.adapter_path = adapter_path
         self.model = None
         self.processor = None
@@ -1037,6 +1124,8 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model_path = draft_model_path
         self.draft_kind_override = draft_kind
+        self.draft_block_size = draft_block_size
+        self.draft_loader = draft_loader
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1118,9 +1207,14 @@ class ResponseGenerator:
                 pass
 
     def _initialize_model(self):
+        callback = getattr(self, "load_progress_callback", None)
         model, processor, config = load_model_resources(
-            self.model_path, self.adapter_path
+            self.model_path,
+            self.adapter_path,
+            **({"progress_callback": callback} if callback is not None else {}),
         )
+        if callback is not None:
+            callback({"stage": "initializing_generator"})
 
         stop_tokens = set(
             resolve_eos_token_ids(
@@ -1131,42 +1225,34 @@ class ResponseGenerator:
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
-        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = self.draft_model_path or os.environ.get(
-            "MLX_VLM_DRAFT_MODEL"
-        )
+        draft_kind = self.draft_kind_override
+        draft_model_path = self.draft_model_path
+        draft_loader = getattr(self, "draft_loader", load_local_drafter)
         if draft_model_path:
-            from ..speculative.drafters import (
-                load_drafter,
-                validate_drafter_compatibility,
-            )
-
+            if callback is not None:
+                callback({"stage": "loading_draft", "draft_model": draft_model_path})
             logger.info(
                 "Loading speculative drafter (%s): %s",
                 draft_kind or "auto",
                 draft_model_path,
             )
-            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
-            if draft_kind is None:
+        if draft_loader is not None:
+            draft_model, resolved_kind = draft_loader(
+                model,
+                draft_model_path,
+                draft_kind,
+                self._effective_draft_block_size(),
+            )
+            if draft_model is not None and draft_kind is None:
                 logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
-            elif resolved_kind != draft_kind:
+            elif draft_model is not None and resolved_kind != draft_kind:
                 logger.warning(
                     "Drafter requires draft kind %s; using it instead of %s.",
                     resolved_kind,
                     draft_kind,
                 )
             draft_kind = resolved_kind
-            try:
-                validate_drafter_compatibility(model, draft_model, draft_kind)
-            except ValueError as e:
-                logger.warning(
-                    "Speculative drafter is incompatible with the target model; "
-                    "falling back to autoregressive generation: %s",
-                    e,
-                )
-                draft_model = None
-                draft_kind = None
-            else:
+            if draft_model is not None:
                 logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model
@@ -1183,6 +1269,14 @@ class ResponseGenerator:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
 
+    def _effective_draft_block_size(self):
+        size = getattr(self, "draft_block_size", _DRAFT_BLOCK_SIZE_FROM_ENV)
+        return (
+            _get_draft_block_size_from_env()
+            if size is _DRAFT_BLOCK_SIZE_FROM_ENV
+            else size
+        )
+
     def generate(
         self,
         prompt: str,
@@ -1190,16 +1284,21 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
+        session: Optional[InferenceSession] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        if (
+            session is not None
+            and is_diffusion_model(self.model)
+            and not callable(
+                getattr(self.model.language_model, "generate_blocks", None)
+            )
+        ):
+            raise ValueError("This diffusion model does not expose resumable blocks.")
         if self.draft_model is not None and args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
-            )
-        if self.draft_model is not None and args.thinking_budget is not None:
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
@@ -1212,6 +1311,15 @@ class ResponseGenerator:
             raw_inputs = self._preprocess_request(
                 prompt, images, audio, videos, **args.preprocessing_kwargs()
             )
+            args.cache_checkpoint_len = 0
+            if args.cache_prefix and not (images or audio or videos):
+                prefix_inputs = self._preprocess_request(args.cache_prefix)
+                full_ids = raw_inputs["input_ids"].reshape(-1).tolist()
+                prefix_ids = prefix_inputs["input_ids"].reshape(-1).tolist()
+                for actual, expected in zip(full_ids, prefix_ids):
+                    if actual != expected:
+                        break
+                    args.cache_checkpoint_len += 1
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
@@ -1238,6 +1346,15 @@ class ResponseGenerator:
             )
 
         request_id = f"{id(rqueue):x}"
+        if runtime.distributed_worker is not None:
+            from .distributed_schedule import request_scope
+
+            scope = request_scope.get()
+            if scope is None:
+                raise ValueError(
+                    "Distributed generation requires a coordinator request ID"
+                )
+            request_id = scope.next_id()
         queued_request = QueuedGenerationRequest(
             rqueue=rqueue,
             raw_inputs=raw_inputs,
@@ -1250,6 +1367,7 @@ class ResponseGenerator:
             apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
             queued_at=request_started_at,
+            session=session,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1267,6 +1385,10 @@ class ResponseGenerator:
         ctx = rqueue.get()
         if isinstance(ctx, Exception):
             raise ctx
+
+        if session is not None:
+            session.context = ctx
+            return ctx, session.reader(timeout=get_token_queue_timeout())
 
         return ctx, _TokenIterator(
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
@@ -1331,10 +1453,31 @@ class ResponseGenerator:
             "queued_at": request.queued_at,
             "prefill_started_at": now,
             "prefill_processed": -1,
+            "emit_prompt_progress": request.args.emit_prompt_progress,
+            "prompt_tokens": request.prompt_tokens,
             "generated_tokens": 0,
             "decode_started_at": None,
             "last_token_at": None,
         }
+
+    @staticmethod
+    def _emit_prompt_progress(info, status, processed, total):
+        queue = info.get("rqueue")
+        if queue is not None and info.get("emit_prompt_progress", False):
+            queue.put(
+                StreamingToken(
+                    text="",
+                    token=0,
+                    logprobs=0,
+                    finish_reason=None,
+                    token_count=0,
+                    prompt_progress={
+                        "status": status,
+                        "processed_tokens": int(processed),
+                        "total_tokens": int(total),
+                    },
+                )
+            )
 
     def _log_prefill_progress(self, batch_gen, active: dict) -> None:
         """Report each chunked-prefill step without changing generation output."""
@@ -1375,6 +1518,7 @@ class ResponseGenerator:
             if processed <= int(info.get("prefill_processed", -1)):
                 continue
             info["prefill_processed"] = processed
+            self._emit_prompt_progress(info, "in_progress", processed, total)
             percent = 100.0 * processed / total if total > 0 else 100.0
             logger.info(
                 "Prefill progress: request=%s tokens=%d/%d (%.1f%%)",
@@ -1393,6 +1537,9 @@ class ResponseGenerator:
         if prompt_time <= 0 and prompt_tps > 0:
             prompt_time = prompt_tokens / prompt_tps
         info["prefill_processed"] = prompt_tokens
+        ResponseGenerator._emit_prompt_progress(
+            info, "completed", prompt_tokens, prompt_tokens
+        )
         logger.info(
             "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
             "elapsed=%.3fs rate=%.1f tok/s",
@@ -1413,7 +1560,13 @@ class ResponseGenerator:
         finish_reason: Optional[str],
         token_count: int = 1,
     ) -> float:
-        now = time.perf_counter()
+        emitted_at = time.perf_counter()
+        session = info.get("rqueue")
+        now = (
+            session.generation_time
+            if isinstance(session, InferenceSession)
+            else emitted_at
+        )
         previous_tokens = int(info.get("generated_tokens", 0) or 0)
         emitted_tokens = max(0, int(token_count or 0))
         generated_tokens = previous_tokens + emitted_tokens
@@ -1436,7 +1589,7 @@ class ResponseGenerator:
             logger.info(
                 "Decode started: request=%s time_to_first_token=%.3fs",
                 request_id,
-                max(0.0, now - queued_at),
+                max(0.0, emitted_at - queued_at),
             )
 
         elapsed = max(0.0, now - decode_started_at)
@@ -1483,11 +1636,23 @@ class ResponseGenerator:
                 elapsed,
                 progress_rate_text,
             )
-        return now
+        return emitted_at
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+        if runtime.distributed_worker is not None:
+            # Every rank draws from identical row/position keys, including
+            # special filters which otherwise use process-global RNG state.
+            return _PositionedTargetSampler(
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                seed=args.seed,
+                top_n_sigma=args.top_n_sigma,
+                p_less=args.p_less,
+                typical_p=args.typical_p,
+            )
         if args.top_n_sigma > 0:
             return make_sampler(
                 temp=args.temperature,
@@ -1714,6 +1879,10 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
+            self._stop = True
+            wire_context = getattr(self, "_wire_context", None)
+            if wire_context is not None:
+                wire_context.__exit__(None, None, None)
             try:
                 # The worker can outlive stop_and_join's timeout. Retire its
                 # disk writer only after its final request/store has finished.
@@ -1723,12 +1892,259 @@ class ResponseGenerator:
             except Exception:
                 logger.exception("Error closing APC after generation worker shutdown")
             finally:
+                # The worker can finish after an unload timeout. Release its
+                # model owners before clearing Metal's allocator cache.
+                self.model = self.processor = self.tokenizer = self.draft_model = None
+                self.apc_manager = None
                 clear_mlx_streams()
+                mx.clear_cache()
+
+    def _start_batch_request(self, request, batch_gen, active, generation_stream):
+        rqueue = request.rqueue
+        raw_inputs = request.raw_inputs
+        prompt_tokens = request.prompt_tokens
+        args = request.args
+        images = request.images
+        log_state = self._log_prefill_started(request, backend="continuous_batching")
+        if batch_gen is None:
+            batch_gen = BatchGenerator(
+                self.model.language_model,
+                self.processor,
+                stop_tokens=self.stop_tokens,
+                sampler=self._make_sampler(args),
+                kv_bits=self.kv_bits,
+                kv_key_bits=getattr(self, "kv_key_bits", None),
+                kv_value_bits=getattr(self, "kv_value_bits", None),
+                kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                kv_value_scheme=getattr(self, "kv_value_scheme", None),
+                kv_group_size=self.kv_group_size,
+                kv_quant_scheme=self.kv_quant_scheme,
+                quantized_kv_start=self.quantized_kv_start,
+                compute_logprobs=bool(args.logprobs),
+                top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
+                stream=generation_stream,
+                manage_wired_limit=False,
+                apc_manager=self.apc_manager,
+                draft_model=self.draft_model,
+                draft_kind=self.draft_kind,
+                draft_block_size=self._effective_draft_block_size(),
+                greedy_sampling=args.temperature == 0,
+                prefill_step_size=self._effective_prefill_step_size(),
+            )
+
+        # Vision encoder runs on the GPU thread; text tokenization
+        # already happened on the caller thread.
+        coordinator = getattr(batch_gen, "apc", None)
+        if coordinator is not None:
+            coordinator.prepare_prefill(
+                prompt_tokens,
+                prefill_step_size=self._effective_prefill_step_size(),
+            )
+        input_ids, gen_kwargs = self._gpu_embed(
+            raw_inputs,
+            images,
+            apc_semantic_hash=request.apc_semantic_hash,
+        )
+        has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+        if args.cache_checkpoint_len:
+            gen_kwargs["_apc_checkpoint_len"] = args.cache_checkpoint_len
+        # Preserve tenant isolation for manually queued requests
+        # that predate server-side semantic hash computation.
+        if request.apc_semantic_hash is None and getattr(args, "tenant_id", None):
+            gen_kwargs["_apc_tenant"] = args.tenant_id
+
+        # Drain pending text-only prompts before inserting an
+        # embed-bearing request — multi-row PromptProcessingBatch
+        # admission expects all rows to carry inputs_embeds (the
+        # mixed APC path concatenates them per-row).
+        if has_embeds and any(
+            not (s[3] and s[3].get("inputs_embeds") is not None)
+            for s in batch_gen.unprocessed_prompts
+        ):
+            self._flush(batch_gen, active)
+
+        try:
+            thinking_budget_criteria = request.thinking_budget_criteria
+            # Cancellation IDs must be unique across compatible batch groups.
+            batch_gen.uid_count = getattr(self, "_next_request_uid", 0)
+            (uid,) = batch_gen.insert(
+                [input_ids.squeeze(0).tolist()],
+                max_tokens=args.max_tokens,
+                prompt_kwargs=[gen_kwargs],
+                logits_processors=[self._make_logits_processors(args, input_ids)],
+                thinking_budget_criteria=[thinking_budget_criteria],
+                resumable=request.session is not None,
+            )
+            self._next_request_uid = batch_gen.uid_count
+        except Exception as e:
+            scheduler = getattr(self, "distributed_schedule", None)
+            if scheduler is not None:
+                scheduler.fail(e)
+            rqueue.put(e)
+            return batch_gen
+
+        rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+        active[uid] = {
+            "rqueue": request.session or rqueue,
+            "streamer": _ServerTokenStreamer(
+                self.tokenizer,
+                make_streaming_detokenizer(self.processor),
+            ),
+            "gen_kwargs": gen_kwargs if has_embeds else None,
+            "prompt_tps": None,
+            "cached_tokens": 0,
+            "spec_snapshot": (
+                speculative_stats_snapshot(self.draft_model)
+                if self.draft_model is not None
+                else None
+            ),
+            **log_state,
+        }
+        self._emit_prompt_progress(active[uid], "started", 0, prompt_tokens)
+        return batch_gen
+
+    def _batch_key(self, request):
+        """Only combine requests with compatible sampling and output settings."""
+        args = request.args
+        key = tuple(
+            getattr(args, name)
+            for name in (
+                "temperature",
+                "top_p",
+                "top_k",
+                "seed",
+                "top_n_sigma",
+                "p_less",
+                "typical_p",
+                "logprobs",
+            )
+        )
+        # DFlash and MTP own extractable per-row state. Other speculative iterators
+        # still require a dedicated group to retain their generator closure.
+        if (
+            self.draft_model is not None
+            and request.session is not None
+            and self.draft_kind not in ("dflash", "mtp")
+        ):
+            key += (id(request.session),)
+        return key
+
+    @staticmethod
+    def _checkpoint_bytes(checkpoint, info):
+        return cache_nbytes(
+            [
+                getattr(checkpoint, "prompt_cache", checkpoint),
+                getattr(checkpoint, "hidden", None),
+                getattr(checkpoint, "shared_kv_states", None),
+                getattr(checkpoint, "prompt_tokens", None),
+                getattr(checkpoint, "_batch_state", None),
+                info.get("gen_kwargs"),
+            ]
+        )
+
+    def _schedule_continuations(self, groups, suspended, capacity, decisions=None):
+        """Detach paused rows; readmit ready checkpoints within the shared limit."""
+        for key, (engine, active) in groups.items():
+            for uid, info in list(active.items()):
+                session = info["rqueue"]
+                if not isinstance(session, InferenceSession):
+                    continue
+                try:
+                    if decisions is None:
+                        session.check()
+                        paused = session.paused
+                    else:
+                        paused, error = decisions[session]
+                        if error:
+                            raise ValueError(error)
+                    if not paused:
+                        session.distributed_state = "running"
+                        continue
+                    checkpoint = engine.suspend(uid)
+                    session.distributed_state = "paused"
+                    suspended[session] = (key, checkpoint, uid, info)
+                    del active[uid]
+                except Exception as error:
+                    session.dispose(str(error))
+                    session.distributed_state = "disposed"
+                    engine.remove(uid)
+                    active.pop(uid, None)
+
+        budget = max(
+            0, int(os.environ.get("MLX_VLM_CONTINUATION_CACHE_BYTES", 1024**3))
+        )
+        sizes = {
+            session: self._checkpoint_bytes(state[1], state[3])
+            for session, state in suspended.items()
+        }
+        resident = sum(sizes.values())
+        for session in sorted(
+            suspended,
+            key=(
+                (lambda s: suspended[s][2])
+                if decisions is not None
+                else (lambda s: s.touched)
+            ),
+        ):
+            key, checkpoint, uid, info = suspended[session]
+            try:
+                if decisions is None:
+                    session.check()
+                    paused = session.paused
+                else:
+                    paused, error = decisions[session]
+                    if error:
+                        raise ValueError(error)
+                if decisions is None and resident > budget:
+                    raise ValueError(
+                        "The inference checkpoint was evicted to release cache memory. Regenerate the response."
+                    )
+                if paused:
+                    continue
+                running = sum(len(active) for _, active in groups.values())
+                if capacity is not None and running >= capacity:
+                    continue
+                engine, active = groups[key]
+                manager = getattr(engine, "apc_manager", None)
+                if manager is not None and decisions is None:
+                    # Concatenation can allocate the entire merged cache before
+                    # releasing either input, not just the incoming row.
+                    live_cache = getattr(
+                        getattr(engine, "_generation_batch", None), "prompt_cache", None
+                    )
+                    merge_bytes = sizes[session] + cache_nbytes(live_cache)
+                    if not manager._make_room(merge_bytes):
+                        continue
+                engine.resume(checkpoint)
+                session.distributed_state = "running"
+                active[uid] = info
+            except Exception as error:
+                session.dispose(str(error))
+                session.distributed_state = "disposed"
+                BatchGenerator.discard(checkpoint)
+            resident -= sizes[session]
+            del suspended[session]
+
+    def _step_group(self, engine, active):
+        # Attribute this batch's work to its sessions, excluding queueing,
+        # pause time, checkpoint extraction/restoration, and other batch groups.
+        with ExitStack() as stack:
+            for info in active.values():
+                session = info["rqueue"]
+                if isinstance(session, InferenceSession):
+                    stack.enter_context(session.generating())
+            self._step(engine, active)
 
     def _run_impl(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Own batch scheduling and publish each decode phase before prefill."""
         try:
             self._initialize_model()
+        except ModelLoadCancelled as e:
+            # Do not retain loader frames and their partially materialized weights.
+            self._load_error = ModelLoadCancelled(str(e))
+            self._ready.set()
+            logger.info("Model loading cancelled: %s", self.model_path)
+            return
         except Exception as e:
             self._load_error = e
             self._ready.set()
@@ -1743,210 +2159,206 @@ class ResponseGenerator:
             return
 
         generation_stream = mx.default_stream(mx.default_device())
+        self._wire_context = wired_limit(self.model, [generation_stream])
+        self._wire_context.__enter__()
 
-        batch_gen = None
-        # uid -> {rqueue, tokens, gen_kwargs}
-        active: dict = {}
+        # A group contains all compatible requests, including resumable ones.
+        # Suspended rows own a cache snapshot and small per-request state only.
+        groups, suspended = {}, {}
         max_num_seqs = get_max_num_seqs()
+        scheduler = None
+        if runtime.distributed_worker is not None:
+            from .distributed_schedule import DistributedBatchScheduler
 
-        while not (self._stop and not active and self.requests.empty()):
-            new_items = []
-            try:
-                # Poll the request queue — non-blocking when generating, short
-                # blocking wait when idle so we don't spin.
-                active_batch = bool(active)
-                coalesce_s = (
-                    get_speculative_batch_coalesce_s()
-                    if not active_batch and self.draft_model is not None
-                    else 0.0
-                )
-                capacity = (
-                    None if max_num_seqs is None else max(0, max_num_seqs - len(active))
-                )
-                new_items, should_stop = self._collect_pending_requests(
-                    active=active_batch,
-                    capacity=capacity,
-                    coalesce_s=coalesce_s,
-                )
-                if should_stop and not active:
+            scheduler = DistributedBatchScheduler(runtime.distributed_worker)
+        self.distributed_schedule = scheduler
+
+        while scheduler is not None or not (
+            self._stop
+            and not any(active for _, active in groups.values())
+            and self.requests.empty()
+        ):
+            if scheduler is not None:
+                try:
+                    scheduler.continuations(self, groups, suspended, max_num_seqs)
+                    new_items, cancelled, should_stop = scheduler.next(
+                        self, groups, max_num_seqs
+                    )
+                except Exception as error:
+                    scheduler.abort(error, self, groups)
                     break
-
-                # Drop abandoned requests before doing more work.
-                self._apply_cancellations(batch_gen, active)
-
-                if new_items and batch_gen is not None and not active:
-                    if not batch_gen.has_work:
-                        batch_gen.close()
-                        batch_gen = None
-
-                for request in new_items:
-                    rqueue = request.rqueue
-                    raw_inputs = request.raw_inputs
-                    prompt_tokens = request.prompt_tokens
-                    args = request.args
-                    images = request.images
-                    log_state = self._log_prefill_started(
-                        request, backend="continuous_batching"
-                    )
-                    if batch_gen is None:
-                        batch_gen = BatchGenerator(
-                            self.model.language_model,
-                            self.processor,
-                            stop_tokens=self.stop_tokens,
-                            sampler=self._make_sampler(args),
-                            kv_bits=self.kv_bits,
-                            kv_key_bits=getattr(self, "kv_key_bits", None),
-                            kv_value_bits=getattr(self, "kv_value_bits", None),
-                            kv_key_scheme=getattr(self, "kv_key_scheme", None),
-                            kv_value_scheme=getattr(self, "kv_value_scheme", None),
-                            kv_group_size=self.kv_group_size,
-                            kv_quant_scheme=self.kv_quant_scheme,
-                            quantized_kv_start=self.quantized_kv_start,
-                            compute_logprobs=bool(args.logprobs),
-                            top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
-                            stream=generation_stream,
-                            apc_manager=self.apc_manager,
-                            draft_model=self.draft_model,
-                            draft_kind=self.draft_kind,
-                            draft_block_size=_get_draft_block_size_from_env(),
-                            greedy_sampling=args.temperature == 0,
-                            prefill_step_size=self._effective_prefill_step_size(),
-                        )
-
-                    # Vision encoder runs on the GPU thread; text tokenization
-                    # already happened on the caller thread.
-                    coordinator = getattr(batch_gen, "apc", None)
-                    if coordinator is not None:
-                        coordinator.prepare_prefill(
-                            prompt_tokens,
-                            prefill_step_size=self._effective_prefill_step_size(),
-                        )
-                    input_ids, gen_kwargs = self._gpu_embed(
-                        raw_inputs,
-                        images,
-                        apc_semantic_hash=request.apc_semantic_hash,
-                    )
-                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    # Preserve tenant isolation for manually queued requests
-                    # that predate server-side semantic hash computation.
-                    if request.apc_semantic_hash is None and getattr(
-                        args, "tenant_id", None
-                    ):
-                        gen_kwargs["_apc_tenant"] = args.tenant_id
-
-                    # Drain pending text-only prompts before inserting an
-                    # embed-bearing request — multi-row PromptProcessingBatch
-                    # admission expects all rows to carry inputs_embeds (the
-                    # mixed APC path concatenates them per-row).
-                    if has_embeds and any(
-                        not (s[3] and s[3].get("inputs_embeds") is not None)
-                        for s in batch_gen.unprocessed_prompts
-                    ):
-                        self._flush(batch_gen, active)
-
-                    try:
-                        thinking_budget_criteria = request.thinking_budget_criteria
-                        (uid,) = batch_gen.insert(
-                            [input_ids.squeeze(0).tolist()],
-                            max_tokens=args.max_tokens,
-                            prompt_kwargs=[gen_kwargs],
-                            logits_processors=[
-                                self._make_logits_processors(args, input_ids)
-                            ],
-                            thinking_budget_criteria=[thinking_budget_criteria],
-                        )
-                    except Exception as e:
-                        rqueue.put(e)
-                        continue
-
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    active[uid] = {
-                        "rqueue": rqueue,
-                        "streamer": _ServerTokenStreamer(
-                            self.tokenizer,
-                            make_streaming_detokenizer(self.processor),
-                        ),
-                        "gen_kwargs": gen_kwargs if has_embeds else None,
-                        "prompt_tps": None,
-                        "cached_tokens": 0,
-                        "spec_snapshot": (
-                            speculative_stats_snapshot(self.draft_model)
-                            if self.draft_model is not None
-                            else None
-                        ),
-                        **log_state,
-                    }
-
-                if not active or batch_gen is None:
-                    continue
-
-                self._step(batch_gen, active)
-
-            except Exception as e:
-                logger.exception("Error in generation thread")
-                error_queues = {
-                    id(info["rqueue"]): info["rqueue"] for info in active.values()
-                }
-                error_queues.update(
-                    {id(request.rqueue): request.rqueue for request in new_items}
-                )
-                _notify_queues(error_queues.values(), e, None)
-                active.clear()
-                batch_gen = None
-                mx.clear_cache()
-                gc.collect()
-
-        if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
-            batch_gen.close()
-
-    def _run_diffusion(self):
-        """GPU thread loop for diffusion models.
-
-        Diffusion generation runs one request at a time (batch size 1).
-        Output streams back block-by-block: one queue item per denoised
-        block, plus a final item carrying the finish reason. Non-streaming
-        endpoints aggregate the same items into a single response.
-        """
-        uid_counter = 0
-        cancelled: set = set()
-        while not self._stop:
-            try:
-                new_items, should_stop = self._collect_pending_requests(active=False)
                 if should_stop:
                     break
-                cancelled |= self._drain_cancellations()
+            else:
+                self._schedule_continuations(groups, suspended, max_num_seqs)
+                cancelled = self._drain_cancellations()
+            for engine, active in groups.values():
+                for uid in cancelled.intersection(active):
+                    if not engine.remove(uid):
+                        self._cancel(uid)
+                        continue
+                    active.pop(uid)["rqueue"].put(None)
+            running = sum(len(active) for _, active in groups.values())
+            capacity = None if max_num_seqs is None else max(0, max_num_seqs - running)
+            if scheduler is None:
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(running),
+                    capacity=capacity,
+                    coalesce_s=(
+                        get_speculative_batch_coalesce_s()
+                        if not running and self.draft_model is not None
+                        else 0.0
+                    ),
+                )
+            if should_stop and not running:
+                break
+            for request in new_items:
+                key = self._batch_key(request)
+                engine, active = groups.get(key, (None, {}))
+                try:
+                    engine = self._start_batch_request(
+                        request, engine, active, generation_stream
+                    )
+                    groups[key] = (engine, active)
+                except Exception as error:
+                    if scheduler is not None:
+                        scheduler.fail(error)
+                    queues = {id(request.rqueue): request.rqueue}
+                    if request.session is not None:
+                        queues[id(request.session)] = request.session
+                    _notify_queues(queues.values(), error, None)
+
+            for key, (engine, active) in list(groups.items()):
+                if not active:
+                    if not any(state[0] == key for state in suspended.values()):
+                        if callable(getattr(engine, "close", None)):
+                            engine.close()
+                        del groups[key]
+                    continue
+                try:
+                    self._step_group(engine, active)
+                except Exception as error:
+                    if scheduler is not None:
+                        scheduler.fail(error)
+                    logger.exception("Error in generation batch")
+                    _notify_queues(
+                        (info["rqueue"] for info in active.values()), error, None
+                    )
+                    for uid in list(active):
+                        engine.remove(uid)
+                    active.clear()
+
+        for session, (_, checkpoint, _, _) in suspended.items():
+            session.dispose("The model was unloaded. Regenerate the response.")
+            BatchGenerator.discard(checkpoint)
+        suspended.clear()
+        for engine, active in groups.values():
+            for uid, info in active.items():
+                queue = info["rqueue"]
+                if isinstance(queue, InferenceSession):
+                    queue.dispose("The model was unloaded. Regenerate the response.")
+                engine.remove(uid)
+            if callable(getattr(engine, "close", None)):
+                engine.close()
+
+    def _run_diffusion(self):
+        """Run diffusion requests, retaining paused iterators at block boundaries.
+
+        Only one request executes on the GPU at a time. A paused session keeps
+        its model-owned canvas/cache and yields the worker to another request.
+        """
+        uid_counter = 0
+        active = {}
+        cancelled: set = set()
+        self._wire_context = wired_limit(self.model, [generation_stream])
+        self._wire_context.__enter__()
+
+        def release(uid, error=None):
+            output, iterator = active.pop(uid)
+            with mx.stream(generation_stream):
+                iterator.close()
+            if error is not None:
+                if isinstance(output, InferenceSession):
+                    output.dispose(str(error))
+                else:
+                    output.put(error)
+            output.put(None)
+
+        try:
+            while not self._stop:
+                cancelled.update(self._drain_cancellations())
+                for uid, (output, _) in list(active.items()):
+                    try:
+                        if isinstance(output, InferenceSession):
+                            output.check()
+                        if uid in cancelled:
+                            release(uid)
+                    except Exception as error:
+                        release(uid, error)
+                cancelled.clear()
+
+                runnable = [
+                    uid
+                    for uid, (output, _) in active.items()
+                    if not isinstance(output, InferenceSession) or not output.paused
+                ]
+                limit = get_max_num_seqs()
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(runnable),
+                    capacity=None if limit is None else max(0, limit - len(runnable)),
+                )
+                if should_stop:
+                    break
                 for request in new_items:
-                    rqueue = request.rqueue
-                    raw_inputs = request.raw_inputs
-                    prompt_tokens = request.prompt_tokens
-                    args = request.args
-                    log_state = self._log_prefill_started(request, backend="diffusion")
                     uid_counter += 1
                     uid = uid_counter
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    try:
+                    output = request.session or request.rqueue
+                    context = GenerationContext(
+                        uid=uid, prompt_tokens=request.prompt_tokens
+                    )
+                    if request.session is not None:
+                        request.session.owner = self
+                        request.session.context = context
+                    active[uid] = (
+                        output,
                         self._generate_diffusion(
                             uid,
-                            rqueue,
-                            raw_inputs,
-                            args,
+                            output,
+                            request.raw_inputs,
+                            request.args,
                             cancelled,
-                            log_state,
+                            self._log_prefill_started(request, backend="diffusion"),
                             apc_semantic_hash=request.apc_semantic_hash,
+                        ),
+                    )
+                    request.rqueue.put(context)
+
+                # Preserve serial scheduling for ordinary requests; paused ones
+                # no longer block the queue. Re-check pause after admission.
+                for uid, (output, iterator) in list(active.items()):
+                    if isinstance(output, InferenceSession) and output.paused:
+                        continue
+                    try:
+                        timing = (
+                            output.generating()
+                            if isinstance(output, InferenceSession)
+                            else nullcontext()
                         )
-                        rqueue.put(None)
-                    except Exception as e:
+                        with timing, mx.stream(generation_stream):
+                            next(iterator)
+                    except StopIteration:
+                        release(uid)
+                        mx.clear_cache()
+                    except Exception as error:
                         logger.exception("Error in diffusion generation")
-                        try:
-                            rqueue.put(e)
-                            rqueue.put(None)
-                        except Exception:
-                            pass
-                    mx.clear_cache()
-            except Exception:
-                logger.exception("Error in diffusion generation thread")
-                mx.clear_cache()
-                gc.collect()
+                        release(uid, error)
+                        mx.clear_cache()
+                    break
+        finally:
+            for uid in list(active):
+                release(
+                    uid, ValueError("The model was unloaded. Regenerate the response.")
+                )
 
     def _generate_diffusion(
         self,
@@ -1981,8 +2393,11 @@ class ResponseGenerator:
         prefill_step_size = self._effective_prefill_step_size()
         if prefill_step_size > 0:
             stream_kwargs["prefill_step_size"] = prefill_step_size
-        if args.seed is not None:
+        if isinstance(rqueue, InferenceSession):
+            stream_kwargs["_rng"] = DiffusionRNG(args.seed)
+        elif args.seed is not None:
             stream_kwargs["seed"] = args.seed
+        stream_kwargs["manage_wired_limit"] = False
         if args.logits_processors is not None:
             stream_kwargs["logits_processors"] = args.logits_processors
         stream_kwargs.update(args.diffusion_kwargs())
@@ -2026,6 +2441,9 @@ class ResponseGenerator:
                 return False
             return True
 
+        incremental = callable(
+            getattr(self.model.language_model, "generate_blocks", None)
+        )
         results = stream_diffusion_generate_from_kwargs(
             self.model,
             self.processor,
@@ -2036,18 +2454,29 @@ class ResponseGenerator:
             skip_special_token_ids,
             stream_kwargs,
             skip_special_tokens=args.skip_special_tokens,
-            on_result=on_result,
+            on_result=None if incremental else on_result,
         )
         try:
-            for _ in results:
-                pass
+            for result in results:
+                if not on_result(result):
+                    return
+                if result.diffusion_block_complete:
+                    yield
         finally:
             results.close()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        """Publish ready decode tokens before advancing bounded prompt work."""
+        try:
+            self._emit_responses(batch_gen.decode_step(), active)
+            prompt_responses = batch_gen.prefill_step()
+        except _apc.APCAdmissionError as error:
+            if error.uid not in active:
+                raise
+            info = active.pop(error.uid)
+            batch_gen.remove(error.uid)
+            _notify_queues([info["rqueue"]], error, None)
+            return
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
@@ -2055,9 +2484,14 @@ class ResponseGenerator:
                 info["prompt_tps"] = prompt_response.prompt_tps
                 info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
                 self._log_prefill_completed(prompt_response.uid, info, prompt_response)
-        if not responses:
-            return
+                # Decode caches now own the context. Do not retain the full
+                # prompt embedding tensor in every paused continuation.
+                info["gen_kwargs"] = None
 
+    def _emit_responses(self, responses, active):
+        scheduler = getattr(self, "distributed_schedule", None)
+        if scheduler is not None:
+            scheduler.verify_step(responses)
         for r in responses:
             if r.uid not in active:
                 continue

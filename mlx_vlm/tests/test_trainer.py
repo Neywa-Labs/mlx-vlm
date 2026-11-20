@@ -11,17 +11,20 @@ from unittest.mock import MagicMock, Mock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.trainer.datasets.next_token import VisionDataset
+from mlx_vlm.trainer.peft import DoRAEmbedding
 from mlx_vlm.trainer.peft.lora import LoRaLayer
 from mlx_vlm.trainer.peft.lora_layers import LoRALinear
 from mlx_vlm.trainer.peft.utils import (
     apply_lora_layers,
     find_all_linear_names,
+    freeze_model,
     get_peft_model,
 )
-from mlx_vlm.trainer.vlm.sft.trainer import (
+from mlx_vlm.trainer.vlm.cross_entropy.trainer import (
     TrainingArgs,
     iterate_batches,
     train,
@@ -30,6 +33,21 @@ from mlx_vlm.trainer.vlm.sft.trainer import (
 from mlx_vlm.utils import load
 
 # Training workflows, adapter loading and numerical gradient contracts.
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_dora_embedding_rejects_only_quantized_weights(quantized):
+    embedding = nn.Embedding(8, 64)
+    if quantized:
+        embedding = nn.QuantizedEmbedding.from_embedding(
+            embedding, group_size=64, bits=4
+        )
+        with pytest.raises(ValueError, match="does not yet support quantization"):
+            DoRAEmbedding.from_base(embedding, r=2)
+    else:
+        adapter = DoRAEmbedding.from_base(embedding, r=2)
+        ids = mx.array([1, 2])
+        assert mx.allclose(adapter(ids), embedding(ids), atol=1e-5).item()
 
 
 @pytest.fixture
@@ -185,9 +203,11 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
         labels=mx.array([[0, 1, 2]] * 4),
     )
     save, optimizer = Mock(), MagicMock(learning_rate=1e-4)
-    monkeypatch.setattr("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors", save)
     monkeypatch.setattr(
-        "mlx_vlm.trainer.vlm.sft.trainer.iterate_batches",
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.mx.save_safetensors", save
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.iterate_batches",
         Mock(return_value=iter([batch])),
     )
     options = dict(steps_per_save=1, adapter_file=None) if missing_adapter else {}
@@ -225,7 +245,7 @@ def test_completion_mask_is_used_without_passing_to_model():
         pixel_values=None,
     )
     vision_language_loss_fn(model, batch, train_on_completions=True, assistant_id=999)
-    assert model.mask.tolist() == [[1, 1, 1]]
+    assert model.mask is None  # 2D padding mask must not replace causal masking
     assert "completion_mask" not in model.kwargs
 
 
@@ -266,6 +286,16 @@ def test_get_peft_model(monkeypatch):
         "language_model.layer1",
         "language_model.layer2",
     }
+
+
+@pytest.mark.parametrize("encoder", ["visual", "vision", "vision_encoder"])
+def test_freeze_model_freezes_encoder(encoder):
+    # e.g. PaddleOCR-VL keeps its vision tower in `visual`
+    model = nn.Module()
+    model.language_model = nn.Linear(4, 4)
+    setattr(model, encoder, nn.Linear(4, 4))
+    freeze_model(model)
+    assert tree_flatten(model.trainable_parameters()) == []
 
 
 def test_find_all_linear_names():
@@ -473,3 +503,20 @@ def test_trainer_public_exports():
     assert trainer.train is vlm.train is train
     assert trainer.train_orpo is vlm.train_orpo is train_orpo
     assert trainer.get_peft_model is get_peft_model
+
+
+def test_legacy_get_learning_rate_handles_warmup_equal_iters():
+    from mlx_vlm.trainer.common.utils import get_learning_rate as common_lr
+    from mlx_vlm.trainer.core import get_learning_rate as legacy_lr
+
+    assert legacy_lr(10, 10, 10, 1e-3, 1e-5) == common_lr(10, 10, 10, 1e-3, 1e-5)
+    assert legacy_lr(10, 3, 5, 1e-3, 1e-5) == common_lr(10, 3, 5, 1e-3, 1e-5)
+
+
+def test_legacy_get_learning_rate_validates_inputs():
+    from mlx_vlm.trainer.core import get_learning_rate as legacy_lr
+
+    with pytest.raises(ValueError, match="iters must be at least 1"):
+        legacy_lr(0, 0, 0, 1e-3, 1e-5)
+    with pytest.raises(ValueError, match="warmup_steps must be between 0 and iters"):
+        legacy_lr(10, 0, 11, 1e-3, 1e-5)

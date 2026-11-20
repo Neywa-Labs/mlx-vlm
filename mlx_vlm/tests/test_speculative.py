@@ -4,6 +4,7 @@ import importlib
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from itertools import product
 from math import prod
 from pathlib import Path
@@ -17,7 +18,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.speculative.utils as speculative
-from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.generate.ar import BatchGenerator, _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -32,6 +33,8 @@ from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
+from mlx_vlm.speculative.drafters.compatibility import validate_dflash_target
+from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
@@ -39,15 +42,1650 @@ from mlx_vlm.tests.test_models import (
     TINY_DEFAULTS,
     TINY_MODELS,
     build_config,
+    make_ernie55_model,
     model_case,
     tiny_config,
+    tiny_language_model,
 )
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    get_model_and_args,
+    get_model_type,
+)
 
 parametrize = pytest.mark.parametrize
 DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
     "speculative"
 ]
+
+
+def inkling2_dspark_case(dtype=mx.float32):
+    from mlx_vlm.models.inkling2 import Model, ModelConfig
+    from mlx_vlm.speculative.drafters.inkling2_dspark import Model as Draft
+    from mlx_vlm.speculative.drafters.inkling2_dspark import ModelConfig as DraftConfig
+
+    config = deepcopy(model_case("inkling2")["config"])
+    config["mtp_config"] = deepcopy(DATA["inkling2_dspark"])
+    target = Model(ModelConfig.from_dict(config))
+    draft = Draft(
+        DraftConfig(
+            text_config={**config["text_config"], "mtp_config": config["mtp_config"]}
+        )
+    )
+    target.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    # Keep target routing away from ties when comparing chunk shapes.
+    for layer in target.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    target.eval()
+    draft.eval()
+    return target, draft
+
+
+@parametrize("location", ["root", "text"])
+def test_inkling2_dspark_native_and_standalone_loading(tmp_path, location):
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    config = deepcopy(model_case("inkling2")["config"])
+    config.update(model_type="inkling2", mtp_config=deepcopy(DATA["inkling2_dspark"]))
+    if location == "text":
+        config["text_config"]["mtp_config"] = config.pop("mtp_config")
+    # Target quantization must not quantize the BF16 sidecar.
+    config["quantization"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = dict(tree_flatten(draft.parameters()))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"norm.weight": mx.zeros((32,))}
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"norm.weight": "model.safetensors"}})
+    )
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == resolve_drafter_kind(tmp_path) == "dflash"
+    equal(dict(tree_flatten(loaded.parameters())), weights)
+    validate_drafter_compatibility(target, loaded, kind)
+    output = get_mtp_splitter(source_config=config).split(
+        str(tmp_path), str(tmp_path / "draft")
+    )
+    standalone, kind = load_drafter(str(output))
+    equal(dict(tree_flatten(standalone.parameters())), weights)
+    assert kind == "dflash"
+    del weights["markov_head.rnn_proj.bias"]
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), weights)
+    with pytest.raises(ValueError, match="Missing|missing"):
+        load_drafter(str(tmp_path))
+
+
+def test_inkling2_dspark_capture_inputs_and_final_norm():
+    target, _ = inkling2_dspark_case()
+    lm = target.language_model
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    x, blocks, expected = lm.model.embed(ids), [], []
+    for layer in lm.layers:
+        expected.append(x)
+        x = layer(x, blocks)
+    expected.append(
+        lm.model.norm(lm.model.final_input(blocks, x)[..., 0, :]).astype(x.dtype)
+    )
+    equal(
+        lm(ids, capture_layer_ids=[3, 0, 2]).hidden_states,
+        [expected[i] for i in [3, 0, 2]],
+    )
+    for invalid in ([0, 0], [-1], [4], [True]):
+        with pytest.raises(ValueError, match="capture_layer_ids"):
+            lm(ids, capture_layer_ids=invalid)
+
+
+@parametrize("dtype,tol", [(mx.float32, 3e-5), (mx.bfloat16, 0.04)])
+@parametrize("retained", [[1, 3], [4, 2], [0, 0]])
+def test_inkling2_dspark_ragged_rollback_and_abort(dtype, tol, retained):
+    target, draft = inkling2_dspark_case(dtype)
+    lm = target.language_model
+    cache = _make_cache(lm, [0, 0])
+    prefix = mx.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    mx.eval(lm(prefix, cache=cache).logits)
+    controls = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[11, 12, 13, 14], [15, 16, 17, 18]])
+    out = lm(
+        block,
+        cache=cache,
+        capture_layer_ids=draft.config.target_layer_ids,
+        speculative_verify=True,
+    )
+    mx.eval(out.logits)
+    if retained == [0, 0]:
+        out.gdn_states.abort()
+    else:
+        out.gdn_states.commit(retained)
+    for row, length in enumerate(retained):
+        for i in range(length):
+            mx.eval(lm(block[row : row + 1, i : i + 1], cache=controls[row]).logits)
+        actual = [c.extract(row) for c in cache]
+        equal(
+            lm(mx.array([[19]]), cache=actual).logits,
+            lm(mx.array([[19]]), cache=controls[row]).logits,
+            atol=tol,
+            rtol=tol,
+        )
+        for a, b in zip(actual, controls[row]):
+            equal(a[1].state, b[1].state, atol=tol, rtol=tol)
+
+
+@parametrize("width", [0, 3, 7])
+@parametrize("length", [1, 8])
+def test_inkling2_dspark_masked_convolution_history(width, length):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.inkling2.language import _update_conv_cache
+    from mlx_vlm.models.inkling.language import _next_conv_state
+
+    mx.random.seed(99)
+    initial = mx.random.normal((4, width, 16))
+    inputs = mx.random.normal((4, length, 16))
+    positions = mx.arange(length)[None]
+    mask = (positions >= mx.array([2, 0, 0, 0])[:, None]) & (
+        positions < mx.array([length, 4, 0, length])[:, None]
+    )
+    for retained in ([0, 1, 4, 8], [8, 5, 3, 0]):
+        retained = [min(n, length) for n in retained]
+        cache = ArraysCache(1)
+        cache[0] = initial
+        cache.start_speculation(length)
+        _update_conv_cache(cache, 0, initial, inputs, mask)
+        cache.commit_speculation(retained)
+        expected = mx.concatenate(
+            [
+                (
+                    _next_conv_state(
+                        initial[row : row + 1],
+                        inputs[row : row + 1, :keep],
+                        mask[row : row + 1, :keep],
+                    )
+                    if keep
+                    else initial[row : row + 1]
+                )
+                for row, keep in enumerate(retained)
+            ]
+        )
+        equal(cache[0], expected, atol=0, rtol=0)
+
+
+@parametrize("batch", [1, 4])
+@parametrize("length", [1, 2, 3, 8])
+@parametrize("masked", [False, True])
+def test_inkling2_short_convolution_native_fp32_rounding(
+    batch, length, masked, monkeypatch
+):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    conv = ShortConvolution(128, 4, 0)
+    conv.set_dtype(mx.bfloat16)
+    conv.eval()
+    actual, reference = ArraysCache(4), ArraysCache(4)
+    state = mx.random.normal((batch, 3, 128))
+    actual[0] = reference[0] = state
+    x = mx.random.normal((batch, length, 128)).astype(mx.bfloat16)
+    mask = None
+    if masked:
+        positions = mx.arange(length)[None]
+        mask = (positions >= mx.array([0, 1, 0, length][:batch])[:, None]) & (
+            positions < mx.array([length, length, length - 1, length][:batch])[:, None]
+        )
+    actual.start_speculation(length)
+    reference.start_speculation(length)
+    calls = []
+    kernel = kernels.short_convolution
+
+    def record(*args):
+        calls.append(True)
+        return kernel(*args)
+
+    monkeypatch.setattr(kernels, "short_convolution", record)
+    output = conv(x, actual, mask)
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
+        assert calls
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.metal, "is_available", lambda: False)
+        expected = conv(x, reference, mask)
+    retained = [length] if batch == 1 else [0, 1, length - 1, length]
+    actual.commit_speculation(retained)
+    reference.commit_speculation(retained)
+    equal(output, expected, atol=0, rtol=0)
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual[0].dtype == mx.float32
+
+
+@parametrize("rank", [None, 0, 1])
+def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch):
+    target, _ = inkling2_dspark_case(mx.bfloat16)
+    lm = target.language_model
+    lm.lm_head = nn.Linear(32, 16384, bias=False)
+    lm.lm_head.set_dtype(mx.bfloat16)
+    lm.config.unpadded_vocab_size = 16370
+    if rank is not None:
+        lm.sharding_group = NS(size=lambda: 2, rank=lambda: rank)
+    h = mx.random.normal((4, 3, 32)).astype(mx.bfloat16)
+    for _ in range(2):
+        # Replacing checkpoint weights must invalidate the retained conversion.
+        lm.lm_head.weight = mx.random.normal((16384, 32)).astype(mx.bfloat16)
+        expected = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
+
+        def gather(local, group):
+            parts = [
+                part.reshape(1, -1, 8192) for part in mx.split(expected, 2, axis=-1)
+            ]
+            equal(local, parts[rank], atol=0, rtol=0)
+            return mx.concatenate(parts)
+
+        if rank is not None:
+            monkeypatch.setattr(mx.distributed, "all_gather", gather)
+        actual = lm._logits_from_norm(h)
+        cap = lm.config.final_logit_softcapping
+        if cap:
+            expected = mx.tanh(expected / cap) * cap
+        equal(actual, expected[..., : lm.config.unpadded_vocab_size], atol=0, rtol=0)
+        assert actual.dtype == mx.float32
+        assert lm.lm_head.weight.dtype == mx.bfloat16
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
+            assert lm._head_projection_cache[0] is lm.lm_head.weight
+        assert not any(
+            "_head_projection_cache" in name
+            for name, _ in tree_flatten(lm.parameters())
+        )
+
+
+def test_inkling2_dspark_draft_context_window_and_budget():
+    target, draft = inkling2_dspark_case()
+    draft.bind(target)
+    hidden = mx.random.normal((1, 7, 3 * 32))
+    full, short = draft.make_cache(), draft.make_cache()
+    all_tokens = draft.draft_block(1, hidden, full, 4, greedy)
+    token = draft.draft_block(1, hidden, short, 2, greedy)
+    equal(token, all_tokens[:, :1])
+    assert all(c.offset == 7 for c in full)
+    assert full[0].keys.shape[2] <= 4
+    for a, b in zip(full, short):
+        equal(a.state, b.state)
+    # A second round keeps only committed target context, never mask positions.
+    draft.draft_block(2, hidden[:, :2], full, 4, greedy)
+    assert all(c.offset == 9 for c in full)
+    assert draft.draft_block(1, hidden, [], 1, greedy).shape == (1, 0)
+
+
+def test_inkling2_dspark_distributed_draft_cache_ownership(monkeypatch):
+    mx.random.seed(96)
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    draft.bind(target)
+    group = NS(size=lambda: 2, rank=lambda: current_rank)
+    target.language_model.sharding_group = group
+    contributions = []
+
+    def all_sum(value, group):
+        contributions.append(value)
+        return value
+
+    monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+    references = [draft.make_cache() for _ in range(4)]
+    caches = [[draft.make_cache() for _ in range(4)] for _ in range(2)]
+    for lengths, keep, add in (
+        ([9, 3, 8, 1], None, False),
+        ([1, 3], [1, 3], False),  # Both survivors belong to rank one.
+        ([2, 1, 4], None, True),  # Merge a fresh row without moving owners.
+        ([3], [1], False),  # A resumed singleton must keep its previous owner.
+    ):
+        if keep is not None:
+            references = [references[i] for i in keep]
+            caches = [[row[i] for i in keep] for row in caches]
+        if add:
+            references.append(draft.make_cache())
+            for row in caches:
+                row.append(draft.make_cache())
+        hidden = [mx.random.normal((1, n, 96)).astype(mx.bfloat16) for n in lengths]
+        anchors = [3] * len(lengths)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(a, h, c, 4, greedy)
+                for a, h, c in zip(anchors, hidden, references)
+            ]
+        )
+        contributions.clear()
+        for current_rank in range(2):
+            draft.draft_batch_greedy(
+                anchors, hidden, caches[current_rank], 4, greedy, mx.int32
+            )
+            for row, reference in zip(caches[current_rank], references):
+                if row[0]._draft_rank == current_rank:
+                    for actual, ref in zip(row, reference):
+                        assert actual.offset == ref.offset
+                        equal(actual.state, ref.state)
+        assert len(contributions) == 2
+        equal(contributions[0] + contributions[1], expected)
+        caches = deepcopy(caches)
+
+    # A fresh singleton keeps replicated execution and adds no collective.
+    contributions.clear()
+    singleton = draft.make_cache()
+    actual = draft.draft_batch_greedy([3], hidden, [singleton], 4, greedy, mx.int32)
+    expected = draft.draft_block(3, hidden[0], draft.make_cache(), 4, greedy)
+    equal(actual, expected)
+    assert not contributions and not hasattr(singleton[0], "_draft_rank")
+
+
+@parametrize("batch", [2, 4])
+def test_inkling2_dspark_local_batch_preserves_logits_and_ragged_cache(batch):
+    target, draft = inkling2_dspark_case(mx.bfloat16)
+    draft.bind(target)
+    references = [draft.make_cache() for _ in range(batch)]
+    caches = [draft.make_cache() for _ in range(batch)]
+    for depth, lengths in ((3, [9, 3, 8, 1]), (2, [2, 1, 3, 2]), (4, [1, 4, 2, 1])):
+        hidden = [
+            mx.random.normal((1, n, 96)).astype(mx.bfloat16) for n in lengths[:batch]
+        ]
+        anchors = list(range(3, 3 + batch))
+        ref_logits, actual_logits = [], []
+
+        def reference_sampler(x):
+            ref_logits.append(x)
+            return mx.argmax(x, axis=-1)
+
+        def actual_sampler(x):
+            actual_logits.append(x)
+            return mx.argmax(x, axis=-1)
+
+        expected = mx.concatenate(
+            [
+                draft.draft_block(a, h, c, depth, reference_sampler)
+                for a, h, c in zip(anchors, hidden, references)
+            ]
+        )
+        actual = draft._draft_local_batch(
+            anchors, hidden, caches, depth, actual_sampler, mx.int32
+        )
+        count = depth - 1
+        expected_logits = mx.stack(
+            [
+                mx.concatenate(ref_logits[row * count : (row + 1) * count])
+                for row in range(batch)
+            ]
+        )
+        equal(mx.stack(actual_logits, axis=1), expected_logits, atol=0, rtol=0)
+        equal(actual, expected)
+        for row, reference in zip(caches, references):
+            for a, b in zip(row, reference):
+                assert a.offset == b.offset
+                equal(a.state, b.state, atol=0, rtol=0)
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_inkling2_dspark_markov_head_reference(dtype):
+    target, draft = inkling2_dspark_case(dtype)
+    draft.bind(target)
+    head = draft.markov_head
+
+    # Independent FP64 fold, followed by the checkpoint's explicit rounding.
+    def array(x):
+        return np.array(x.astype(mx.float32)).astype(np.float64)
+
+    folded = array(target.language_model.lm_head.weight) @ array(head.hidden_out.weight)
+    equal(head._fold_weight, mx.array(folded.astype(np.float32)).astype(dtype))
+    state = mx.zeros((1, draft.config.markov_rank), dtype)
+    hidden, context = mx.random.normal((1, 1, 32)).astype(dtype), mx.random.normal(
+        (1, 1, 32)
+    ).astype(dtype)
+    term = head.context(hidden, context)[:, 0]
+    previous = mx.array([3])
+
+    def rounded(x):
+        return array(mx.array(np.asarray(x, dtype=np.float32)).astype(dtype))
+
+    raw = rounded(
+        np.concatenate([array(state), array(head.markov_w1(previous))], -1)
+        @ array(head.rnn_proj.weight[:, :16]).T
+        + array(term)
+    )
+    gate, candidate, output = np.split(raw, 3, axis=-1)
+    gate, candidate = rounded(1 / (1 + np.exp(-gate))), rounded(np.tanh(candidate))
+    expected = rounded(
+        rounded(gate * array(state)) + rounded(rounded(1 - gate) * candidate)
+    )
+    actual, _ = head.step(state, previous, term)
+    equal(
+        actual,
+        mx.array(expected.astype(np.float32)).astype(dtype),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@parametrize("temperature", [0, 0.7])
+@parametrize("prefill_step_size", [None, 2])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_inkling2_dspark_standard_generation_and_reset(
+    temperature, prefill_step_size, dtype, monkeypatch
+):
+    mx.random.seed(73)
+    target, draft = inkling2_dspark_case(dtype)
+    calls = []
+    forward = type(target.language_model).__call__
+
+    def record(self, inputs=None, *args, **kwargs):
+        embeddings = kwargs.get("inputs_embeds")
+        calls.append(inputs.shape[1] if inputs is not None else embeddings.shape[1])
+        return forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(target.language_model), "__call__", record)
+    options = dict(temperature=temperature, prefill_step_size=prefill_step_size)
+    expected = generated(target, **options)
+    for _ in range(2):
+        calls.clear()
+        assert generated(target, draft, **options) == expected
+        prefix = [2, 1, 1] if prefill_step_size else [4]
+        assert calls[: len(prefix)] == prefix
+        assert draft.draft_lens and sum(draft.draft_lens) > 0
+
+
+def mistral_dspark_case():
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark import Model, ModelConfig
+
+    args = TextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=64,
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        index_topk=4,
+        index_head_dim=8,
+        index_n_heads=2,
+        mtp_config={
+            "n_layers": 2,
+            "depth": 3,
+            "target_activation_layers": "0,2,3",
+            "ragged_attention": "4,4",
+            "norm_strategy": "eagle",
+            "dspark": {
+                "markov_rank": 8,
+                "head_type": "rnn",
+                "draft_input": "position_specific",
+            },
+        },
+    )
+    target = LanguageModel(args)
+    draft = Model(ModelConfig(text_config=args))
+    target.eval()
+    draft.eval()
+    return target, draft
+
+
+@parametrize("sidecar", [False, True])
+def test_mistral_dspark_native_loading(tmp_path, sidecar):
+    target, draft = mistral_dspark_case()
+    settings = {"model_type": "mistral_large4", "text_config": target.args.to_dict()}
+    if sidecar:
+        mtp_config = settings["text_config"].pop("mtp_config")
+        (tmp_path / "params.json").write_text(json.dumps({"mtp": mtp_config}))
+    (tmp_path / "config.json").write_text(json.dumps(settings))
+    weights = {"mtp_dspark." + k: v for k, v in tree_flatten(draft.parameters())}
+    weights["norm.weight"] = mx.ones((32,))
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "dflash"
+    assert loaded.config.target_layer_ids == [0, 2, 3]
+    assert loaded.config.block_size == 4
+    expected = dict(tree_flatten(draft.parameters()))
+    actual = dict(tree_flatten(loaded.parameters()))
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(np.array(actual[key]), np.array(expected[key]))
+    from mlx_vlm.speculative.drafters.mistral_large4_dspark.split import (
+        MistralLarge4DsparkSplitter,
+    )
+
+    separate = MistralLarge4DsparkSplitter().split(
+        str(tmp_path), str(tmp_path / "draft")
+    )
+    extracted, kind = load_drafter(str(separate))
+    assert kind == "dflash"
+    for key, value in tree_flatten(extracted.parameters()):
+        np.testing.assert_array_equal(np.array(value), np.array(expected[key]))
+    del weights["mtp_dspark.backbone.mask_embedding"]
+    mx.save_safetensors(
+        str(tmp_path / "consolidated-00001-of-00001.safetensors"), weights
+    )
+    with pytest.raises(ValueError):
+        load_drafter(str(tmp_path))
+
+
+def test_mistral_dspark_capture_and_latent_rollback():
+    target, draft = mistral_dspark_case()
+    ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    reference, cache = target.make_cache(), target.make_cache()
+    prefix = target(ids[:, :2], cache=cache, capture_layer_ids=[0, 2, 3])
+    target(ids[:, :2], cache=reference)
+    assert len(prefix.hidden_states) == 3
+    captured = []
+    # A tap is the residual stream after the named layer, before final norm.
+    last = target.model.norm
+    probe = target.model(ids[:, :2], capture_layer_ids=[3], capture_sink=captured)
+    np.testing.assert_allclose(np.array(probe), np.array(last(captured[0])), atol=1e-6)
+    output, transaction = common.verify_forward(
+        target, ids[:, 2:], cache, capture_layer_ids=draft.config.target_layer_ids
+    )
+    mx.eval(output.logits, output.hidden_states)
+    transaction.commit(2)
+    target(ids[:, 2:4], cache=reference)
+    assert all(c.offset == 4 for c in cache)
+    a = target(mx.array([[9]]), cache=cache).logits
+    b = target(mx.array([[9]]), cache=reference).logits
+    np.testing.assert_allclose(np.array(a), np.array(b), atol=2e-5, rtol=2e-5)
+
+
+def test_mistral_dspark_context_window_and_short_budget():
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    hidden = mx.random.normal((1, 9, 96))
+    c1, c2 = draft.make_cache(), draft.make_cache()
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    full = draft.draft_block(3, hidden, c1, 4, sampler)
+    # Incremental context ingestion retains exactly the same last window.
+    draft.draft_block(2, hidden[:, :6], c2, 4, sampler)
+    partial = draft.draft_block(3, hidden[:, 6:], c2, 2, sampler)
+    np.testing.assert_array_equal(np.array(full[:, :1]), np.array(partial))
+    assert [c.offset for c in c1] == [9, 9]
+    assert [c.offset for c in c2] == [9, 9]
+    for a, b in zip(c1, c2):
+        np.testing.assert_allclose(
+            np.array(a._temporal_order(a.keys)[..., -4:, :]),
+            np.array(b._temporal_order(b.keys)[..., -4:, :]),
+            atol=1e-5,
+        )
+
+
+def test_mistral_dspark_recurrent_head_equations():
+    _, draft = mistral_dspark_case()
+    head = draft.autoregressive_head
+    h = mx.random.normal((1, 3, 32))
+    tokens = mx.array([3])
+    state = None
+    reference = np.zeros((1, 8), dtype=np.float32)
+    for i in range(3):
+        bias, state = head.step(tokens, h[:, i], state)
+        embed = np.array(head.embedding.weight)[np.array(tokens)]
+        joined = np.concatenate([reference, embed, np.array(h[:, i])], axis=-1)
+        joined = joined @ np.array(head.joint_proj.weight).T + np.array(
+            head.joint_proj.bias
+        )
+        gate, candidate, out = np.split(joined, 3, axis=-1)
+        gate = 1 / (1 + np.exp(-gate))
+        reference = gate * reference + (1 - gate) * np.tanh(candidate)
+        expected = np.tanh(out) @ np.array(head.output.weight).T
+        np.testing.assert_allclose(np.array(state), reference, atol=1e-6, rtol=1e-5)
+        np.testing.assert_allclose(np.array(bias), expected, atol=1e-6, rtol=1e-5)
+        tokens = mx.argmax(bias, axis=-1)
+
+
+def test_mistral_dspark_batched_drafts_keep_independent_context_positions():
+    mx.random.seed(17)
+    target, draft = mistral_dspark_case()
+    draft.bind(target)
+    batched = [draft.make_cache() for _ in range(2)]
+    separate = [draft.make_cache() for _ in range(2)]
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for lengths in ([9, 3], [1, 3], [4, 2]):
+        hidden = [mx.random.normal((1, length, 96)) for length in lengths]
+        actual = draft.draft_batch([3, 5], hidden, batched, 4, sampler, mx.int32)
+        expected = mx.concatenate(
+            [
+                draft.draft_block(token, h, cache, 4, sampler)
+                for token, h, cache in zip([3, 5], hidden, separate)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual), np.array(expected))
+        for actual_row, expected_row in zip(batched, separate):
+            for a, b in zip(actual_row, expected_row):
+                assert a.offset == b.offset
+                np.testing.assert_allclose(
+                    np.array(a.keys), np.array(b.keys), atol=1e-5
+                )
+                np.testing.assert_allclose(
+                    np.array(a.values), np.array(b.values), atol=1e-5
+                )
+
+
+def test_mistral_dspark_ragged_rollback_includes_shared_and_index_only_caches():
+    from mlx_vlm.models.mistral_large4.language import LanguageModel
+
+    mx.random.seed(19)
+    target, _ = mistral_dspark_case()
+    args = target.args
+    args.kv_source_layers = [0, 1, 0, 1]
+    args.no_rope_layers = [1, 1, 1, 1]
+    args.indexer_types = ["full", "full", "full", "shared"]
+    target = LanguageModel(args)
+    target.eval()
+    cache = [c.to_batch([0, 0]) for c in target.make_cache()]
+    mx.eval(target(mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), cache=cache).logits)
+    reference = [[c.extract(row) for c in cache] for row in range(2)]
+    block = mx.array([[9, 10, 11, 12], [13, 14, 15, 16]])
+    out = target(block, cache=cache, speculative_verify=True)
+    mx.eval(out.logits)
+    out.gdn_states.commit([1, 3])
+    for c in cache:
+        assert c.offset.tolist() == [5, 7]
+        assert c.left_padding.tolist() == [0, 0]
+    cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
+    assert all(c._ragged and c.offset.tolist() == [5, 7] for c in cache)
+    for row, retained in enumerate([1, 3]):
+        for index in range(retained):
+            mx.eval(
+                target(
+                    block[row : row + 1, index : index + 1], cache=reference[row]
+                ).logits
+            )
+        actual = target(mx.array([[17]]), cache=[c.extract(row) for c in cache]).logits
+        expected = target(mx.array([[17]]), cache=reference[row]).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=5e-5, rtol=5e-5
+        )
+
+
+@parametrize("cancel", [False, True])
+@parametrize("sampling", ["greedy", "random", "positioned"])
+@parametrize("phased", [False, True])
+@parametrize("family", ["mistral", "inkling2"])
+def test_dspark_admits_requests_while_batch_is_active(cancel, sampling, phased, family):
+    from types import SimpleNamespace
+
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+    from mlx_vlm.utils import StoppingCriteria
+
+    mx.random.seed(23)
+    sampler = make_sampler(temp=0.7) if sampling == "random" else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    if family == "inkling2":
+        model, draft = inkling2_dspark_case()
+        target = model.language_model
+    else:
+        target, draft = mistral_dspark_case()
+    embed = getattr(target.model, "embed", target.model.embed_tokens)
+    generator = BatchGenerator(
+        target,
+        SimpleNamespace(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=sampling == "greedy",
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4], [11, 12, 13]]
+    outputs = [[], [], []]
+
+    def insert(rows, limits):
+        generator.insert(
+            rows,
+            max_tokens=limits,
+            prompt_kwargs=[{"inputs_embeds": embed(mx.array([p]))} for p in rows],
+        )
+
+    insert(prompts[:2], [40, 3])
+    added = False
+    overlapped = False
+    try:
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            responses = generator.decode_step() if phased else generator.next()[1]
+            if phased:
+                generator.prefill_step()
+            for response in responses:
+                if response.token is not None:
+                    outputs[response.uid].append(response.token)
+            if not added and len(outputs[0]) >= 2:
+                insert(prompts[2:], [6])
+                added = True
+            if outputs[2] and len(outputs[0]) < 40:
+                overlapped = True
+                if cancel:
+                    assert generator.remove(0)
+                    cancel = False
+            batch = generator._generation_batch
+            assert len(getattr(batch, "_all_uids", batch.uids)) <= 2
+        assert not generator.has_work
+        assert overlapped
+        assert len(outputs[1]) == 3
+        assert len(outputs[2]) == 6
+    finally:
+        generator.close()
+
+
+@parametrize(
+    "family",
+    ["dflash2", "ricursive-dflash2", "dspark-lfm2", "mistral", "gemma", "inkling2"],
+)
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True])
+@parametrize("phased", [False, True])
+def test_speculative_row_resume_preserves_state_and_other_requests(
+    family, pause_after, sampling, phased
+):
+    from mlx_vlm.sample_utils import make_sampler
+
+    mx.random.seed(23)
+    if family == "mistral":
+        target, draft = mistral_dspark_case()
+    elif family == "inkling2":
+        model, draft = inkling2_dspark_case()
+        target = model.language_model
+    elif family == "gemma":
+        target, draft = gemma_dflash_case(shared=True)
+    else:
+        target, draft = dflash_target(family).language_model, dflash_drafter(family)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="dflash",
+        draft_block_size=4,
+        sampler=make_sampler(temp=0.7) if sampling else None,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4]]
+    outputs = [[], []]
+    embed = getattr(target.model, "embed", target.model.embed_tokens)
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": embed(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        checkpoint = generator.suspend(0)
+        assert generator._generation_batch.uids == [1]
+        saved = deepcopy(checkpoint._batch_state.state)
+        stopped_count, other_count = map(len, outputs)
+        for _ in range(3):
+            step()
+        assert len(outputs[0]) == stopped_count
+        assert len(outputs[1]) > other_count
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        draft_cache = checkpoint._batch_state.draft_caches[0]
+        generator.resume(checkpoint)
+        assert generator._generation_batch.uids == [1, 0]
+        assert generator._generation_batch._batch_state.draft_caches[-1] is draft_cache
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+def mtp_resume_case(family, *, shared=False):
+    if family != "gemma":
+        target, config = language(family, inference=True)
+        return target, mtp_drafter(family, config)
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import LanguageModel
+    from mlx_vlm.speculative.drafters.gemma4_assistant import Model, ModelConfig
+
+    config = TextConfig(
+        hidden_size=32,
+        num_hidden_layers=4 if shared else 2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        vocab_size=64,
+        vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=0,
+        num_kv_shared_layers=2 if shared else 0,
+        layer_types=["sliding_attention", "full_attention"] * (2 if shared else 1),
+        sliding_window=8,
+    )
+    return LanguageModel(config), Model(
+        ModelConfig(text_config=deepcopy(config), backbone_hidden_size=32, block_size=4)
+    )
+
+
+def gemma_dflash_case(*, shared=False):
+    from mlx_vlm.speculative.drafters.qwen3_dflash.config import DFlashConfig
+    from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import DFlashDraftModel
+
+    target, _ = mtp_resume_case("gemma", shared=shared)
+    return target, DFlashDraftModel(
+        DFlashConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=64,
+            mask_token_id=63,
+            block_size=4,
+            num_target_layers=4 if shared else 2,
+            target_layer_ids=[0, 3] if shared else [0, 1],
+        )
+    )
+
+
+def test_gemma_shared_kv_skips_empty_batch_caches():
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    caches = [BatchRotatingKVCache(8, [0, 0]), BatchKVCache([0, 0]), None, None]
+    assert target.shared_kv_from_cache(caches) == {}
+
+
+@parametrize("lengths", [[4, 7], [12, 10], [5, 5]])
+@parametrize("steps", [0, 1, 5, 20])
+def test_gemma_shared_kv_views_match_independent_rows(lengths, steps):
+    from mlx_vlm import apc
+
+    target, _ = mtp_resume_case("gemma", shared=True)
+    rows = [target.make_cache() for _ in lengths]
+    for row, length in zip(rows, lengths):
+        target(mx.array([list(range(1, length + 1))]), cache=row)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(rows, lengths)
+    for _ in range(steps):
+        target(mx.array([[1], [2]]), cache=caches)
+    actual = target.shared_kv_from_cache(caches)
+    expected = []
+    for index in range(len(rows)):
+        row = [entry.extract(index) for entry in caches]
+        expected.append(target.shared_kv_from_cache(row))
+    for key, tensors in actual.items():
+        for index, reference in enumerate(expected):
+            for tensor, wanted in zip(tensors, reference[key]):
+                length = wanted.shape[2]
+                assert mx.array_equal(tensor[index : index + 1, :, :length], wanted)
+                assert mx.all(tensor[index, :, length:] == 0)
+
+
+@parametrize("shared", [False, True])
+@parametrize("kind", ["mtp", "dflash"])
+def test_gemma_ragged_speculative_commit_matches_independent_rows(shared, kind):
+    from mlx_vlm import apc
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+
+    mx.random.seed(32)
+    target, draft = mtp_resume_case("gemma", shared=shared)
+    target.eval()
+    references = [target.make_cache(), target.make_cache()]
+    prompts = [list(range(1, 14)), list(range(3, 12))]
+    for prompt, cache in zip(prompts, references):
+        target(mx.array([prompt]), cache=cache)
+    caches, _ = apc.make_warm_batch_exact_cache_multi(
+        deepcopy(references), list(map(len, prompts))
+    )
+    assert caches is not None
+    for round_index, retained in enumerate(([3, 1], [1, 4], None, [4, 2], [2, 3])):
+        tokens = mx.array([[20, 21, 22, 23], [30, 31, 32, 33]]) + round_index
+        if kind == "mtp":
+            hidden, shared_kv, transaction = target.speculative_verify_hidden(
+                tokens, caches
+            )
+        else:
+            output = target(tokens, cache=caches, speculative_verify=True)
+            transaction = output.gdn_states
+        assert isinstance(transaction, SpeculativeCacheTransaction)
+        if retained is None:
+            transaction.abort()
+        else:
+            transaction.commit(retained)
+            committed_shared = target.shared_kv_from_cache(caches)
+            for row, count in enumerate(retained):
+                for i in range(count):
+                    target(tokens[row : row + 1, i : i + 1], cache=references[row])
+                if kind == "mtp":
+                    # The assistant must see the same committed context as a
+                    # standalone request, including after window rotation.
+                    position = references[row][0].offset
+                    draft.reset(target)
+                    mtp.MTPBatch._bind_shared(
+                        NS(draft=draft, position=position),
+                        committed_shared,
+                        row,
+                        None,
+                    )
+                    inputs = mx.concatenate(
+                        [
+                            target.model.embed_tokens(mx.array([[42]]))
+                            * target.model.embed_scale,
+                            target.speculative_draft_hidden(
+                                hidden[row : row + 1, count - 1 : count]
+                            ),
+                        ],
+                        axis=-1,
+                    )
+                    positions = mx.array([[position - 1]])
+                    _, actual_draft = draft(inputs, draft._shared_kv, positions)
+                    reference_kv = mtp._mtp_shared_kv_from_prompt_cache(
+                        NS(
+                            model=NS(layers=target.model.layers[: len(references[row])])
+                        ),
+                        references[row],
+                    )
+                    draft.set_shared_kv(
+                        reference_kv, kv_offset=position, kv_valid_len=position
+                    )
+                    _, expected_draft = draft(inputs, draft._shared_kv, positions)
+                    assert mx.allclose(actual_draft, expected_draft, atol=2e-5).item()
+        probe = mx.array([[42], [43]])
+        actual = target(probe, cache=caches).logits
+        for row in range(2):
+            expected = target(probe[row : row + 1], cache=references[row]).logits
+            assert mx.allclose(actual[row : row + 1], expected, atol=2e-5).item()
+            assert (
+                mx.argmax(actual[row, -1]).item() == mx.argmax(expected[0, -1]).item()
+            )
+            assert caches[0].offset[row].item() == references[row][0].offset
+
+
+def test_mtp_ragged_acceptance_respects_remaining_token_budgets(monkeypatch):
+    target, draft = mtp_resume_case("gemma")
+    verify = mtp._mtp_verify_target
+
+    def accept_all(model, inputs, *args, **kwargs):
+        result = verify(model, inputs, *args, **kwargs)
+        # Guarantee acceptance at the boundary where one row has one token
+        # left and its peer can still emit an entire speculative round.
+        result.target_tokens = mx.concatenate([inputs[:, 1:], inputs[:, :1]], axis=1)
+        return result
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", accept_all)
+    commits = []
+    commit = mtp.commit_speculative_round
+
+    def observe_commit(model, caches, transaction, accepted, block_size):
+        commits.append(list(accepted))
+        return commit(model, caches, transaction, accepted, block_size)
+
+    monkeypatch.setattr(mtp, "commit_speculative_round", observe_commit)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=2,
+        prefill_batch_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3], [2, 4]]
+    generator.insert(
+        prompts,
+        max_tokens=[2, 5],
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * target.model.embed_scale
+            }
+            for p in prompts
+        ],
+    )
+    counts = [0, 0]
+    try:
+        while generator.has_work:
+            _, responses = generator.next()
+            for response in responses:
+                counts[response.uid] += response.token is not None
+        assert counts == [2, 5]
+        assert [0, 1] in commits
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "glm", "deepseek", "gemma", "ling"])
+@parametrize("pause_after", [1, 8])
+@parametrize("sampling", [False, True, "positioned"])
+@parametrize("phased", [False, True])
+def test_mtp_shared_resume_preserves_rows(
+    family, pause_after, sampling, monkeypatch, phased
+):
+    from mlx_vlm.models.cache import cache_nbytes
+    from mlx_vlm.sample_utils import make_sampler
+    from mlx_vlm.server.generation import _PositionedTargetSampler
+
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    sampler = make_sampler(temp=0.7) if sampling else None
+    if sampling == "positioned":
+        sampler = _PositionedTargetSampler(temperature=0.7, top_p=1.0, seed=23)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=16,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        sampler=sampler,
+        greedy_sampling=not sampling,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8] if family == "glm" else [2, 4]]
+    outputs = [[], [], []]
+    generator.insert(
+        prompts,
+        max_tokens=32,
+        resumable=True,
+        prompt_kwargs=[
+            {
+                "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                * getattr(target.model, "embed_scale", 1)
+            }
+            for p in prompts
+        ],
+    )
+
+    def step():
+        responses = generator.decode_step() if phased else generator.next()[1]
+        if phased:
+            generator.prefill_step()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        while len(outputs[0]) < pause_after:
+            step()
+        for _ in range(2):
+            checkpoint = generator.suspend(0)
+            assert generator._generation_batch.uids == [1]
+            state = checkpoint._batch_state
+            saved = deepcopy(state.rows[0].state)
+            row = state.rows[0]
+            assert row.draft is not draft
+            if family != "gemma" and pause_after == 1:
+                position = row.draft._next_position
+                if isinstance(position, mx.array):
+                    position = position.item()
+                assert position == row.position
+            # Session copies share weight arrays, not mutable draft state.
+            weights = dict(tree_flatten(draft.parameters()))
+            for name, array in tree_flatten(row.draft.parameters()):
+                if name in weights and not name.startswith("_"):
+                    assert array is weights[name]
+            assert cache_nbytes(state) >= cache_nbytes(row.state) > 0
+            stopped, other = len(outputs[0]), len(outputs[1])
+            for _ in range(2):
+                step()
+            assert len(outputs[0]) == stopped
+            assert len(outputs[1]) > other
+            for (_, before), (_, after) in zip(
+                tree_flatten(saved), tree_flatten(row.state)
+            ):
+                if isinstance(before, mx.array):
+                    assert mx.array_equal(before, after).item()
+            generator.resume(checkpoint)
+            assert generator._generation_batch.uids == [1, 0]
+            assert generator._generation_batch._batch_state.rows[-1] is row
+            widths.clear()
+            step()
+            assert 2 in widths
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert [len(row) for row in outputs[:2]] == [32, 32]
+        if not sampling:
+            for prompt, actual in zip(prompts, outputs):
+                cache = target.make_cache()
+                target._rope_deltas = None
+                target._position_ids = None
+                inputs, expected = mx.array([prompt]), []
+                for _ in range(32):
+                    token = mx.argmax(
+                        target(inputs, cache=cache).logits[:, -1], axis=-1
+                    )
+                    expected.append(token.item())
+                    inputs = token[:, None]
+                assert actual == expected
+    finally:
+        generator.close()
+
+
+@parametrize("family", ["qwen", "gemma"])
+def test_mtp_resume_joins_new_requests_after_all_rows_paused(family, monkeypatch):
+    mx.random.seed(23)
+    target, draft = mtp_resume_case(family)
+    target.eval()
+    draft.eval()
+    widths = []
+    verify = mtp._mtp_verify_target
+
+    def observe(model, inputs, *args, **kwargs):
+        widths.append(inputs.shape[0])
+        return verify(model, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(mtp, "_mtp_verify_target", observe)
+    generator = BatchGenerator(
+        target,
+        NS(stopping_criteria=StoppingCriteria([])),
+        completion_batch_size=3,
+        prefill_batch_size=2,
+        prefill_step_size=2,
+        draft_model=draft,
+        draft_kind="mtp",
+        draft_block_size=4,
+        greedy_sampling=True,
+        compute_logprobs=False,
+    )
+    prompts = [[1, 3, 5, 7], [2, 4, 6, 8, 10], [3, 5]]
+    outputs = [[], [], []]
+
+    def insert(rows):
+        generator.insert(
+            rows,
+            max_tokens=24,
+            resumable=True,
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": target.model.embed_tokens(mx.array([p]))
+                    * getattr(target.model, "embed_scale", 1)
+                }
+                for p in rows
+            ],
+        )
+
+    def step():
+        _, responses = generator.next()
+        for response in responses:
+            if response.token is not None:
+                outputs[response.uid].append(response.token)
+
+    try:
+        insert(prompts[:1])
+        while len(outputs[0]) < 4:
+            step()
+        checkpoint = generator.suspend(0)
+        assert not generator.has_work
+        saved = deepcopy(checkpoint._batch_state.rows[0].state)
+        insert(prompts[1:])
+        while min(len(outputs[1]), len(outputs[2])) < 2:
+            step()
+        for (_, before), (_, after) in zip(
+            tree_flatten(saved), tree_flatten(checkpoint._batch_state.rows[0].state)
+        ):
+            if isinstance(before, mx.array):
+                assert mx.array_equal(before, after).item()
+        generator.resume(checkpoint)
+        widths.clear()
+        step()
+        assert 3 in widths
+        assert generator.remove(2)
+        cancelled = len(outputs[2])
+        for _ in range(100):
+            if not generator.has_work:
+                break
+            step()
+        assert not generator.has_work
+        assert list(map(len, outputs)) == [24, 24, cancelled]
+        for prompt, actual in zip(prompts[:2], outputs[:2]):
+            cache = target.make_cache()
+            target._rope_deltas = target._position_ids = None
+            inputs, expected = mx.array([prompt]), []
+            for _ in range(24):
+                token = greedy(target(inputs, cache=cache).logits[:, -1])
+                expected.append(token.item())
+                inputs = token[:, None]
+            assert actual == expected
+    finally:
+        generator.close()
+
+
+@parametrize("dtype", [mx.float16, mx.bfloat16])
+@parametrize(
+    "batch,length",
+    [
+        (2, 1),
+        (2, 4),
+        (3, 3),
+        (3, 4),
+        (4, 4),
+        (5, 3),
+        (6, 3),
+        (8, 4),
+        (13, 2),
+        (15, 2),
+        (15, 4),
+    ],
+)
+def test_mistral_dspark_wide_projection_matches_native_decode(dtype, batch, length):
+    from mlx_vlm.models.mistral_large4.verify_kernel import native_wide_linear
+
+    mx.random.seed(71)
+    # Include non-tile-aligned output and input tails as well as a large K.
+    for k, n in [(68, 61), (128, 131), (2048, 256), (512, 6144)]:
+        weight = mx.random.normal((n, k)).astype(dtype)
+        x = mx.random.normal((batch, length, k)).astype(dtype)
+        actual = native_wide_linear(weight, x)
+        if actual is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        expected = mx.concatenate(
+            [mx.contiguous(x[:, t : t + 1]) @ weight.T for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        if n == 6144:
+            parts = [native_wide_linear(w, x) for w in mx.split(weight, 2)]
+            equal(mx.concatenate(parts, axis=-1), expected)
+
+
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+def test_mistral_dspark_verifier_matches_decode(dtype, batch):
+    target, draft = mistral_dspark_case()
+    target.set_dtype(dtype)
+    prompt = mx.array([[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1]][:batch])
+    block = mx.array([[7, 8, 9, 10], [10, 9, 8, 7]][:batch])
+    caches = [target.make_cache(), target.make_cache()]
+    if batch > 1:
+        caches = [[c.to_batch([0] * batch) for c in entries] for entries in caches]
+    for cache in caches:
+        mx.eval(target(prompt, cache=cache).logits)
+    ordinary = [
+        target(block[:, i : i + 1], cache=caches[0], capture_layer_ids=[0, 2, 3])
+        for i in range(4)
+    ]
+    output = target(
+        block, cache=caches[1], capture_layer_ids=[0, 2, 3], speculative_verify=True
+    )
+    expected = mx.concatenate([x.logits for x in ordinary], axis=1)
+    np.testing.assert_allclose(
+        np.array(output.logits.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+    np.testing.assert_array_equal(
+        np.array(mx.argmax(output.logits, axis=-1)),
+        np.array(mx.argmax(expected, axis=-1)),
+    )
+    output.gdn_states.commit(2)
+    for cache in caches[0]:
+        cache.trim(2)
+    next_token = mx.array([[12], [13]][:batch])
+    actual = target(next_token, cache=caches[1]).logits
+    reference = target(next_token, cache=caches[0]).logits
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        atol=0.04 if dtype == mx.bfloat16 else 2e-5,
+        rtol=0.02 if dtype == mx.bfloat16 else 2e-5,
+    )
+
+
+@parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@parametrize("batch", [2, 5])
+def test_mistral_dspark_projection_preserves_singleton_row(dtype, batch):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.language import decode_linear
+
+    mx.random.seed(83)
+    for k, n in [(6144, 512), (512, 6144)]:
+        module = nn.Linear(k, n, bias=False)
+        module.weight = mx.random.normal((n, k)).astype(dtype)
+        module.eval()
+        inputs = mx.random.normal((batch, 4, k)).astype(dtype)
+        if verifier.native_wide_linear(module.weight, inputs) is None:
+            pytest.skip("Native wide-GEMV is unavailable on this device")
+        equal(
+            verifier.linear(module, inputs[-1:]), verifier.linear(module, inputs)[-1:]
+        )
+        ordinary = mx.concatenate(
+            [decode_linear(module, inputs[-1:, t : t + 1]) for t in range(4)], axis=1
+        )
+        equal(verifier.linear(module, inputs[-1:]), ordinary)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("padding", [0, 3])
+def test_mistral_dspark_verifier_preserves_singleton_row(prefix, topk, padding):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    if (
+        verifier.native_wide_linear(
+            model.lm_head.weight, mx.zeros((2, 1, model.args.hidden_size), mx.bfloat16)
+        )
+        is None
+    ):
+        pytest.skip("Native wide-GEMV is unavailable on this device")
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    batched = [c.to_batch([0, padding]) for c in model.make_cache()]
+    mx.eval(model(mx.random.randint(1, 60, (2, prefix)), cache=batched).logits)
+    single = deepcopy(batched)
+    for c in single:
+        c.filter(mx.array([1], mx.int32))
+
+    # Compare the same inputs and evolving accepted cache, not free-running text.
+    for _ in range(3):
+        inputs = mx.random.randint(1, 60, (2, 4))
+        bh, bn, bt = verifier.verify_hidden(model, inputs, batched, [0, 1, 2, 3])
+        sh, sn, st = verifier.verify_hidden(model, inputs[1:], single, [0, 1, 2, 3])
+        equal(sh, [h[1:] for h in bh])
+        equal(verifier.verify_logits(model, sn), verifier.verify_logits(model, bn)[1:])
+        bt.commit([2, 2])
+        st.commit([2])
+        for b, s in zip(batched, single):
+            b, s = b.extract(1), s.extract(0)
+            equal(b.state, s.state)
+            assert b.meta_state == s.meta_state
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@parametrize("prefix,topk", [(3, 2048), (127, 2048), (255, 2048), (127, 128)])
+@parametrize("batch,length", [(1, 1), (1, 4), (2, 1), (2, 4), (8, 2), (8, 4)])
+@parametrize("ragged", [False, True])
+def test_mistral_dspark_verifier_preserves_hidden_logits_and_cache(
+    prefix, topk, batch, length, ragged
+):
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+
+    mx.random.seed(79)
+    model, _ = mistral_dspark_case()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            layer.attention.indexer.topk = topk
+    initial = [c.to_batch([i % 3 for i in range(batch)]) for c in model.make_cache()]
+    ids = mx.random.randint(1, 60, (batch, prefix))
+    mx.eval(model(ids, cache=initial).logits)
+    if ragged:
+        for c in initial:
+            c._ragged = True
+            c.offset -= mx.arange(batch) % 3
+    ids = mx.random.randint(1, 60, (batch, length))
+    reference_cache, actual_cache = deepcopy(initial), deepcopy(initial)
+    ordinary = [
+        model(ids[:, t : t + 1], cache=reference_cache, capture_layer_ids=[0, 1, 2, 3])
+        for t in range(length)
+    ]
+    expected_hidden = [
+        mx.concatenate([r.hidden_states[i] for r in ordinary], axis=1) for i in range(4)
+    ]
+    expected_logits = mx.concatenate([r.logits for r in ordinary], axis=1)
+    hidden, norm, transaction = verifier.verify_hidden(
+        model, ids, actual_cache, [0, 1, 2, 3]
+    )
+    logits = verifier.verify_logits(model, norm)
+    equal(hidden, expected_hidden)
+    equal(logits, expected_logits)
+    equal([c.state for c in actual_cache], [c.state for c in reference_cache])
+    transaction.abort()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+def test_mistral_dspark_expert_scales_refresh_without_serializing_runtime_state():
+    from mlx_vlm.models.mistral_large4 import speculative_verifier as verifier
+    from mlx_vlm.models.mistral_large4.config import TextConfig
+    from mlx_vlm.models.mistral_large4.language import MoE
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    model, _ = mistral_dspark_case()
+    ffn = MoE(
+        TextConfig(
+            hidden_size=512,
+            moe_intermediate_size=512,
+            n_routed_experts=8,
+            expert_start=0,
+            expert_end=4,
+            n_shared_experts=0,
+            nvfp4=True,
+        )
+    )
+    for name in ("w1", "w3", "w2"):
+        setattr(
+            ffn.experts,
+            name,
+            ScaledQuantizedSwitchLinear(
+                getattr(ffn.experts, name),
+                mx.array([0.25, 0.5, 1.0, 0.75]),
+                "weight_scale_2",
+            ),
+        )
+    ffn.eval()
+    ffn.group = object()
+    model.layers[0].feed_forward = ffn
+    first = verifier._expert_parameters(model, mx.bfloat16)
+    second = verifier._expert_parameters(model, mx.bfloat16)
+    assert all(a is b for a, b in zip(first[id(ffn)][2], second[id(ffn)][2]))
+    assert "_verification_scales" not in model.parameters()
+    ffn.experts.w1.weight_scale_2 = mx.array([0.5, 1.0, 2.0, 1.5])
+    third = verifier._expert_parameters(model, mx.bfloat16)
+    equal(third[id(ffn)][2][0], first[id(ffn)][2][0] * 2)
+    assert third[id(ffn)][2][0] is not first[id(ffn)][2][0]
+    assert third[id(ffn)][2][1] is first[id(ffn)][2][1]
+    ffn.experts.w1.weight = mx.zeros_like(ffn.experts.w1.weight)
+    fourth = verifier._expert_parameters(model, mx.bfloat16)
+    assert fourth[id(ffn)][0][0] is ffn.experts.w1.weight
+    assert fourth[id(ffn)][2][0] is third[id(ffn)][2][0]
+
+
+def test_mistral_dspark_cpu_verification_uses_portable_fallback():
+    with mx.stream(mx.cpu):
+        model, _ = mistral_dspark_case()
+        cache = [c.to_batch([0, 0]) for c in model.make_cache()]
+        mx.eval(model(mx.array([[1, 2, 3], [3, 2, 1]]), cache=cache).logits)
+        expected_cache = deepcopy(cache)
+        ids = mx.array([[4, 5], [5, 4]])
+        expected = mx.concatenate(
+            [model(ids[:, t : t + 1], cache=expected_cache).logits for t in range(2)],
+            axis=1,
+        )
+        result = model(ids, cache=cache, speculative_verify=True)
+        equal(result.logits, expected, atol=2e-5, rtol=2e-5)
+        result.gdn_states.abort()
+
+
+@parametrize("temperature", [0, 0.7])
+@parametrize("prefill_step_size", [None, 2])
+def test_mistral_dspark_standard_generation(
+    temperature, prefill_step_size, monkeypatch
+):
+    lm, draft = mistral_dspark_case()
+    calls = []
+    forward = type(lm).__call__
+
+    def record(self, inputs, *args, **kwargs):
+        calls.append(inputs.shape[1])
+        return forward(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(type(lm), "__call__", record)
+    model = NS(
+        language_model=lm,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=lm.model.embed_tokens(ids)
+        ),
+    )
+    options = dict(temperature=temperature, prefill_step_size=prefill_step_size)
+    expected = generated(model, **options)
+    calls.clear()
+    actual = generated(model, draft, **options)
+    # Preserve the ordinary prefill boundary, including the final singleton.
+    prefix = [2, 1, 1] if prefill_step_size else [4]
+    assert calls[: len(prefix)] == prefix
+    assert actual == expected
+    assert draft.draft_lens and sum(draft.draft_lens) > 0
+    assert generated(model, draft, **options) == expected
+
+
+@parametrize("family", ["mistral", "inkling"])
+@parametrize("entrypoint", ["step", "stream"])
+def test_dspark_generation_stays_on_one_stream(family, entrypoint, monkeypatch):
+    from mlx_vlm.generate.common import generation_stream
+
+    if family == "mistral":
+        lm, draft = mistral_dspark_case()
+        model = NS(
+            language_model=lm,
+            get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+                inputs_embeds=lm.model.embed_tokens(ids)
+            ),
+        )
+    else:
+        model, draft = inkling2_dspark_case()
+        lm = model.language_model
+
+    seen = {}
+    with mx.stream(generation_stream):
+        expected_stream = mx.default_stream(mx.default_device())
+
+    def observe(cls, name):
+        original = getattr(cls, name)
+
+        def call(self, *args, **kwargs):
+            stream = mx.default_stream(mx.default_device())
+            seen.setdefault(name, []).append(stream)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, name, call)
+
+    observe(type(lm), "__call__")
+    stages = ["reset", "draft_block"]
+    if family == "mistral":
+        stages.append("prepare_target_hidden")
+    for name in stages:
+        observe(type(draft), name)
+
+    expected = generated(model)
+    caller_stream = mx.new_stream(mx.default_device())
+    with mx.stream(caller_stream):
+        if entrypoint == "step":
+            actual = generated(model, draft)
+        else:
+            from mlx_vlm.generate import dispatch
+            from mlx_vlm.tests.test_generate import MockProcessor
+
+            prepare = dispatch._prepare_generation_inputs
+
+            def prepare_inputs(*args, **kwargs):
+                seen.setdefault("prepare_inputs", []).append(
+                    mx.default_stream(mx.default_device())
+                )
+                return prepare(*args, **kwargs)
+
+            monkeypatch.setattr(dispatch, "_prepare_generation_inputs", prepare_inputs)
+            processor = MockProcessor()
+            processor.tokenizer.stopping_criteria = lambda token: False
+            if family == "mistral":
+                model.config = NS(model_type="mistral_large4", eos_token_id=[])
+            iterator = dispatch.stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                pixel_values=None,
+                mask=None,
+                max_tokens=12,
+                temperature=0,
+                seed=41,
+                prefill_step_size=None,
+                draft_model=draft,
+                draft_kind="dflash",
+            )
+            for result in iterator:
+                assert mx.default_stream(mx.default_device()) == caller_stream
+            actual = result.token_ids
+            stages.append("prepare_inputs")
+        assert mx.default_stream(mx.default_device()) == caller_stream
+    assert actual == expected
+    assert set(seen) == {"__call__", *stages}
+    assert all(
+        stream == expected_stream for streams in seen.values() for stream in streams
+    )
+
+
+def test_mistral_dspark_greedy_matches_bf16_logprob_ties():
+    target, _ = mistral_dspark_case()
+    target.set_dtype(mx.bfloat16)
+    target.lm_head.weight = mx.zeros_like(target.lm_head.weight)
+    target.lm_head.weight[1, 0] = 1e-4
+    hidden = mx.zeros((1, 4, 32), dtype=mx.bfloat16)
+    hidden[..., 0] = 1
+    from mlx_vlm.models.mistral_large4.speculative_verifier import verify_logits
+
+    logits = verify_logits(target, hidden)
+    assert mx.argmax(logits, axis=-1).tolist() == [[1, 1, 1, 1]]
+    # Subtraction rounds these nearby logits to a BF16 tie in generate_step.
+    assert target.speculative_argmax_from_hidden(hidden).tolist() == [[0, 0, 0, 0]]
 
 
 def module(name):
@@ -75,6 +1713,12 @@ def language(family, *, inference=False, **overrides):
 
 
 def dflash_target(family):
+    if family == "ricursive-dflash2":
+        arch = module("models.ricursive")
+        target = arch.Model(build_config(arch, model_case("ricursive")["config"]))
+        target.set_dtype(mx.bfloat16)
+        target.eval()
+        return target
     if family in ("dflash2", "dspark-qwen"):
         model, _ = language("qwen")
         model.set_dtype(mx.bfloat16)
@@ -121,11 +1765,15 @@ def dflash_drafter(family):
     arch, name = get_model_and_args(config)
     expected = (
         "dflash2"
-        if family == "dflash2"
+        if family in ("dflash2", "ricursive-dflash2")
         else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
     )
     assert name == expected
-    return arch.Model(arch.ModelConfig.from_dict(config))
+    drafter = arch.Model(arch.ModelConfig.from_dict(config))
+    if family == "ricursive-dflash2":
+        drafter.set_dtype(mx.bfloat16)
+        drafter.eval()
+    return drafter
 
 
 def mtp_drafter(family, config):
@@ -236,26 +1884,34 @@ class TransactionDrafter:
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for key in actual:
-            equal(actual[key], expected[key], **tolerance)
-    elif isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 def greedy(logits):
     return mx.argmax(logits, axis=-1)
 
 
-def generated(target, drafter=None, *, seed=41, temperature=0):
+def generated(target, drafter=None, *, seed=41, temperature=0, prefill_step_size=None):
     if seed is None:
         mx.random.seed(47)
     options = {} if drafter is None else dict(draft_model=drafter, draft_kind="dflash")
@@ -269,14 +1925,22 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
             max_tokens=24 if seed is None else 12,
             temperature=temperature,
             seed=seed,
-            prefill_step_size=None,
+            prefill_step_size=prefill_step_size,
             **options,
         )
     ]
 
 
 @parametrize(
-    "family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-lfm2-moe", "dspark-qwen"]
+    "family",
+    [
+        "dflash2",
+        "ricursive-dflash2",
+        "glimmer",
+        "dspark-lfm2",
+        "dspark-lfm2-moe",
+        "dspark-qwen",
+    ],
 )
 @parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
 def test_generation_and_request_reset(family, temperature, seed):
@@ -295,9 +1959,305 @@ def test_generation_and_request_reset(family, temperature, seed):
         drafter.draft_lens.append(999)
 
 
+def test_ricursive_dflash_capture_order_and_shared_weights():
+    mx.random.seed(53)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    drafter = dflash_drafter("ricursive-dflash2")
+    drafter.bind(target)
+    assert drafter.embed_tokens is model.model.embed_tokens
+    assert drafter.lm_head is model.lm_head
+    # The released drafter shares the raw embedding table, before target scaling.
+    assert drafter.embed_scale == 1.0
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    actual = model(ids, capture_layer_ids=[4, 0, 2])
+    captured = model(ids, capture_layer_ids=list(range(5))).hidden_states
+    equal(actual.hidden_states, [captured[index] for index in [4, 0, 2]])
+    for invalid in ([0, 0], [-1], [5], [True]):
+        with pytest.raises(ValueError, match="capture_layer_ids"):
+            model(ids, capture_layer_ids=invalid)
+
+
+@parametrize("layer_index", [0, 1])
+def test_ricursive_dflash_no_rope_and_four_tap_convolution(layer_index):
+    drafter = dflash_drafter("ricursive-dflash2")
+    layer = drafter.layers[layer_index]
+    calls = []
+
+    def rope(x, offset=0):
+        calls.append(offset)
+        return drafter.rope(x, offset=offset)
+
+    assert drafter.config.no_rope_layers == [1]
+    assert layer.attention_conv.base_kernel.shape == (2, 4, 64)
+    output = layer(
+        mx.ones((1, 3, 64), dtype=mx.bfloat16),
+        mx.ones((1, 6, 64), dtype=mx.bfloat16),
+        rope,
+        KVCache(),
+    )
+    assert mx.isfinite(output).all().item()
+    assert len(calls) == (3 if layer_index == 0 else 0)
+
+
+@parametrize("quantized_weights", [False, True])
+@parametrize("batch", [1, 2])
+@parametrize("prefix,length", [(0, 3), (7, 10)])
+def test_ricursive_dflash_verification_and_rotating_rollback(
+    quantized_weights, batch, prefix, length
+):
+    mx.random.seed(73)
+    target = dflash_target("ricursive-dflash2")
+    model = target.language_model
+    if quantized_weights:
+        # Exercise the fused affine kernel as well as native batch fallback.
+        model = type(model)(
+            replace(model.config, hidden_size=512, intermediate_size=1024, head_dim=128)
+        )
+        model.set_dtype(mx.bfloat16)
+        nn.quantize(model, group_size=64, bits=4)
+        model.eval()
+    caches = [
+        model.make_cache() if batch == 1 else _make_cache(model, [0] * batch)
+        for _ in range(2)
+    ]
+    prompt = mx.random.randint(0, 128, (batch, prefix))
+    if prefix:
+        for cache in caches:
+            mx.eval(model(prompt, cache=cache).logits)
+    for accepted in (0, length // 2, length - 1):
+        block = mx.random.randint(0, 128, (batch, length))
+        serial_cache = deepcopy(caches[0])
+        serial = [
+            model(
+                block[:, index : index + 1],
+                cache=serial_cache,
+                capture_layer_ids=[0, 2, 4],
+            )
+            for index in range(length)
+        ]
+        actual = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate([part.logits for part in serial], axis=1))
+        equal(
+            actual.hidden_states,
+            [
+                mx.concatenate(parts, axis=1)
+                for parts in zip(*(part.hidden_states for part in serial))
+            ],
+        )
+        model.rollback_speculative_cache(caches[1], actual.gdn_states, accepted, length)
+        assert not actual.gdn_states.active
+        for index in range(accepted + 1):
+            mx.eval(model(block[:, index : index + 1], cache=caches[0]).logits)
+        probe = mx.random.randint(0, 128, (batch, 1))
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+        for reference, restored in zip(*caches):
+            equal(mx.array(reference.offset), mx.array(restored.offset))
+        aborted = model(
+            block, cache=caches[1], capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        mx.eval(aborted.logits)
+        aborted.gdn_states.abort()
+        equal(
+            model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+        )
+
+
+@parametrize("family", ["dflash2", "ricursive-dflash2"])
+@parametrize("batch", [1, 2, 4])
+def test_dflash2_batched_drafting_keeps_independent_caches(family, batch):
+    mx.random.seed(103)
+    target, draft = dflash_target(family), dflash_drafter(family)
+    target.language_model.set_dtype(mx.float32)
+    draft.set_dtype(mx.float32)
+    draft.bind(target)
+    draft.eval()
+    for layer in draft.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            conv.base_kernel = mx.random.normal(conv.base_kernel.shape) * 0.05
+    serial_caches = [draft.make_cache() for _ in range(batch)]
+    batch_caches = [draft.make_cache() for _ in range(batch)]
+    width = draft.config.hidden_size * len(draft.config.target_layer_ids)
+    for step in range(3):
+        hidden = [
+            mx.random.normal((1, (11 - row) if step == 0 else row + 1, width))
+            for row in range(batch)
+        ]
+        anchors = list(range(1 + step, batch + 1 + step))
+        expected = mx.concatenate(
+            [
+                draft.draft_block(anchor, h, cache, 3, greedy)
+                for anchor, h, cache in zip(anchors, hidden, serial_caches)
+            ]
+        )
+        actual = draft.draft_batch(anchors, hidden, batch_caches, 3, greedy, mx.int32)
+        equal(actual, expected)
+        for actual_row, expected_row in zip(batch_caches, serial_caches):
+            for actual_cache, expected_cache in zip(actual_row, expected_row):
+                assert actual_cache.offset == expected_cache.offset
+                equal(actual_cache.state, expected_cache.state, atol=2e-5, rtol=2e-5)
+
+
+@parametrize("prefix,padding", [(0, 0), (3, 0), (3, 2), (9, 0), (9, 2)])
+def test_ricursive_ragged_verification_matches_independent_requests(prefix, padding):
+    mx.random.seed(127)
+    model = dflash_target("ricursive-dflash2").language_model
+    model.set_dtype(mx.float32)
+    cache = _make_cache(model, [0, padding])
+    if prefix:
+        mx.eval(model(mx.random.randint(1, 30, (2, prefix)), cache=cache).logits)
+    references = [deepcopy(cache) for _ in range(2)]
+    for i, row in enumerate(references):
+        for entry in row:
+            entry.filter(mx.array([i], mx.int32))
+    for accepted in ([1, 3], [4, 2], [2, 4]):
+        ids = mx.random.randint(1, 30, (2, 4))
+        expected = []
+        for i, row in enumerate(references):
+            temporary = deepcopy(row)
+            outputs = [
+                model(ids[i : i + 1, t : t + 1], cache=temporary).logits
+                for t in range(4)
+            ]
+            expected.append(mx.concatenate(outputs, axis=1))
+        actual = model(
+            ids, cache=cache, capture_layer_ids=[0, 2, 4], speculative_verify=True
+        )
+        equal(actual.logits, mx.concatenate(expected), atol=3e-5, rtol=3e-5)
+        actual.gdn_states.commit(accepted)
+        for i, (row, count) in enumerate(zip(references, accepted)):
+            for t in range(count):
+                mx.eval(model(ids[i : i + 1, t : t + 1], cache=row).logits)
+            for a, e in zip(cache, row):
+                a, e = a.extract(i), e.extract(0)
+                assert a.offset == e.offset
+                equal(a.state, e.state, atol=3e-5, rtol=3e-5)
+
+
+@parametrize("window", [None, 8])
+def test_ricursive_cache_batch_lifecycle(window):
+    arch = module("models.ricursive.cache")
+
+    def single():
+        return arch.KVCache() if window is None else arch.RotatingKVCache(window)
+
+    def content(cache):
+        if window is None:
+            return cache.state
+        return tuple(
+            cache._temporal_order(getattr(cache, name))[..., -window:, :]
+            for name in ("keys", "values")
+        )
+
+    original = single()
+    k = mx.arange(20, dtype=mx.float32).reshape(1, 1, 5, 4)
+    original.update_and_fetch(k, k * 2)
+    warm = original.to_batch([3])
+    equal(content(warm.extract(0)), content(original))
+    with pytest.raises(ValueError):
+        original.to_batch([0, 0])
+    batch = original.prefix_cache_merge([original, original], [5, 5])
+    transaction = start_speculative_cache([batch], 4)
+    for t in range(4):
+        block = mx.full((2, 1, 1, 4), t + 20, mx.float32)
+        batch.update_and_fetch(block, block * 2)
+    transaction.commit([1, 3])
+    references = [batch.extract(i) for i in range(2)] + [original]
+    batch = type(batch).from_state(batch.state, batch.meta_state)
+    batch.extend(warm)
+    batch.filter(mx.array([2, 0, 1], mx.int32))
+    for i, reference in enumerate([references[j] for j in [2, 0, 1]]):
+        equal(content(batch.extract(i)), content(reference))
+    batch.prepare(lengths=[1, 2, 3], right_padding=[2, 1, 0])
+    block = mx.full((3, 1, 3, 4), 42, mx.float32)
+    batch.update_and_fetch(block, block * 2)
+    batch.finalize()
+    for i, (reference, n) in enumerate(
+        zip([references[j] for j in [2, 0, 1]], [1, 2, 3])
+    ):
+        reference.update_and_fetch(block[i : i + 1, :, :n], block[i : i + 1, :, :n] * 2)
+        assert batch.extract(i).offset == reference.offset
+        equal(content(batch.extract(i)), content(reference))
+
+    empty = single().to_batch([0, 1])
+    restored = type(empty).from_state(empty.state, empty.meta_state)
+    restored.update_and_fetch(block[:2], block[:2])
+    equal(restored.offset, mx.array([3, 2]))
+
+
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("bits", [2, 4, 8])
+@parametrize("batch,length", [(2, 3), (4, 5), (8, 8)])
+def test_native_affine_batch_projection(dtype, bits, batch, length):
+    from mlx_vlm.models.quantized import native_affine_batch_linear
+
+    mx.random.seed(131)
+    for group_size, outputs in [(32, 67), (64, 1024), (128, 256)]:
+        layer = nn.Linear(512, outputs, bias=True)
+        layer.set_dtype(dtype)
+        layer = layer.to_quantized(group_size=group_size, bits=bits)
+        layer.eval()
+        inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+        actual = native_affine_batch_linear(layer, inputs)
+        if actual is None:
+            pytest.skip("Native affine batch QMV is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(inputs[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+
+
+@parametrize(
+    "dtype,kind",
+    [(dtype, "dense") for dtype in (mx.bfloat16, mx.float16)]
+    + list(
+        product(
+            (mx.bfloat16, mx.float16, mx.float32),
+            ("weight_scale_2", "weight_global_scale"),
+        )
+    ),
+)
+@parametrize("batch,length", [(1, 3), (2, 4), (4, 5), (8, 8)])
+def test_native_block_projection(dtype, batch, length, kind):
+    from mlx_vlm.models.linear import native_block_linear
+
+    mx.random.seed(1337)
+    for inputs, outputs in [(1024, 67), (1024, 2048), (4096, 512)]:
+        layer = nn.Linear(inputs, outputs, bias=kind != "dense")
+        layer.weight = mx.random.normal(layer.weight.shape)
+        layer.set_dtype(dtype)
+        if kind != "dense":
+            layer = ScaledQuantizedLinear(
+                layer.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+                mx.array(0.027 if kind == "weight_scale_2" else 37.0),
+                kind,
+                pre_quant_scale=mx.random.uniform(0.5, 1.5, (inputs,)),
+            )
+        layer.eval()
+        x = mx.random.normal((batch, length, inputs)).astype(dtype)
+        actual = native_block_linear(layer, x)
+        if actual is None:
+            pytest.skip("Native block projection is unavailable on this device")
+        expected = mx.concatenate(
+            [layer(mx.contiguous(x[:, t : t + 1])) for t in range(length)], axis=1
+        )
+        equal(actual, expected)
+        equal(native_batch_linear(layer, x), expected)
+
+
 @parametrize(
     "family,failure",
-    [("qwen", False), ("glm", False), ("deepseek", False), ("glm", True)],
+    [
+        ("qwen", False),
+        ("glm", False),
+        ("deepseek", False),
+        ("ling", False),
+        ("glm", True),
+    ],
 )
 def test_mtp_generation(family, failure, monkeypatch):
     mx.random.seed(2127)
@@ -348,10 +2308,14 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(TINY_MODELS))
+@parametrize(
+    "family,length",
+    [("qwen", 4), ("glm", 4), ("deepseek", 4), ("ling", 4), ("ling", 9)],
+)
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_verify_commit_matches_decode(family, batch, dtype):
+@parametrize("quantized", [False, True])
+def test_verify_commit_matches_decode(family, batch, dtype, quantized, length):
     mx.random.seed(2127)
     model, _ = language(family, inference=True)
     model.load_weights(
@@ -360,6 +2324,20 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             for key, value in tree_flatten(model.parameters())
         ]
     )
+    if quantized:
+        predicate = getattr(model, "quant_predicate", None) or (
+            lambda path, module: True
+        )
+        nn.quantize(
+            model,
+            bits=4,
+            group_size=32,
+            class_predicate=lambda path, module: (
+                hasattr(module, "to_quantized")
+                and module.weight.shape[-1] % 32 == 0
+                and predicate(path, module)
+            ),
+        )
     model.eval()
     reference, actual = [_make_cache(model, [0] * batch) for _ in range(2)]
     prefix = mx.broadcast_to((mx.arange(19)[None] % 30) + 1, (batch, 19))
@@ -384,23 +2362,26 @@ def test_verify_commit_matches_decode(family, batch, dtype):
             assert mx.array_equal(actual, expected).item()
 
     # Each model owns its verifier; compare blocks with one-token verifier calls.
-    for retained in (1, 4, 3):
-        tokens = mx.broadcast_to(mx.array([[4, 5, 6, 7]]), (batch, 4))
+    for retained in (1, length, length - 1):
+        tokens = mx.broadcast_to(mx.arange(4, 4 + length)[None], (batch, length))
         oracle = deepcopy(reference)
+        accepted = None
         hidden_steps, logit_steps = [], []
-        for i in range(4):
+        for i in range(length):
             hidden, logits, transaction = verify(tokens[:, i : i + 1], oracle)
             hidden_steps.append(hidden)
             logit_steps.append(logits)
             transaction.commit([1] * batch)
+            if i + 1 == retained:
+                accepted = deepcopy(oracle)
         hidden, logits, transaction = verify(tokens, actual)
         compare(hidden, mx.concatenate(hidden_steps, 1))
         compare(logits, mx.concatenate(logit_steps, 1))
         equal(greedy(logits), greedy(mx.concatenate(logit_steps, 1)))
         transaction.commit([retained] * batch)
-        for i in range(retained):
-            _, _, transaction = verify(tokens[:, i : i + 1], reference)
-            transaction.commit([1] * batch)
+        # Reuse the independent one-token oracle at the accepted prefix.
+        # Replaying that prefix again would perform the same verifier calls.
+        reference = accepted
         probe = mx.full((batch, 1), 20)
         compare(model(probe, cache=reference).logits, model(probe, cache=actual).logits)
 
@@ -443,6 +2424,44 @@ def test_quantized_linear_and_argmax(mode, bits, size, batch):
     allowed = mx.arange(batch * 3, dtype=mx.int32).reshape(batch, 3) % 16
     mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
     equal(quantized.decode_quantized_argmax(linear, inputs, token_mask=mask), allowed)
+
+
+@parametrize("mode,bits,size", [("affine", 4, 64), ("affine", 5, 64), ("mxfp8", 8, 32)])
+@parametrize("sharding", ["all-to-sharded", "sharded-to-all"])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("batch,width", [(1, 512), (2, 512), (1, 128)])
+def test_sharded_block_projection(
+    mode, bits, size, sharding, dtype, batch, width, monkeypatch
+):
+    from mlx.nn.layers.distributed import shard_linear
+
+    mx.random.seed(2130)
+    dense = nn.Linear(width, 32, bias=True)
+    dense.load_weights(
+        [(k, v.astype(dtype)) for k, v in tree_flatten(dense.parameters())]
+    )
+    layer = shard_linear(
+        nn.QuantizedLinear.from_linear(dense, mode=mode, bits=bits, group_size=size),
+        sharding,
+    )
+    layer.eval()
+    inputs = mx.random.normal((batch, 8, width)).astype(dtype)[:, ::2]
+    expected = mx.concatenate(
+        [layer(mx.contiguous(inputs[:, i : i + 1])) for i in range(4)], axis=1
+    )
+    mx.eval(expected)
+    if (
+        sharding == "all-to-sharded"
+        and batch == 1
+        and width == 512
+        and dtype != mx.float32
+    ):
+        # Column shards must enter the shared block kernel, not a per-token loop.
+        def fail(*args, **kwargs):
+            raise AssertionError("tokenwise fallback")
+
+        monkeypatch.setattr(type(layer), "__call__", fail)
+    equal(native_batch_linear(layer, inputs), expected)
 
 
 @parametrize("mode,bits,size", formats((32, 64, 128)))
@@ -526,6 +2545,28 @@ def test_affine_switch_projection_parity(bits, dtype, projection):
     equal(actual, expected)
 
 
+@parametrize("width,intermediate", [(512, 64), (4096, 640)])
+@parametrize("batch", [1, 4])
+@parametrize("length", [2, 4])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_switch_glu_block_matches_decode(width, intermediate, batch, length, dtype):
+    mx.random.seed(2527)
+    mlp = SwitchGLU(width, intermediate, 8)
+    mlp.set_dtype(dtype)
+    nn.quantize(mlp, bits=4, group_size=64)
+    mlp.eval()
+    inputs = mx.random.normal((batch, length, width)).astype(dtype)
+    indices = mx.broadcast_to(mx.arange(8), (batch, length, 8))
+    expected = mx.concatenate(
+        [
+            mlp(mx.contiguous(inputs[:, i : i + 1]), indices[:, i : i + 1])
+            for i in range(length)
+        ],
+        axis=1,
+    )
+    equal(mlp(inputs, indices), expected)
+
+
 @parametrize("bits", [4, 5, 8])
 @parametrize("dtype", [mx.bfloat16, mx.float16])
 @parametrize("batch", [1, 2])
@@ -584,6 +2625,221 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     generator.close()
 
 
+def thinking_criteria(budget, *, enabled=True, preopened=True):
+    tokenizer = NS(
+        encode=lambda text, **kw: [{"<think>": 1, "\n": 2, "</think>": 3}[text]]
+    )
+    return ThinkingBudgetCriteria(
+        tokenizer,
+        budget,
+        thinking_start_token="<think>",
+        enable_thinking=enabled,
+        prompt_preopens_thinking=preopened,
+    )
+
+
+def test_thinking_budget_uniform_truncation_counts_only_retained_tokens():
+    criteria = [thinking_criteria(1), thinking_criteria(5)]
+    assert common._apply_thinking_budget(
+        [7, 7], [list(range(50, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([2, 2], [[50, 51, 2], [50, 51, 52]])
+    assert criteria[1].thinking_token_count == 3
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The first row's pending closing token shortens the second row again.
+    assert common._apply_thinking_budget(
+        [4, 4], [list(range(53, 58))] * 2, criteria, [0, 1], uniform=True
+    ) == ([0, 0], [[3], [53]])
+    assert not criteria[0].in_thinking
+    assert criteria[1].thinking_token_count == 4
+    assert criteria[1].pop_forced_token_id() is None
+
+    # The remaining row closes only after spending its own retained budget.
+    assert common._apply_thinking_budget([3], [[54, 55, 56, 57]], criteria, [1]) == (
+        [2],
+        [[54, 55, 2]],
+    )
+    assert common._apply_thinking_budget([1], [[56, 57]], criteria, [1]) == (
+        [0],
+        [[3]],
+    )
+    assert not criteria[1].in_thinking
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("batch,uniform", [(1, False), (2, False), (2, True)])
+@parametrize(
+    "budget,token,enabled",
+    [
+        (0, 4, True),
+        (2, 4, True),
+        (20, 4, True),
+        (0, 3, True),
+        (0, 2, True),
+        (0, 4, False),
+    ],
+)
+@parametrize("greedy_sampling", [True, False])
+def test_thinking_budget_rounds(
+    kind, batch, uniform, budget, token, enabled, greedy_sampling
+):
+    target = TransactionTarget(token)
+    target.requires_uniform_batch_acceptance = uniform
+    drafter = TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
+    caches[0][0] = mx.zeros((batch, 1))
+    initial = mx.zeros((batch, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    criteria = [
+        thinking_criteria(budget + row * 3, enabled=enabled) for row in range(batch)
+    ]
+    expected = []
+    references = []
+    for row in range(batch):
+        reference = thinking_criteria(budget + row * 3, enabled=enabled)
+        tokens = [token]
+        reference(token)
+        for _ in range(11):
+            forced = reference.pop_forced_token_id()
+            next_token = token if forced is None else forced
+            tokens.append(next_token)
+            reference(next_token)
+        expected.append(tokens)
+        references.append(reference)
+
+    rounds = getattr(speculative, f"_{kind}_rounds" + ("_batch" if batch > 1 else ""))
+    options = dict(
+        first_bonus=token if batch == 1 else mx.full((batch,), token, dtype=mx.int32),
+        max_tokens=12,
+        sampler=greedy,
+        greedy_sampling=greedy_sampling,
+        draft_block_size=5,
+        thinking_budget_criteria=criteria[0] if batch == 1 else criteria,
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    actual = [[token] for _ in range(batch)]
+    iterator = rounds(target, drafter, caches, mx.zeros((batch, 1, 4)), **options)
+    for tokens, _ in iterator:
+        for row, value in enumerate([tokens] if batch == 1 else tokens):
+            if value is not None:
+                actual[row].append(value)
+    assert actual == expected
+    for state, reference in zip(criteria, references):
+        assert state.in_thinking == reference.in_thinking
+        assert state.thinking_token_count == reference.thinking_token_count
+
+
+@parametrize("kind", ["mtp", "dflash", "eagle3"])
+@parametrize("budget", [0, 2])
+def test_thinking_budget_trims_cache_before_forced_bonus(kind, budget):
+    target, drafter = TransactionTarget(4), TransactionDrafter()
+    drafter.config.block_size = 5
+    caches = [ArraysCache(1), KVCache()]
+    caches[0][0] = mx.zeros((1, 1))
+    initial = mx.zeros((1, 1, 2, 1))
+    caches[1].update_and_fetch(initial, initial)
+    options = dict(
+        first_bonus=4,
+        max_tokens=12,
+        sampler=greedy,
+        draft_block_size=5,
+        thinking_budget_criteria=thinking_criteria(budget),
+    )
+    if kind == "mtp":
+        options["shared_kv_states"] = {}
+    iterator = getattr(speculative, f"_{kind}_rounds")(
+        target, drafter, caches, mx.zeros((1, 1, 4)), **options
+    )
+    assert next(iterator)[0] == (2 if budget == 0 else 4)
+    # The forced newline is the uncached bonus. Only the preceding tokens
+    # (including the old bonus) may remain in either cache.
+    assert drafter.accept_lens == [budget]
+    assert caches[1].offset == 2 + budget + 1
+    assert caches[0][0].item() == budget + 1
+    iterator.close()
+
+
+def test_thinking_budget_tracks_generated_opening_and_filtered_rows():
+    states = [
+        thinking_criteria(0, preopened=False),
+        thinking_criteria(1, preopened=False),
+    ]
+    for state, token in zip(states, [4, 1]):
+        state(token)
+    counts, rows = common._apply_thinking_budget([3], [[4, 4, 4, 4]], states, [1])
+    assert counts == [2] and rows == [[4, 4, 2]]
+    assert states[0].thinking_token_count == 0
+    counts, rows = common._apply_thinking_budget([2], [[4, 4, 4]], states, [1])
+    assert counts == [0] and rows == [[3]]
+    assert not states[1].in_thinking
+
+
+@parametrize("batch", [False, True])
+def test_thinking_budget_generation_matches_autoregressive(batch):
+    mx.random.seed(37)
+    target, drafter = dflash_target("dflash2"), dflash_drafter("dflash2")
+    results = []
+    for use_draft in (False, True):
+        options = (
+            dict(draft_model=drafter, draft_kind="dflash", draft_block_size=5)
+            if use_draft
+            else {}
+        )
+        if batch:
+            processor = NS(stopping_criteria=StoppingCriteria([99]))
+            generator = BatchGenerator(
+                target.language_model,
+                processor,
+                max_tokens=16,
+                greedy_sampling=True,
+                **options,
+            )
+            try:
+                prompts = [[4, 5, 6], [7, 8]]
+                uids = generator.insert(
+                    prompts,
+                    prompt_kwargs=[
+                        target.get_input_embeddings(mx.array([ids])).to_dict()
+                        for ids in prompts
+                    ],
+                    thinking_budget_criteria=[
+                        thinking_criteria(0),
+                        thinking_criteria(4),
+                    ],
+                )
+                tokens = {uid: [] for uid in uids}
+                while generator.has_work:
+                    _, responses = generator.next()
+                    for response in responses:
+                        if response.token is not None:
+                            tokens[response.uid].append(response.token)
+                results.append(list(tokens.values()))
+            finally:
+                generator.close()
+        else:
+            criteria = thinking_criteria(2)
+            tokens = []
+            for token, _ in generate_step(
+                mx.array([[4, 5, 6]]),
+                target,
+                None,
+                None,
+                max_tokens=16,
+                temperature=0,
+                thinking_budget_criteria=criteria,
+                **options,
+            ):
+                tokens.append(token)
+                if not use_draft:
+                    criteria(token)
+            results.append([tokens])
+    assert results[0] == results[1]
+    assert all(3 in row for row in results[1])
+    assert drafter.draft_lens
+
+
 def test_acceptance_walk_and_budgets():
     drafts = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
     for retained, budget in product(range(4), (0, 1, 4)):
@@ -633,7 +2889,16 @@ def test_sampler_rng_isolation():
     assert first.shape == (1,) and mx.array_equal(first, second).item()
 
 
-@parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
+@parametrize(
+    "family,quant",
+    [
+        ("qwen", "mxfp8"),
+        ("glm", "affine"),
+        ("glm", "mxfp8"),
+        ("ling", "affine"),
+        ("ling", "mxfp8"),
+    ],
+)
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     name = TINY_MODELS[family]["module"]
     text = tiny_config(family)
@@ -644,7 +2909,10 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
         else f"model.language_model.layers.{text.num_hidden_layers}.eh_proj"
     )
     key = "layers.0.mlp.down_proj" if family == "qwen" else "eh_proj"
-    fp8 = family == "qwen" or quant == "affine"
+    if family == "ling":
+        prefix = f"model.layers.{text.num_hidden_layers}.attention.q_b_proj"
+        key = "mtp.attention.q_b_proj"
+    fp8 = family in ("qwen", "ling") or quant == "affine"
     config = dict(model_type=name, text_config=text.to_dict())
     weights = {prefix + ".weight": mx.ones((128, 128), dtype=mx.bfloat16)}
     if fp8:
@@ -673,7 +2941,9 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
     assert (key + ".biases" in written) == (quant == "affine")
 
 
-@parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
+@parametrize(
+    "family", ["dflash2", "ricursive-dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"]
+)
 def test_checkpoint_routing_and_validation(tmp_path, family):
     settings = dflash_config(family)
     (tmp_path / "config.json").write_text(json.dumps(settings))
@@ -992,6 +3262,7 @@ def test_bundled_qwen_mtp_kind_and_standalone_loading(tmp_path, type_key, model_
 @parametrize(
     "family, model_type",
     [
+        ("ling", "bailing_hybrid"),
         ("glm", "glm5_next"),
         ("glm", "glm5_next_text"),
         ("deepseek", "deepseek_v4"),
@@ -1026,7 +3297,26 @@ def test_load_registered_native_drafter(
     reference.set_dtype(mx.bfloat16)
     weights = {}
     for key, value in tree_flatten(reference.parameters()):
-        if family == "glm":
+        if family == "ling":
+            if key == "mtp.attention.unembed_out.weight":
+                continue
+            if key == "mtp.attention.embed_q.weight":
+                value = mx.concatenate(
+                    [
+                        value.swapaxes(-1, -2),
+                        reference.mtp.attention.unembed_out.weight,
+                    ],
+                    axis=1,
+                ).reshape(-1, text["kv_lora_rank"])
+                key = "mtp.attention.kv_b_proj.weight"
+            key = f"model.layers.{text['num_hidden_layers']}." + key.removeprefix(
+                "mtp."
+            )
+            if ".switch_mlp." in key:
+                for expert, tensor in enumerate(value):
+                    weights[key.replace(".switch_mlp.", f".experts.{expert}.")] = tensor
+                continue
+        elif family == "glm":
             key = key.removeprefix("mtp_block.")
             key = key.replace("shared_head_norm.", "shared_head.norm.")
             key = f"model.language_model.layers.{text['num_hidden_layers']}.{key}"
@@ -1403,6 +3693,80 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
     assert all(0 <= token < 32 for token in tokens[0].tolist())
 
 
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("batch", [1, 2])
+@parametrize("quantized", [False, True])
+def test_ling_mtp_verified_cache_skips_past_expert_outputs(
+    dtype, batch, quantized, monkeypatch
+):
+    mx.random.seed(109)
+    target, cfg = language("ling", inference=True)
+    target.set_dtype(dtype)
+    draft = mtp_drafter("ling", cfg)
+    reference = mtp_drafter("ling", cfg)
+    for model in (draft, reference):
+        model.set_dtype(dtype)
+        if quantized:
+            nn.quantize(
+                model,
+                bits=8,
+                group_size=32,
+                mode="mxfp8",
+                class_predicate=lambda path, module: (
+                    hasattr(module, "to_quantized")
+                    and module.weight.shape[-1] % 32 == 0
+                    and model.quant_predicate(path, module)
+                ),
+            )
+        model.eval()
+    padding = None if batch == 1 else [2, 0]
+    draft.reset(target, left_padding=padding)
+    prompt = mx.broadcast_to(mx.array([[1, 2, 3, 4, 5]]), (batch, 5))
+    hidden = mx.random.normal((batch, 5, cfg.hidden_size)).astype(dtype)
+    bonus = mx.full((batch,), 6, mx.int32)
+    draft.prefill_from_target_hidden(prompt, hidden, bonus, greedy, greedy=True)
+    mx.eval(draft.parameters(), draft.draft_eval_state())
+
+    reference.load_weights(tree_flatten(draft.parameters()))
+    reference.reset(target, left_padding=padding)
+    reference._cache = deepcopy(draft._cache)
+    reference._next_position = draft._next_position
+    experts = Mock(wraps=draft.mtp.mlp)
+    monkeypatch.setattr(draft.mtp, "mlp", experts)
+
+    for step, accepted in enumerate((0, 1, 3, 2)):
+        tokens = draft.draft_block(bonus, hidden[:, -1:], None, 4, greedy, greedy=True)
+        mx.eval(tokens, draft.draft_eval_state())
+        experts.reset_mock()
+        verified = mx.random.normal((batch, 4, cfg.hidden_size)).astype(dtype)
+        next_bonus = mx.full((batch, 1), 7 + step, mx.int32)
+        kept = mx.concatenate([tokens[:, :accepted], next_bonus], axis=1)
+
+        # The oracle runs the whole NEXTN layer for the verified prefix.
+        if accepted:
+            reference._forward_tokens(
+                tokens[:, :accepted], verified[:, :accepted], mx.int32
+            )
+        logits, expected_hidden = reference._forward_tokens(
+            next_bonus, verified[:, accepted : accepted + 1], mx.int32
+        )
+        reference._set_seed_from_hidden(logits, greedy, True)
+        reference._seed_hidden = expected_hidden
+        draft.accept_verified_tokens_batch(
+            verified, tokens, [accepted] * batch, kept.tolist(), greedy, mx.int32, True
+        )
+        mx.eval(draft.draft_eval_state(), reference.draft_eval_state())
+        equal(draft._cache[0].state, reference._cache[0].state)
+        equal(draft._seed_hidden, reference._seed_hidden)
+        equal(draft._seed_token, reference._seed_token)
+        equal(draft._cache[0].offset, reference._cache[0].offset)
+        assert draft._next_position == reference._next_position
+        assert draft._round_appended == 0
+        experts.assert_called_once()
+        assert experts.call_args.args[0].shape[:2] == (batch, 1)
+        bonus = next_bonus[:, 0]
+
+
 @parametrize("accepted", [0, 2])
 def test_eagle3_draft_replay(accepted):
     arch = module("speculative.drafters.eagle3")
@@ -1431,6 +3795,42 @@ def test_eagle3_draft_replay(accepted):
     assert drafter._draft_to_target(mx.array([[0, 1, 3]]), mx.int32).tolist() == [
         [0, 2, 6]
     ]
+
+
+def eagle3_drafter(hidden_size=16):
+    arch = module("speculative.drafters.eagle3")
+    cfg = arch.ModelConfig(
+        transformer_layer_config=values(
+            intermediate_size=32, head_dim=8, hidden_size=hidden_size
+        ),
+        **DATA["eagle3"],
+    )
+    return arch.Model(cfg)
+
+
+def test_eagle3_bind_without_embed_tokens():
+    # SGLang EAGLE-3 drafters ship no embedding; load_model sets it to None.
+    drafter = eagle3_drafter()
+    drafter.embed_tokens = None
+    target_embed = nn.Embedding(32, 16)
+    drafter.bind(NS(model=NS(embed_tokens=target_embed)))
+    assert drafter.embed_tokens is target_embed
+
+    drafter.embed_tokens = None
+    with pytest.raises(AttributeError, match="embed_tokens"):
+        drafter.bind(NS())
+
+
+def test_eagle3_bind_quantized_target_embedding():
+    drafter = eagle3_drafter(hidden_size=64)
+    target_embed = nn.QuantizedEmbedding(32, 64)
+    drafter.bind(NS(embed_tokens=target_embed))
+    assert drafter.embed_tokens is target_embed
+
+    # A target embedding with a different vocab is not shared.
+    own_embed = drafter.embed_tokens = nn.Embedding(32, 64)
+    drafter.bind(NS(embed_tokens=nn.QuantizedEmbedding(48, 64)))
+    assert drafter.embed_tokens is own_embed
 
 
 @parametrize("offsets,length", [([128], 8), ([10], 6), ([5, 8], 8), ([128, 10], 8)])
@@ -1510,7 +3910,8 @@ def test_padded_prefill_chunks(padding):
         assert caches[1].left_padding.tolist() == expected_padding
 
 
-def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+@parametrize("chunk_size", [1, 3])
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output(chunk_size):
     lm, _ = language("qwen")
     model = lm.model
     cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
@@ -1519,13 +3920,69 @@ def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
         layer_cache.filter(mx.array([0]))
 
     singleton_cache = [ArraysCache(2), KVCache()]
-    actual = model(mx.array([[0, 0, 4]]), cache=cache)
+    pending = mx.array([[0, 0, 4]])
+    for start in range(0, pending.shape[1], chunk_size):
+        actual = model(pending[:, start : start + chunk_size], cache=cache)
     expected = model(mx.array([[4]]), cache=singleton_cache)
     assert mx.array_equal(actual[:, -1:], expected).item()
 
     actual = model(mx.array([[5]]), cache=cache)
     expected = model(mx.array([[5]]), cache=singleton_cache)
     assert mx.array_equal(actual, expected).item()
+
+
+def test_mtp_batch_filter_keeps_survivor_rope_deltas():
+    """A finished row's M-RoPE delta must leave the batch with its row: the
+    continuous-batching filter drops the row from the caches and the drafter,
+    and the target's stored per-row deltas are sliced with ``[:batch_size]``
+    on the next verify, so an unfiltered store hands a surviving row the
+    finished row's position offset. The survivor must keep its own delta and
+    match the plain autoregressive continuation."""
+
+    def build():
+        mx.random.seed(23)
+        lm, cfg = language("qwen", inference=True)
+        lm.eval()
+        return lm, cfg
+
+    prompt = mx.array([[1, 5, 2, 7], [1, 5, 2, 7]])
+    model, config = build()
+    drafter = mtp_drafter("qwen", config)
+    drafter.eval()
+    caches = [ArraysCache(2, left_padding=[0, 0]), BatchKVCache([0, 0])]
+    out = model(prompt, cache=caches, return_hidden=True, return_shared_kv=True)
+    first = greedy(out.logits[:, -1])
+    # distinct per-row deltas, as images of different grid sizes would leave
+    model._rope_deltas = mx.array([[0], [1000]], dtype=mx.int32)
+    model._position_ids = None
+    rounds = mtp._mtp_rounds_batch(
+        model,
+        drafter,
+        caches,
+        out.hidden_states[-1],
+        {},
+        prompt_tokens=prompt,
+        first_bonus=first,
+        max_tokens=8,
+        sampler=greedy,
+        draft_block_size=4,
+        greedy_sampling=True,
+        stop_check=lambda row, _token: row == 0,
+    )
+    survivor = [first[1].item()]
+    survivor += [tokens[1] for tokens, _ in rounds if tokens[1] is not None]
+    assert model._rope_deltas.tolist() == [[1000]]
+
+    reference_model, _ = build()
+    cache = reference_model.make_cache()
+    token = greedy(reference_model(prompt[1:2], cache=cache).logits[:, -1])
+    reference_model._rope_deltas = mx.array([[1000]], dtype=mx.int32)
+    reference_model._position_ids = None
+    reference = [token.item()]
+    for _ in range(7):
+        token = greedy(reference_model(token[:, None], cache=cache).logits[:, -1])
+        reference.append(token.item())
+    assert survivor == reference
 
 
 @parametrize(
@@ -2037,6 +4494,149 @@ def test_rotating_ragged_commit_masks_rejected_tokens():
         assert sorted(x for x in visible.tolist() if x >= 0) == sorted(expected[-8:])
 
 
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("initial_length,decode", [(3, 0), (8, 0), (8, 3), (17, 1)])
+@parametrize("block", [2, 3, 8])
+def test_rotating_prefix_kernel_matches_independent_replay(
+    dtype, initial_length, decode, block, monkeypatch
+):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    base = BatchRotatingKVCache(8, [0, 2, 1, 0])
+    keys = mx.random.normal((4, 2, initial_length, 16)).astype(dtype)
+    values = mx.random.normal((4, 2, initial_length, 24)).astype(dtype)
+    base.update_and_fetch(keys, values)
+    for _ in range(decode):
+        base.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+    actual, reference = deepcopy(base), deepcopy(base)
+    for lengths in (
+        [block, 1, block - 1, 0],
+        [1] * 4,
+        [block] * 4,
+        [0] * 4,
+        [block - 1] * 4,
+    ):
+        k = mx.random.normal((4, 2, block, 16)).astype(dtype)
+        v = mx.random.normal((4, 2, block, 24)).astype(dtype)
+        a = start_speculative_cache([actual], block)
+        b = start_speculative_cache([reference], block)
+        actual.update_and_fetch(k, v)
+        reference.update_and_fetch(k, v)
+        a.commit(lengths)
+        with monkeypatch.context() as patch:
+            patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+            b.commit(lengths)
+        equal(actual.state, reference.state, atol=0, rtol=0)
+        assert actual.meta_state == reference.meta_state
+        assert "update_and_fetch" not in actual.__dict__
+    # Retained cache rows remain usable after filtering and snapshot/restore.
+    actual.filter([3, 1])
+    reference.filter([3, 1])
+    actual = deepcopy(actual)
+    a, b = start_speculative_cache([actual], block), start_speculative_cache(
+        [reference], block
+    )
+    actual.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    reference.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    a.commit([block, 0])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([block, 0])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.meta_state == reference.meta_state
+
+
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("total", [2, 3, 8])
+@parametrize("has_initial", [False, True])
+def test_temporal_prefix_selection_strides_and_zero_acceptance(
+    dtype, total, has_initial, monkeypatch
+):
+    from mlx_vlm.speculative import cache_kernels
+
+    # Views retain nontrivial batch, time and feature strides.
+    states = mx.random.normal((4, total + 1, 3, 38)).astype(dtype)[..., ::2]
+    middle, final = states[:, 1:total], states[:, total]
+    initial = states[:, 0] if has_initial else None
+    lengths = [0, 1, total - 1, total]
+    record = ("states", middle, final)
+    actual = ArraysCache._select_speculative_states(record, initial, lengths, total)
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "select_temporal_states", lambda *args: None)
+        expected = ArraysCache._select_speculative_states(
+            record, initial, lengths, total
+        )
+    equal(actual, expected, atol=0, rtol=0)
+
+
+def test_temporal_prefix_selection_retains_promoted_initial_dtype():
+    initial = mx.full((4, 3), 1.001, mx.float32)
+    middle = mx.full((4, 1, 3), 2, mx.bfloat16)
+    final = mx.full((4, 3), 3, mx.bfloat16)
+    output = ArraysCache._select_speculative_states(
+        ("states", middle, final), initial, [0, 1, 2, 0], 2
+    )
+    assert output.dtype == mx.float32
+    equal(
+        output,
+        mx.concatenate(
+            [
+                initial[:1],
+                middle[1, :1].astype(mx.float32),
+                final[2:3].astype(mx.float32),
+                initial[3:],
+            ]
+        ),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_rotating_prefix_commit_retains_incoming_dtype_promotion(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    actual = BatchRotatingKVCache(8, [0, 0])
+    old = mx.ones((2, 1, 12, 16), mx.bfloat16)
+    actual.update_and_fetch(old, old)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 1.001, mx.float32)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.keys.dtype == actual.values.dtype == mx.float32
+
+
+def test_rotating_prefix_commit_preserves_subclass_update_semantics(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    class ScaledRotatingCache(BatchRotatingKVCache):
+        def update_and_fetch(self, keys, values):
+            return super().update_and_fetch(keys * 2, values * 2)
+
+    actual = ScaledRotatingCache(8, [0, 0])
+    prefix = mx.ones((2, 1, 12, 16))
+    actual.update_and_fetch(prefix, prefix)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 7.0)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert bool(mx.any(actual.keys == 14).item())
+
+
 def test_temporal_cache_boundaries_and_failed_transactions():
     cache = ArraysCache(1)
     initial = mx.arange(6, dtype=mx.float32).reshape(2, 3)
@@ -2238,7 +4838,7 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
     equal(model(probes, cache=caches).logits, mx.concatenate(expected), atol=1e-4)
 
 
-@parametrize("family", ["glm", "qwen"])
+@parametrize("family", ["glm", "qwen", "ling"])
 @parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
@@ -2248,10 +4848,15 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
-        else arch.Qwen3_5GatedDeltaNet(cfg)
+        else (
+            arch.KimiDeltaAttention(cfg)
+            if family == "ling"
+            else arch.Qwen3_5GatedDeltaNet(cfg)
+        )
     )
     layer.eval()
-    cache = ArraysCache(2, left_padding=[0] * 3)
+    slots = 4 if family == "ling" else 2
+    cache = ArraysCache(slots, left_padding=[0] * 3)
     cache.prepare(lengths=[100] * 3)
     mx.eval(layer(mx.random.normal((3, 4, cfg.hidden_size)), cache=cache), cache.state)
     for retained in ([0, 2, 5], [3, 1, 4]):
@@ -2265,7 +4870,7 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
         for i in range(0, 5, step):
             mx.eval(layer(inputs[:, i : i + step], cache=cache))
         transaction.commit(retained)
-        for slot in range(2):
+        for slot in range(slots):
             expected = mx.concatenate(
                 [states[n][slot][row : row + 1] for row, n in enumerate(retained)]
             )
@@ -2346,6 +4951,11 @@ def test_filter_batch_keeps_padding_and_positions():
 def test_speculative_dispatch_errors_and_hidden_state():
     with pytest.raises(ValueError):
         speculative.get_speculative_rounds_batch("nope")
+    for kind in ("eagle3", "nope"):
+        with pytest.raises(ValueError, match="Shared speculative batches"):
+            speculative.make_speculative_batch(
+                None, None, [], None, draft_kind=kind, first_bonus=None, sampler=None
+            )
     hidden = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     assert (
         speculative.speculative_hidden_state("mtp", NS(hidden_states=hidden))
@@ -2365,3 +4975,546 @@ def test_speculative_lifetime_counters_survive_reset():
     snapshot = common.speculative_stats_snapshot(drafter)
     common._record_speculative_round(drafter, 2, 7)
     assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)
+
+
+def official_dspark_config(layout="speculators", **overrides):
+    params = deepcopy(DATA["official_dspark"])
+    if layout == "speculators":
+        params["speculators_model_type"] = "dspark"
+        params["aux_hidden_state_layer_ids"] = params.pop("target_layer_ids")
+        del params["num_target_layers"]
+    else:
+        params.update(params.pop("transformer_layer_config"))
+        params.update(model_type="qwen3", architectures=["Qwen3DSparkModel"])
+    return params | overrides
+
+
+@parametrize("layout", ["speculators", "openbmb"])
+@parametrize("anchor", [True, False])
+def test_official_dspark_config(layout, anchor):
+    arch = module("speculative.drafters.dspark")
+    raw = official_dspark_config(layout, sample_from_anchor=anchor)
+    assert get_model_type(raw) == "dspark"
+    cfg = arch.ModelConfig.from_dict(raw)
+    assert cfg.hidden_size == 32 and cfg.target_layer_ids == [0, 1]
+    assert cfg.block_size == (4 if layout == "speculators" and not anchor else 5)
+    assert cfg.num_target_layers == (None if layout == "speculators" else 4)
+    target = NS(
+        config=NS(hidden_size=32, vocab_size=64),
+        model=NS(layers=[None] * 4),
+        rollback_speculative_cache=Mock(),
+    )
+    validate_dflash_target(cfg, target, "DSpark")
+    target.model.layers = [None]
+    with pytest.raises(ValueError, match="layer"):
+        validate_dflash_target(cfg, target, "DSpark")
+
+
+def test_dspark_keeps_checkpoint_output_head():
+    arch = module("speculative.drafters.dspark")
+    cfg = arch.ModelConfig.from_dict(official_dspark_config())
+    draft = arch.Model(cfg)
+    weights = dict(tree_flatten(draft.parameters()))
+    weights["lm_head.weight"] = mx.random.normal((64, 32))
+    draft.load_weights(list(draft.sanitize(weights).items()), strict=True)
+    target = NS(
+        config=NS(hidden_size=32, vocab_size=64),
+        model=NS(layers=[None] * 4, embed_tokens=nn.Embedding(64, 32)),
+        lm_head=nn.Linear(32, 64, bias=False),
+        rollback_speculative_cache=Mock(),
+    )
+    draft.bind(target)
+    equal(draft.lm_head.weight, weights["lm_head.weight"])
+    assert draft.lm_head is not target.lm_head
+
+
+def test_dspark_reduced_vocabulary_conditions_on_target_ids(monkeypatch):
+    arch = module("speculative.drafters.dspark")
+    draft = arch.Model(
+        arch.ModelConfig.from_dict(official_dspark_config(draft_vocab_size=4))
+    )
+    weights = dict(tree_flatten(draft.parameters()))
+    weights.update(
+        d2t=mx.array([6, 8, 10, 12], dtype=mx.int64),
+        t2d=mx.zeros((64,), dtype=mx.bool_),
+    )
+    weights["lm_head.weight"] = mx.zeros((4, 32))
+    weights["markov_head.markov_w1.weight"] = mx.zeros((64, 8))
+    for row, column in zip([63, 6, 9, 12], range(4)):
+        weights["markov_head.markov_w1.weight"][row, column] = 1
+    weights["markov_head.markov_w2.weight"] = mx.concatenate(
+        [mx.eye(4), mx.zeros((4, 4))], axis=1
+    )
+    draft.load_weights(list(draft.sanitize(weights).items()), strict=True)
+    monkeypatch.setattr(
+        draft, "_hidden", lambda inputs, *args: mx.zeros((*inputs.shape, 32))
+    )
+    tokens = draft.draft_block(
+        63, None, None, 5, lambda logits: mx.argmax(logits, axis=-1)
+    )
+    assert tokens.tolist() == [[6, 9, 12, 15]]
+
+
+@parametrize("non_causal", [False, True])
+def test_speculators_sliding_attention_causality(non_causal):
+    arch = module("speculative.drafters.dspark")
+    raw = official_dspark_config(sliding_window_non_causal=non_causal)
+    raw["transformer_layer_config"].update(
+        layer_types=["sliding_attention", "full_attention"], sliding_window=8
+    )
+    draft = arch.Model(arch.ModelConfig.from_dict(raw))
+    x, context = mx.random.normal((1, 3, 32)), mx.random.normal((1, 3, 32))
+    changed = mx.concatenate([x[:, :2], x[:, 2:] + 10], axis=1)
+    for i, layer in enumerate(draft.layers):
+
+        def forward(value):
+            return layer.self_attn(value, context, draft.rope, draft.make_cache()[i])[
+                :, 0
+            ]
+
+        difference = mx.max(mx.abs(forward(x) - forward(changed))).item()
+        assert (difference < 1e-6) == (i == 0 and not non_causal)
+
+
+@parametrize("family", ["mellum", "deepseek_v41"])
+def test_native_split_load_and_greedy_generation(family, tmp_path):
+    mx.random.seed(7)
+    target = tiny_language_model(family)
+    raw = target.config.to_dict()
+    arch = module(
+        f"speculative.drafters.{family}_{'mtp' if family == 'mellum' else 'dspark'}"
+    )
+    opts = {} if family == "mellum" else dict(n_mtp_layers=2, markov_rank=8)
+    draft = arch.Model(arch.ModelConfig(text_config=raw, **opts))
+    source = {}
+    for key, value in tree_flatten(draft.parameters()):
+        if family == "mellum":
+            key = f"mtp.{key}"
+        elif key.startswith("markov_head."):
+            key = f"mtp.1.{key.replace('markov_w1', 'embed').replace('markov_w2', 'head')}"
+        else:
+            key = key.replace("stages.", "mtp.", 1)
+        if ".switch_mlp." in key:
+            for index, tensor in enumerate(value):
+                stem = key.replace(".switch_mlp.", f".experts.{index}.")
+                if family == "deepseek_v41":
+                    stem = (
+                        stem.replace("gate_proj", "w1")
+                        .replace("down_proj", "w2")
+                        .replace("up_proj", "w3")
+                    )
+                source[stem] = tensor
+        elif ".attn.wo_a.weight" in key:
+            source[key] = value.flatten(0, 1)
+        else:
+            source[key] = value
+    config, weights, path = split_checkpoint(tmp_path, raw, source, separate=True)
+    loaded, kind = load_drafter(str(path))
+    bundled, bundled_kind = load_drafter(str(tmp_path))
+    assert kind == bundled_kind == ("mtp" if family == "mellum" else "dflash")
+    equal(
+        dict(tree_flatten(loaded.parameters())),
+        dict(tree_flatten(bundled.parameters())),
+    )
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    embedding = getattr(target, "model", target).embed_tokens
+    outer = NS(
+        language_model=target,
+        config=target.config,
+        get_input_embeddings=lambda ids, *args, **kwargs: InputEmbeddingsFeatures(
+            inputs_embeds=embedding(ids)
+        ),
+    )
+
+    def run(**kwargs):
+        return [
+            int(token)
+            for token, _ in generate_step(
+                ids, outer, None, None, max_tokens=8, temperature=0, **kwargs
+            )
+        ]
+
+    assert run() == run(draft_model=loaded, draft_kind=kind, num_draft_tokens=3)
+    assert loaded.draft_lens
+
+
+@parametrize("name", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_qwen_text_aliases_share_native_splitter(name):
+    splitter = get_mtp_splitter(
+        source_config={"model_type": name, "mtp_num_hidden_layers": 1}
+    )
+    assert splitter.output_model_type == "qwen3_5_mtp"
+
+
+@parametrize("bits", [4, 8])
+def test_deepseek_v41_native_packed_weights(bits):
+    split = get_mtp_splitter("deepseek_v41")
+    raw = tiny_language_model("deepseek_v41").config.to_dict()
+    mode = f"mxfp{bits}"
+    original = mx.random.normal((32, 32))
+    packed, scales = mx.quantize(original, group_size=32, bits=bits, mode=mode)
+    prefix = "mtp.0.main_proj" if bits == 8 else "mtp.0.ffn.experts.0.w1"
+    source = {f"{prefix}.weight": packed.view(mx.uint8), f"{prefix}.scale": scales}
+    if bits == 4:
+        source.update(
+            {k.replace("experts.0", "experts.1"): v for k, v in list(source.items())}
+        )
+    converted = split.transform(source, raw, False)
+    name = "stages.0.main_proj" if bits == 8 else "stages.0.ffn.switch_mlp.gate_proj"
+    weight, scale = converted[f"{name}.weight"], converted[f"{name}.scales"]
+    if bits == 4:
+        weight, scale = weight[0], scale[0]
+    equal(
+        mx.dequantize(weight, scale, group_size=32, bits=bits, mode=mode),
+        mx.dequantize(packed, scales, group_size=32, bits=bits, mode=mode),
+    )
+    assert split.quantization_from_source(converted, {})[name]["mode"] == mode
+
+
+def ernie_echo_case():
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model, ModelConfig
+
+    target = make_ernie55_model()
+    draft = Model(ModelConfig(text_config=target.config))
+    draft.eval()
+    mx.eval(target.parameters(), draft.parameters())
+    return target, draft
+
+
+@pytest.mark.parametrize("length", [3, 16])
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_ernie_echo_projects_only_the_next_proposal(length, batch, dtype):
+    target, draft = ernie_echo_case()
+    target.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    lm = target.language_model
+    prompt = mx.broadcast_to(mx.arange(length)[None], (batch, length))
+    prefill = lm(prompt, cache=lm.make_cache(), return_hidden=True)
+    draft.reset(lm)
+    logits, hidden = draft._forward_tokens(prompt, prefill.hidden_states[-1])
+    h = hidden.reshape(batch, length, lm.config.hc_mult, lm.config.hidden_size)
+    expected = lm.multimax(lm.lm_head(draft.norm(draft.hc_head(h)).astype(mx.float32)))
+    assert logits.shape == (batch, 1, lm.config.vocab_size)
+    assert mx.allclose(logits, expected[:, -1:], atol=2e-5, rtol=2e-5).item()
+    assert all(cache.offset == length for cache in draft._cache)
+
+
+def distributed_echo_outputs(target, stage, barrier=None):
+    """Real ECHO draft/verify/rollback collectives for the shared TP harness."""
+    from mlx_vlm.generate.ar import _make_cache, generate_step
+    from mlx_vlm.models.ernie5_5_moe import Model as TargetModel
+    from mlx_vlm.speculative.drafters.ernie5_5_mtp import Model, ModelConfig
+
+    mx.random.seed(55)
+    draft = Model(ModelConfig(text_config=target.config))
+    draft.set_dtype(target.model.embed_tokens.weight.dtype)
+    draft.eval()
+    mx.eval(draft.parameters())
+    outputs = {}
+
+    def record(key, value):
+        stage(key)
+        mx.eval(value, draft.draft_eval_state())
+        outputs[key] = value
+        if barrier is not None:
+            barrier(key)
+
+    def check_rank_tokens(key, tokens):
+        # BF16 near-ties can change free-running tokens relative to the
+        # unsharded model. All TP ranks must nevertheless agree exactly.
+        group = target.sharding_group
+        if group is not None:
+            gathered = mx.distributed.all_gather(tokens.reshape(1, -1), group=group)
+            mx.eval(gathered)
+            assert mx.all(gathered == gathered[:1]).item(), key
+        if barrier is not None:
+            barrier(key)
+
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    for batch in (1, 2):
+        prompt = mx.broadcast_to(mx.arange(8)[None], (batch, 8))
+        for accepted in (0, 1, 2):
+            prefix = f"echo-batch={batch}-accepted={accepted}"
+            caches = _make_cache(target, [2, 0]) if batch == 2 else target.make_cache()
+            prefill = target(prompt, cache=caches, return_hidden=True)
+            draft.reset(target)
+            draft.set_shared_kv(
+                {}, 8, kv_valid_len=mx.array([6, 8]) if batch == 2 else 8
+            )
+            bonus = mx.full((batch,), 13)
+            draft.prefill_from_target_hidden(
+                prompt, prefill.hidden_states[-1], bonus, sampler, greedy=True
+            )
+            record(prefix + "-prefill", draft._seed_hidden)
+            tokens = draft.draft_block(
+                bonus, prefill.hidden_states[-1][:, -1:], None, 3, sampler, greedy=True
+            )
+            check_rank_tokens(prefix + "-draft", tokens)
+            # Teacher-force identical proposals for aligned verification and
+            # replay comparisons, independently of BF16 draft-token ties.
+            tokens = mx.broadcast_to(mx.array([[17, 19]]), (batch, 2))
+            verify = mx.concatenate([bonus[:, None], tokens], axis=1)
+            hidden, _, transaction = target.speculative_verify_hidden(verify, caches)
+            record(prefix + "-verify", target.speculative_logits_from_hidden(hidden))
+            # Force all acceptance lengths to exercise replay and rollback.
+            new_tokens = [
+                [int(t) for t in row[:accepted]] + [23] for row in tokens.tolist()
+            ]
+            draft.accept_verified_tokens_batch(
+                hidden, tokens, [accepted] * batch, new_tokens, sampler, greedy=True
+            )
+            target.rollback_speculative_cache(
+                caches, transaction, [accepted] * batch, 3
+            )
+            record(prefix + "-replay", draft._seed_hidden)
+            record(
+                prefix + "-next", target(mx.full((batch, 1), 23), cache=caches).logits
+            )
+
+    # The public generator must also keep draft and verifier collectives ordered.
+    wrapper = TargetModel(target.config)
+    wrapper.language_model = target
+    wrapper.eval()
+    previous = {}
+    for repeat, temperature in enumerate((0.0, 0.7, 0.0, 0.7)):
+        mx.random.seed(17)
+        tokens = []
+        for step, (token, _) in enumerate(
+            generate_step(
+                mx.arange(8)[None],
+                wrapper,
+                None,
+                None,
+                max_tokens=9,
+                temperature=temperature,
+                draft_model=draft,
+                draft_kind="mtp",
+                draft_block_size=3,
+            )
+        ):
+            tokens.append(int(token))
+            if barrier is not None:
+                barrier(f"echo-generation-{repeat}-{step}")
+        check_rank_tokens(f"echo-generation-{repeat}", mx.array(tokens))
+        if temperature in previous:
+            assert tokens == previous[temperature]
+        previous[temperature] = tokens
+
+    caches = _make_cache(target, [2, 0])
+    prompt = mx.broadcast_to(mx.arange(8)[None], (2, 8))
+    prefill = target(prompt, cache=caches, return_hidden=True)
+    rows = [[], []]
+    for step, (tokens, _) in enumerate(
+        mtp._mtp_rounds_batch(
+            wrapper,
+            draft,
+            caches,
+            prefill.hidden_states[-1],
+            {},
+            prompt_tokens=prompt,
+            first_bonus=sampler(prefill.logits[:, -1]),
+            max_tokens=8,
+            sampler=sampler,
+            draft_block_size=3,
+            greedy_sampling=True,
+        )
+    ):
+        for row, token in zip(rows, tokens):
+            if token is not None:
+                row.append(token)
+        if barrier is not None:
+            barrier(f"echo-batched-generation-{step}")
+    check_rank_tokens("echo-batched-generation", mx.array(rows))
+    return outputs
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("prompt_length", [7, 8, 10])
+@pytest.mark.parametrize("accepted", [0, 2, 4])
+def test_ernie_echo_rollback_matches_committed_prefix(
+    batch_size, prompt_length, accepted
+):
+    import numpy as np
+
+    from mlx_vlm.generate.ar import _make_cache
+
+    target = make_ernie55_model()
+    lm = target.language_model
+    padding = [3, 0] if batch_size == 2 else [0]
+    cache = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    reference = _make_cache(lm, padding) if batch_size > 1 else lm.make_cache()
+    prompt = mx.broadcast_to(
+        mx.arange(prompt_length)[None], (batch_size, prompt_length)
+    )
+    lm(prompt, cache=cache)
+    lm(prompt, cache=reference)
+    block = mx.broadcast_to(mx.arange(5)[None] + 15, (batch_size, 5))
+    hidden, _, state = lm.speculative_verify_hidden(block, cache)
+    mx.eval(hidden)
+    lm.rollback_speculative_cache(cache, state, [accepted] * batch_size, 5)
+    lm(block[:, : accepted + 1], cache=reference)
+    probe = mx.full((batch_size, 3), 21)
+    actual = lm(probe, cache=cache).logits
+    expected = lm(probe, cache=reference).logits
+    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    assert mx.array_equal(
+        mtp._mtp_cache_offset(cache), mtp._mtp_cache_offset(reference)
+    )
+    from mlx_vlm.models.cache import BatchPoolingCache
+
+    for actual_layer, expected_layer in zip(cache, reference):
+        for a, b in zip(actual_layer.caches, expected_layer.caches):
+            if isinstance(a, BatchPoolingCache):
+                # Transactions may compact unused physical pool columns. Compare
+                # every row's valid history, not allocator padding.
+                assert a._pool_lengths == b._pool_lengths
+                assert a.remainder == b.remainder
+                pairs = [
+                    (a.extract(i).state, b.extract(i).state) for i in range(batch_size)
+                ]
+            else:
+                pairs = [(a.state, b.state)]
+            for actual_state, expected_state in pairs:
+                for x, y in zip(
+                    tree_flatten(actual_state), tree_flatten(expected_state)
+                ):
+                    if isinstance(x[1], mx.array) and isinstance(y[1], mx.array):
+                        np.testing.assert_allclose(x[1], y[1], atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("prompt_length", [7, 8])
+@pytest.mark.parametrize("draft_behavior", ["learned", "accept_all", "reject_all"])
+def test_ernie_echo_generation_matches_ar(prompt_length, draft_behavior):
+    from mlx_vlm.generate.ar import generate_step
+
+    target, draft = ernie_echo_case()
+    prompt = mx.arange(prompt_length)[None]
+    expected = [
+        int(t)
+        for t, _ in generate_step(
+            prompt, target, None, None, max_tokens=25, temperature=0
+        )
+    ]
+    if draft_behavior != "learned":
+        original = draft.draft_block
+
+        def force_tokens(
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype=mx.int32,
+            greedy=False,
+        ):
+            original(
+                last_bonus, hidden, cache, block_size, sampler, token_dtype, greedy
+            )
+            position = (
+                draft._cache[0].offset - draft._round_appended - prompt_length + 1
+            )
+            tokens = expected[position : position + block_size - 1]
+            if draft_behavior == "reject_all":
+                tokens = [(t + 1) % target.config.vocab_size for t in tokens]
+            return mx.array([tokens])
+
+        draft.draft_block = force_tokens
+    for _ in range(2):
+        actual = [
+            int(t)
+            for t, _ in generate_step(
+                prompt,
+                target,
+                None,
+                None,
+                max_tokens=25,
+                temperature=0,
+                draft_model=draft,
+                draft_kind="mtp",
+                draft_block_size=3,
+            )
+        ]
+        assert actual == expected
+        assert draft.accept_lens
+        if draft_behavior == "accept_all":
+            assert draft.accept_lens == draft.draft_lens
+        elif draft_behavior == "reject_all":
+            assert set(draft.accept_lens) == {0}
+
+
+@pytest.mark.parametrize("mode", [None, "affine", "mxfp8", "nvfp4"])
+def test_ernie_echo_native_load_and_conversion_preserve_auxiliary(tmp_path, mode):
+    import numpy as np
+
+    from mlx_vlm.models.ernie5_5_moe.echo import ECHO_WEIGHT_NAMES
+    from mlx_vlm.speculative.drafters import load_drafter
+    from mlx_vlm.utils import load_model
+
+    target, draft = ernie_echo_case()
+    original = dict(tree_flatten(draft.parameters()))
+    weights = dict(tree_flatten(target.parameters()))
+    prefix = f"model.layers.{target.config.num_hidden_layers}."
+    for source, dest in ECHO_WEIGHT_NAMES.items():
+        value = original[dest]
+        weights[prefix + source] = value.T if source == "hc_head_fn" else value
+    (tmp_path / "config.json").write_text(json.dumps(target.config.to_dict()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded, kind = load_drafter(str(tmp_path))
+    assert kind == "mtp"
+    assert resolve_drafter_kind(tmp_path, "dflash") == "mtp"
+    for key, value in tree_flatten(loaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    # Ordinary conversion saves the loaded target's parameters, including echo.*.
+    converted = load_model(tmp_path)
+    assert converted.echo is not None
+    if mode is not None:
+        from mlx_vlm.quant_utils import quantize_model
+
+        converted, config = quantize_model(
+            converted,
+            target.config.to_dict(),
+            group_size=None,
+            bits=8 if mode == "mxfp8" else 4,
+            mode=mode,
+        )
+        original = dict(tree_flatten(converted.echo.parameters()))
+        (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(converted.parameters()))
+    )
+    reloaded, _ = load_drafter(str(tmp_path))
+    for key, value in tree_flatten(reloaded.parameters()):
+        np.testing.assert_array_equal(value, original[key])
+    if mode is not None:
+        assert reloaded.e_proj.mode == reloaded.h_proj.mode == "mxfp8"
+    converted_again = load_model(tmp_path)
+    inputs = mx.arange(9)[None]
+    np.testing.assert_allclose(
+        converted_again(inputs).logits, converted(inputs).logits, atol=2e-5, rtol=2e-5
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(target.parameters()))
+    )
+    with pytest.raises(ValueError, match="No MTP tensors"):
+        load_drafter(str(tmp_path))
+
+
+def test_ernie_echo_shared_decoder_preserves_target_router():
+    target, draft = ernie_echo_case()
+    original = target.layers[-1].ffn.e_score_correction_bias
+    draft.e_score_correction_bias = mx.arange(
+        target.config.n_routed_experts, dtype=mx.float32
+    )
+    draft.reset(target)
+    cache = target.make_cache()
+    inputs = mx.arange(9)[None]
+    out = target.language_model(inputs, cache=cache, return_hidden=True)
+    bonus = mx.argmax(out.logits[:, -1], axis=-1)
+    draft.set_shared_kv({}, 9, kv_valid_len=9)
+    draft.prefill_from_target_hidden(
+        inputs, out.hidden_states[-1], bonus, lambda x: mx.argmax(x, -1), greedy=True
+    )
+    mx.eval(draft.draft_eval_state())
+    assert target.layers[-1].ffn.e_score_correction_bias is original
+    assert draft._target.layers[-1] is target.layers[-1]

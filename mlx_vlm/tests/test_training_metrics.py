@@ -19,15 +19,15 @@ from mlx_vlm.trainer.common.metrics import (
 )
 from mlx_vlm.trainer.losses.cross_entropy import cross_entropy
 from mlx_vlm.trainer.losses.preference import dpo_objective, orpo_objective
-from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs as LegacyORPOTrainingArgs
-from mlx_vlm.trainer.vlm.orpo.trainer import orpo_loss as legacy_orpo_loss
-from mlx_vlm.trainer.vlm.orpo.trainer import train_orpo
-from mlx_vlm.trainer.vlm.sft.runtime import (
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import (
     vlm_batch_metrics,
     vlm_sft_loss,
     vlm_vision_mask,
 )
-from mlx_vlm.trainer.vlm.sft.trainer import vision_language_loss_fn
+from mlx_vlm.trainer.vlm.cross_entropy.trainer import vision_language_loss_fn
+from mlx_vlm.trainer.vlm.orpo.trainer import ORPOTrainingArgs as LegacyORPOTrainingArgs
+from mlx_vlm.trainer.vlm.orpo.trainer import orpo_loss as legacy_orpo_loss
+from mlx_vlm.trainer.vlm.orpo.trainer import train_orpo
 
 
 def test_dynamic_metrics_weighted_means_optional_keys_counts_and_distributed_sum():
@@ -183,8 +183,8 @@ def test_preference_losses_report_metrics_without_changing_objectives():
         elif kind == "ipo":
             expected = (logits - 5) ** 2
         else:
-            expected = -nn.log_sigmoid(0.1 * logits) + 50 * mx.maximum(
-                reference - chosen, 0
+            expected = -nn.log_sigmoid(
+                0.1 * (logits - 50 * mx.maximum(reference - chosen, 0))
             )
         assert mx.allclose(losses, expected).item()
     losses, metrics = orpo_objective(chosen, rejected)
@@ -197,6 +197,34 @@ def test_preference_losses_report_metrics_without_changing_objectives():
     )
     assert mx.allclose(legacy_loss, losses.mean()).item()
     assert isinstance(legacy_metrics, dict)
+
+
+@pytest.mark.parametrize(
+    "chosen,beta,delta",
+    [(-2.0, 0.1, 50.0), (-0.5, 0.1, 50.0), (-2.0, 0.3, 50.0), (-2.0, 0.1, 0.0)],
+)
+def test_dpop_loss_and_gradients_match_equation_3(chosen, beta, delta):
+    # https://arxiv.org/html/2402.13228v2#S4
+    def loss(scores):
+        losses, _ = dpo_objective(
+            scores[:1],
+            scores[1:],
+            mx.array([-1.0]),
+            mx.array([-2.0]),
+            beta=beta,
+            delta=delta,
+            loss_type="dpop",
+        )
+        return losses.sum()
+
+    margin = beta * (chosen + 2.0 - delta * max(-1.0 - chosen, 0.0))
+    slope = 1.0 / (1.0 + math.exp(margin))
+    chosen_scale = 1.0 + delta if chosen < -1.0 else 1.0
+    scores = mx.array([chosen, -3.0])
+    assert loss(scores).item() == pytest.approx(math.log1p(math.exp(-margin)))
+    assert mx.grad(loss)(scores).tolist() == pytest.approx(
+        [-beta * chosen_scale * slope, beta * slope]
+    )
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -335,3 +363,42 @@ def test_existing_orpo_pipeline_prints_train_and_validation_metrics(tmp_path, ca
     assert "train_policy_chosen_logps=" in output
     assert "val_policy_chosen_logps=" in output
     assert (tmp_path / "adapters.safetensors").is_file()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_public_orpo_trains_both_dataset_formats_through_shared_engine(
+    legacy, tmp_path
+):
+    from mlx_vlm.trainer import ORPOTrainingArgs, train_orpo
+
+    sequence = {
+        "input_ids": mx.array([[1, 2, 3]]),
+        "attention_mask": mx.ones((1, 3)),
+        "completion_mask": mx.array([[0, 1, 1]]),
+    }
+    if legacy:
+        rows = [
+            {
+                f"{candidate}_{key}": value
+                for candidate in ("chosen", "rejected")
+                for key, value in sequence.items()
+            }
+        ]
+    else:
+        rows = [{"chosen": sequence, "rejected": sequence}]
+    config = LegacyORPOTrainingArgs if legacy else ORPOTrainingArgs
+    args = config(
+        iters=1,
+        batch_size=1,
+        steps_per_report=1,
+        steps_per_save=1,
+        steps_per_eval=1,
+        val_batches=1,
+        adapter_file=str(tmp_path / "adapters.safetensors"),
+    )
+    model = TinyLM()
+    before = mx.array(model.projection.weight)
+    metrics = train_orpo(model, optim.Adam(learning_rate=0.01), rows, rows, args=args)
+    assert math.isfinite(metrics["train_loss"])
+    assert (tmp_path / "adapters.safetensors").is_file()
+    assert not mx.array_equal(before, model.projection.weight).item()

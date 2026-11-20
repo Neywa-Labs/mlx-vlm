@@ -10,7 +10,11 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.losses.cross_entropy import token_cross_entropy
 from mlx_vlm.trainer.losses.preference import dpo_objective, orpo_objective
-from mlx_vlm.trainer.vlm.sft.runtime import forward_vlm_logits, vlm_batch_metrics
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import (
+    forward_vlm_logits,
+    vlm_batch_metrics,
+)
+from mlx_vlm.trainer.vlm.mtp import add_mtp_loss
 
 
 def response_token_logps(
@@ -67,6 +71,7 @@ def dpo_vlm_loss(
     beta: float = 0.1,
     loss_type: str = "sigmoid",
     delta: float = 50.0,
+    mtp_loss_weight: float = 0.0,
     **_: Any,
 ) -> tuple[mx.array, dict[str, mx.array]]:
     """Compute batch-mean DPO and report rewards, pairs, and token counts."""
@@ -96,7 +101,8 @@ def dpo_vlm_loss(
         mx.int32
     )
     metrics["num_reference_tokens"] = metrics["num_processed_tokens"]
-    return mx.mean(losses), metrics
+    loss = mx.mean(losses)
+    return add_mtp_loss(model, batch["chosen"], loss, metrics, mtp_loss_weight)
 
 
 def orpo_vlm_loss(
@@ -105,6 +111,7 @@ def orpo_vlm_loss(
     *,
     beta: float = 0.1,
     eps: float = 1e-6,
+    mtp_loss_weight: float = 0.0,
     **_: Any,
 ) -> tuple[mx.array, dict[str, mx.array]]:
     """Compute ORPO and report preference metrics, pairs, and token counts."""
@@ -119,4 +126,5 @@ def orpo_vlm_loss(
     metrics["num_tokens"] = (chosen_tokens.sum() + rejected_tokens.sum()).astype(
         mx.int32
     )
-    return mx.mean(losses), metrics
+    loss = mx.mean(losses)
+    return add_mtp_loss(model, batch["chosen"], loss, metrics, mtp_loss_weight)

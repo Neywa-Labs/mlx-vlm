@@ -1,5 +1,5 @@
-import inspect
 import json
+import warnings
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -36,8 +36,13 @@ MODEL_CONFIG = {
     "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "granite_docling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_audio": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3_omni": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "lfm3": MessageFormat.TEXT_ONLY,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere_compass": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -49,7 +54,9 @@ MODEL_CONFIG = {
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "llava_onevision2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "sensenova_loop": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "prism_hadamard_qwen35": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen4_exp": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -57,12 +64,15 @@ MODEL_CONFIG = {
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
     "minicpmv4_7": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "minicpm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "mistral_large4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "oxr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
@@ -93,6 +103,8 @@ MODEL_CONFIG = {
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark_open": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -109,6 +121,7 @@ MODEL_CONFIG = {
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
@@ -121,6 +134,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "deepseek_v41": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "ernie5_5_moe": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
     "qwen3_5_text": MessageFormat.TEXT_ONLY,
@@ -176,6 +190,9 @@ def extract_text_from_content(content: Any) -> str:
 
     # Fallback: convert to string (shouldn't happen in normal usage)
     return str(content) if content else ""
+
+
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 
 
 def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
@@ -334,6 +351,7 @@ class MessageFormatter:
             "mimo_v2",
             "qwen3_vl",
             "mage_vl",
+            "llava_onevision2",
             "qwen3_vl_moe",
             "qwen3_5",
             "prism_hadamard_qwen35",
@@ -346,11 +364,15 @@ class MessageFormatter:
             "minicpmv4_6",
             "minicpmv4_7",
             "minimax_m3_vl",
+            "muse_spark",
+            "muse_spark_open",
             "llava_onevision",
             "glm5_next",
             "nemotron_h_omni",
             "nemotron_h_nano_omni",
             "nemotronh_nano_omni_reasoning_v3",
+            "lfm3_vl",
+            "lfm3_omni",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -477,7 +499,17 @@ class MessageFormatter:
 
         if role == "user" and not skip_audio_token and num_audios > 0:
             audio_tokens = [MessageBuilder.audio_message()] * num_audios
-            content = audio_tokens + content if image_first else content + audio_tokens
+            if self.model_name in ("lfm3_audio", "lfm3_omni"):
+                # Keep audio before trailing text, or after all media when
+                # there is no trailing text. Images may be interleaved with text.
+                split = len(content)
+                if content and content[-1].get("type") == "text":
+                    split -= 1
+                content = content[:split] + audio_tokens + content[split:]
+            else:
+                content = (
+                    audio_tokens + content if image_first else content + audio_tokens
+                )
 
         return {"role": role, "content": content}
 
@@ -591,7 +623,10 @@ class MessageFormatter:
         """Format with numbered image/audio tokens.
 
         Order follows Phi-4 convention: <|image_N|> before <|audio_N|>.
+        ``image_offset`` is the number of images in earlier messages, so the
+        numbering runs across the whole conversation.
         """
+        offset = kwargs.get("image_offset", 0)
         explicit_images = _content_media_count(
             prompt, ("image", "image_url", "input_image")
         )
@@ -599,7 +634,7 @@ class MessageFormatter:
         parts, explicit_images = self._content_parts(
             prompt,
             str,
-            lambda i: f"<|image_{missing+i+1}|>",
+            lambda i: f"<|image_{offset+missing+i+1}|>",
             role == "user" and not skip_image_token,
         )
         content = "".join(parts)
@@ -611,7 +646,7 @@ class MessageFormatter:
                 prefix_parts.append(
                     "".join(
                         [
-                            f"<|image_{i+1}|>"
+                            f"<|image_{offset+i+1}|>"
                             for i in range(num_images - explicit_images)
                         ]
                     )
@@ -654,9 +689,11 @@ class MessageFormatter:
                 f"Got {len(fps_list)} fps values for {len(videos)} videos."
             )
 
+        # the videos belong to the user turn, not to a system prompt
         content = [
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
+            if role == "user"
         ]
         prompt_parts, explicit_images = self._content_parts(
             prompt,
@@ -866,17 +903,6 @@ def get_chat_template(
 
     chat_template_override = kwargs.get("chat_template", None)
 
-    def _supports_template_kw(template_processor: Any, name: str) -> bool:
-        try:
-            signature = inspect.signature(template_processor.apply_chat_template)
-        except (TypeError, ValueError):
-            return False
-
-        return name in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-
     def _template_references_kw(template_processor: Any, name: str) -> bool:
         templates = [
             chat_template_override,
@@ -933,16 +959,17 @@ def get_chat_template(
         if "tools" in template_kwargs:
             # Equivalent schemas must render the same token prefix for APC.
             template_kwargs["tools"] = _sort_tool_schema_keys(template_kwargs["tools"])
-        if "enable_thinking" not in template_kwargs and _supports_template_kw(
-            template_processor, "enable_thinking"
-        ):
-            template_kwargs["enable_thinking"] = False
+        # Omission (or None) preserves both Python and Jinja template defaults.
+        if template_kwargs.get("enable_thinking") is None:
+            template_kwargs.pop("enable_thinking", None)
         if (
             "thinking_mode" not in template_kwargs
-            and template_kwargs.get("enable_thinking") is True
+            and isinstance(template_kwargs.get("enable_thinking"), bool)
             and _template_references_kw(template_processor, "thinking_mode")
         ):
-            template_kwargs["thinking_mode"] = "enabled"
+            template_kwargs["thinking_mode"] = (
+                "enabled" if template_kwargs["enable_thinking"] else "disabled"
+            )
 
         try:
             return template_processor.apply_chat_template(
@@ -980,11 +1007,24 @@ def apply_chat_template(
         return_messages: Whether to return messages list instead of template
         num_images: Number of images in the input
         num_audios: Number of audio files in the input
-        **kwargs: Additional arguments for message formatting
+        **kwargs: Additional arguments for message formatting, including:
+            video: Video path or list of paths. Adds one video placeholder per
+                video for models with native video support. There is no
+                ``num_videos`` argument; pass the paths here instead.
+            fps: Frames per second to sample, a scalar or one value per video
+                (default 1).
+            max_pixels: Maximum pixels per video frame (default 224 * 224).
 
     Returns:
         Formatted messages or chat template
     """
+    if "num_videos" in kwargs:
+        warnings.warn(
+            "apply_chat_template does not use num_videos; pass video=<path or "
+            "list of paths> to add video placeholders.",
+            stacklevel=2,
+        )
+
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
@@ -993,7 +1033,7 @@ def apply_chat_template(
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):
-            msg = dict(prompt)
+            msg = _normalize_tool_message(prompt)
             msg["content"] = extract_text_from_content(msg.get("content", ""))
             messages = [msg]
         elif isinstance(prompt, list):
@@ -1003,7 +1043,11 @@ def apply_chat_template(
                     messages.append({"role": "user", "content": item})
                 elif (role_content := _get_role_content(item)) is not None:
                     role, content = role_content
-                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    msg = (
+                        _normalize_tool_message(item)
+                        if isinstance(item, dict)
+                        else {"role": role}
+                    )
                     if role != "tool":
                         msg["content"] = extract_text_from_content(content)
                     messages.append(msg)
@@ -1088,6 +1132,7 @@ def apply_chat_template(
                         skip_audio_token=audio_counts[i] == 0,
                         num_images=image_counts[i],
                         num_audios=audio_counts[i],
+                        image_offset=sum(image_counts[:i]),
                         **kwargs,
                     )
                 )
@@ -1101,20 +1146,23 @@ def apply_chat_template(
                 if has_tool_metadata:
                     messages.append(_normalize_tool_message(p))
                 else:
-                    messages.append(
-                        get_message_json(
-                            model_type,
-                            content,
-                            role,
-                            skip_image_token=image_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            skip_audio_token=audio_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            num_images=image_counts[i],
-                            num_audios=audio_counts[i],
-                            **kwargs,
-                        )
+                    message = get_message_json(
+                        model_type,
+                        content,
+                        role,
+                        skip_image_token=image_counts[i] == 0
+                        or role in ["system", "assistant"],
+                        skip_audio_token=audio_counts[i] == 0
+                        or role in ["system", "assistant"],
+                        num_images=image_counts[i],
+                        num_audios=audio_counts[i],
+                        image_offset=sum(image_counts[:i]),
+                        **kwargs,
                     )
+                    if isinstance(p, dict) and isinstance(message, dict):
+                        # Templates replay earlier reasoning, e.g. with preserve_thinking
+                        message.update({k: p[k] for k in _REASONING_KEYS if k in p})
+                    messages.append(message)
 
     if return_messages:
         return messages
@@ -1122,8 +1170,5 @@ def apply_chat_template(
     # Some models only need the last message
     if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
-
-    if model_type == "qwen3_omni_moe" and "enable_thinking" not in kwargs:
-        kwargs["enable_thinking"] = True
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

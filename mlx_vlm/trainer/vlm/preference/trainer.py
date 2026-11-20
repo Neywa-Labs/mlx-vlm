@@ -8,8 +8,8 @@ from typing import Any
 import mlx.nn as nn
 
 from mlx_vlm.trainer.common.utils import evaluate_weighted_batches
+from mlx_vlm.trainer.vlm.cross_entropy.runtime import _make_vlm_task
 from mlx_vlm.trainer.vlm.preference.dataset import iterate_vlm_preference_batches
-from mlx_vlm.trainer.vlm.sft.runtime import _make_vlm_task
 
 
 def evaluate_preference_vlm(
@@ -71,37 +71,4 @@ def make_task(
         loss_fn=loss_fn,
         iterate_batches=iterate_batches,
         unit="preference_pairs",
-    )
-
-
-def train_preference_vlm(
-    model,
-    optimizer,
-    train_dataset,
-    val_dataset,
-    args,
-    *,
-    loss_fn,
-    iterate_batches=iterate_vlm_preference_batches,
-    reference_model=None,
-    training_callback=None,
-    seed=None,
-):
-    from mlx_vlm.trainer.common.engine import train
-
-    args.validate()
-    task = make_task(model, args, loss_fn=loss_fn, iterate_batches=iterate_batches)
-    if reference_model is not None:
-        reference_model.freeze()
-        reference_model.eval()
-        task.state.append(reference_model.state)
-    return train(
-        model,
-        optimizer,
-        train_dataset,
-        val_dataset,
-        args,
-        task,
-        training_callback,
-        seed,
     )

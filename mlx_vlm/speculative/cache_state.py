@@ -43,6 +43,13 @@ class _RotatingCacheTransaction:
             else:
                 del cache.update_and_fetch
         else:
+            from .cache_kernels import commit_rotating_prefix
+
+            if commit_rotating_prefix(
+                cache, self.original, self.updates, lengths, length
+            ):
+                self.updates.clear()
+                return
             updates = self.updates[:]
             self.abort()
             keep = max(lengths)
@@ -163,17 +170,15 @@ def start_speculative_cache(
     transaction = SpeculativeCacheTransaction(entries, positions, leaves, length)
     try:
         for cache in leaves:
-            if isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
-                # A block append may evict or rotate the serving window. Merely
-                # decrementing its cursor exposes rejected keys on the next
-                # decode. Retain the bounded window and replay accepted KV only.
-                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
-                continue
             start = getattr(cache, "start_speculation", None)
             if callable(start) and (
                 cache_types is None or isinstance(cache, cache_types)
             ):
                 entries.append((cache, start(length)))
+            elif isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
+                # Native cache transactions take precedence; older rotating
+                # caches retain the bounded replay adapter.
+                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
             else:
                 read_position = _cache_position_reader(cache)
                 if read_position is not None and callable(getattr(cache, "trim", None)):
@@ -261,7 +266,7 @@ def _trim_append_caches(caches, retained, block_size, transaction=None):
         if has_ragged_tail:
             prepare = getattr(cache, "prepare", None)
             finalize = getattr(cache, "finalize", None)
-            if (
+            if callable(getattr(cache, "trim_right", None)) or (
                 getattr(cache, "keys", None) is not None
                 and callable(prepare)
                 and callable(finalize)
@@ -284,8 +289,11 @@ def _trim_append_caches(caches, retained, block_size, transaction=None):
         if cache_trim > 0:
             trim_cache(cache_trim)
         if right_trimmed:
-            cache.prepare(right_padding=right_padding)
-            cache.finalize()
+            if callable(getattr(cache, "trim_right", None)):
+                cache.trim_right(right_padding)
+            else:
+                cache.prepare(right_padding=right_padding)
+                cache.finalize()
 
 
 __all__ = [
