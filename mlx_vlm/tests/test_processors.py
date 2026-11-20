@@ -5338,3 +5338,60 @@ class TestResizeImageGuards:
     def test_small_image_upscale_behavior_is_unchanged(self):
         img = Image.new("RGB", (100, 150))
         assert resize_image(img, (320, 320)).size == (213, 320)
+
+
+from mlx_vlm.models.base import BaseImageProcessor
+
+
+class TestPrepareInputsMultiImagePlaceholders:
+    """The legacy prepare_inputs branch keeps every text chunk per image."""
+
+    class _StubImageProcessor(BaseImageProcessor):
+        def preprocess(self, images=None, **kwargs):
+            return [np.zeros((3, 4, 4), dtype=np.float32) for _ in images]
+
+    class _StubProcessor:
+        def __init__(self):
+            self.image_processor = (
+                TestPrepareInputsMultiImagePlaceholders._StubImageProcessor()
+            )
+            self.tokenizer = SimpleNamespace(pad_token=None)
+            self.pad_token = None
+            self.eos_token = "</s>"
+            self.pad_token_id = 0
+
+        def __call__(self, text, **kwargs):
+            return SimpleNamespace(input_ids=[ord(char) for char in text])
+
+    def _inputs(self, prompts, num_images=2):
+        images = [np.zeros((4, 4, 3), dtype=np.float32) for _ in range(num_images)]
+        return prepare_inputs(
+            self._StubProcessor(),
+            images=images,
+            prompts=prompts,
+            image_token_index=99,
+        )
+
+    def test_multi_image_prompt_keeps_all_text_and_one_token_per_image(self):
+        inputs = self._inputs("A<image>B<image>C")
+        assert inputs["input_ids"].tolist() == [[65, 99, 66, 99, 67]]
+        assert inputs["pixel_values"].shape == (2, 3, 4, 4)
+
+    def test_batch_pads_to_the_longest_placeholder_sequence(self):
+        inputs = self._inputs(["A<image>B<image>C", "D"])
+        assert inputs["input_ids"].tolist() == [
+            [65, 99, 66, 99, 67],
+            [68, 0, 0, 0, 0],
+        ]
+        assert inputs["attention_mask"].tolist() == [
+            [1, 1, 1, 1, 1],
+            [1, 0, 0, 0, 0],
+        ]
+
+    def test_prompt_without_placeholder_does_not_crash(self):
+        inputs = self._inputs("plain", num_images=1)
+        assert inputs["input_ids"].tolist() == [[112, 108, 97, 105, 110]]
+
+    def test_single_image_matches_previous_layout(self):
+        inputs = self._inputs("A<image>B", num_images=1)
+        assert inputs["input_ids"].tolist() == [[65, 99, 66]]
