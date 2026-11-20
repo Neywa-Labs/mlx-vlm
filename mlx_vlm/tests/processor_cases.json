@@ -31,6 +31,7 @@
     "pixtral_ip": ["pixtral.image_processing_pixtral", null],
     "omni": ["qwen3_omni_moe", "Qwen3OmniMoeProcessor"],
     "qwen3": ["qwen3_vl", "Qwen3VLProcessor"],
+    "wemm": ["wemm_video", "WeMMVideoProcessor"],
     "smolvlm": ["smolvlm", "SmolVLMProcessor"],
     "step3p7": ["step3p7", "Step3VLProcessor"],
     "ocr": ["unlimited_ocr.processing_unlimitedocr", "UnlimitedOCRProcessor"],
@@ -41,6 +42,22 @@
       "nemotron_h_nano_omni.processing_nemotron_h_nano_omni",
       "NemotronHNanoOmniProcessor"
     ]
+  },
+  "native_qwen_checkpoints": {
+    "qwen3_vl": {"processor": "qwen3_vl", "config": {"model_type": "qwen3_vl"}},
+    "wemm_dense": {
+      "processor": "wemm_video",
+      "config": {"model_type": "qwen3_5", "architectures": ["WeMMVideoForConditionalGeneration"], "audio_config": {"num_mel_bins": 4}}
+    },
+    "wemm_moe": {
+      "processor": "wemm_video",
+      "config": {
+        "model_type": "wemm_qwen3_5_moe",
+        "audio_config": {"num_mel_bins": 4},
+        "architectures": ["WeMMVideoForConditionalGeneration"],
+        "auto_map": {"AutoConfig": "configuration_wemm.WeMMConfig"}
+      }
+    }
   },
   "smoke": {
     "llava": {"class": "LlavaProcessor", "family": "llava"},
@@ -83,6 +100,7 @@
     "qwen2_vl": {"class": "Qwen2VLProcessor", "family": "qwen_vl"},
     "qwen2_5_vl": {"class": "Qwen2_5_VLProcessor", "family": "qwen_vl"},
     "qwen3_vl": {"class": "Qwen3VLProcessor", "modes": ["image"], "family": "qwen_vl"},
+    "wemm_video": {"class": "WeMMVideoProcessor", "image_placeholder": "<|vision_start|><|image_pad|><|vision_end|>", "kwargs": {"audio_config": {"num_mel_bins": 4}}},
     "qwen3_omni_moe": {
       "class": "Qwen3OmniMoeProcessor",
       "tokenizer": {

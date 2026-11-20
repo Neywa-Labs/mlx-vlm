@@ -28,9 +28,9 @@ import pytest
 from PIL import Image
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
-from tokenizers.models import WordLevel
+from tokenizers.models import BPE, WordLevel
 from tokenizers.normalizers import NFKC
-from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.pre_tokenizers import ByteLevel, Whitespace
 from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 from mlx_vlm.generate import GenerationResult, generate
@@ -853,6 +853,139 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
+@pytest.mark.parametrize("name,case", DATA["native_qwen_checkpoints"].items())
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "hub"])
+@pytest.mark.parametrize(
+    "trust", [None, False, True], ids=["default", "native", "trusted"]
+)
+def test_native_processor_dispatch(tmp_path, name, case, remote, trust):
+    _write_configs(tmp_path, config=case["config"])
+    processor = _native_qwen_processor(case["processor"])
+    processor.tokenizer.name_or_path = str(tmp_path)
+    hub_options = dict(
+        revision="pinned-revision",
+        cache_dir=str(tmp_path / "cache"),
+        token="test-token",
+        local_files_only=True,
+        force_download=False,
+        subfolder="processor",
+    )
+    options = {
+        **hub_options,
+        **({"trust_remote_code": trust} if trust is not None else {}),
+    }
+    with (
+        patch(
+            "transformers.utils.hub.cached_file",
+            return_value=str(tmp_path / "config.json"),
+        ) as metadata,
+        patch.object(
+            type(processor), "from_pretrained", return_value=processor
+        ) as loader,
+        patch("mlx_vlm.utils.load_tokenizer", return_value=lambda _: None) as tokenizer,
+        patch("mlx_vlm.utils.StoppingCriteria"),
+    ):
+        source = "test/checkpoint" if remote else tmp_path
+        assert load_processor(source, **options) is processor
+        expected_trust = (
+            trust if trust is not None else case["processor"] != "wemm_video"
+        )
+        loader.assert_called_once_with(
+            source, **hub_options, trust_remote_code=expected_trust
+        )
+        metadata.assert_called_once_with(
+            source,
+            "config.json",
+            **hub_options,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        assert tokenizer.call_args.args == (tmp_path,)
+
+
+@pytest.mark.parametrize("config", [None, {"model_type": "unknown_native_processor"}])
+def test_auto_processor_falls_back_without_native_registration(
+    tmp_path, monkeypatch, config
+):
+    from mlx_vlm.models import base
+
+    if config is not None:
+        _write_configs(tmp_path, config=config)
+    sentinel = object()
+    fallback = Mock(return_value=sentinel)
+    monkeypatch.setattr(base, "_ORIGINAL_AUTO_PROCESSOR", NS(__func__=fallback))
+    assert AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
+    fallback.assert_called_once_with(AutoProcessor, tmp_path, trust_remote_code=False)
+
+
+def test_auto_processor_preserves_native_loader_errors(tmp_path, monkeypatch):
+    from mlx_vlm.models import base
+
+    _write_configs(tmp_path, config={"model_type": "test_native_processor"})
+    native = NS(from_pretrained=Mock(side_effect=ValueError("invalid native config")))
+    monkeypatch.setitem(
+        base._NATIVE_PROCESSORS, "test_native_processor", (native, False)
+    )
+    fallback = Mock()
+    monkeypatch.setattr(base, "_ORIGINAL_AUTO_PROCESSOR", NS(__func__=fallback))
+    with pytest.raises(ValueError, match="invalid native config"):
+        AutoProcessor.from_pretrained(tmp_path)
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("name,case", DATA["native_qwen_checkpoints"].items())
+def test_native_processor_roundtrip_without_remote_code(
+    tmp_path, monkeypatch, name, case
+):
+    processor = _native_qwen_processor(case["processor"])
+    processor.save_pretrained(tmp_path)
+    _write_configs(tmp_path, config=case["config"])
+
+    def reject_prompt(prompt):
+        pytest.fail("Native processor requested remote code: " + prompt)
+
+    monkeypatch.setattr("builtins.input", reject_prompt)
+    restored = load_processor(tmp_path, add_detokenizer=False)
+    inputs = dict(
+        text="<|vision_start|><|image_pad|><|vision_end|> Describe.",
+        images=[Image.new("RGB", (4, 4))],
+        return_tensors="np",
+    )
+    expected, actual = processor(**inputs), restored(**inputs)
+    assert expected.keys() == actual.keys()
+    for key in expected:
+        equal(expected[key], actual[key])
+
+    # No model import precedes load_processor in this fresh interpreter.
+    script = textwrap.dedent("""
+        import json, sys
+        from pathlib import Path
+        from PIL import Image
+        from mlx_vlm.utils import load_processor
+        folder = Path(sys.argv[1])
+        processor = load_processor(folder, add_detokenizer=False, local_files_only=True)
+        assert type(processor).__name__ == sys.argv[3]
+        outputs = processor(text=sys.argv[2], images=[Image.new("RGB", (4, 4))], return_tensors="np")
+        (folder / "fresh-output.json").write_text(json.dumps({k: v.tolist() for k, v in outputs.items()}))
+    """)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            inputs["text"],
+            type(processor).__name__,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    fresh = json.loads((tmp_path / "fresh-output.json").read_text())
+    assert fresh.keys() == expected.keys()
+    for key in expected:
+        equal(expected[key], fresh[key])
+
+
 def test_mistral_large4_processor_without_torch(tmp_path):
     metadata = deepcopy(DATA["checkpoints"]["mistral3"])
     metadata["config"]["model_type"] = "mistral_large4"
@@ -1044,7 +1177,49 @@ def _assert_all_mx(result, *media):
 SMOKE_PROCESSORS = DATA["smoke"]
 
 
+def _native_qwen_processor(name, tokenizer_class=PreTrainedTokenizerFast):
+    case = SMOKE_PROCESSORS[name]
+    module = importlib.import_module(f"mlx_vlm.models.{name}.processing_{name}")
+    tokens = [
+        "[UNK]",
+        "[PAD]",
+        "[EOS]",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+        "<|audio_start|>",
+        "<|audio_end|>",
+        "<|audio_pad|>",
+    ]
+    tokenizer = fast_tokenizer(
+        [*tokens, *sorted(ByteLevel.alphabet())],
+        tokenizer_class=tokenizer_class,
+        eos_token="[EOS]",
+        additional_special_tokens=tokens[3:],
+        chat_template="{% for m in messages %}{{m['role']}}: {{m['content']}}{% endfor %}",
+    )
+    # Dense checkpoints select Qwen's BPE tokenizer on reload. Use its byte
+    # vocabulary contract instead of an incompatible synthetic WordLevel model.
+    tokenizer.backend_tokenizer.model = BPE(tokenizer.get_vocab(), merges=[])
+    tokenizer.backend_tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tokenizer.backend_tokenizer.decoder = ByteLevelDecoder()
+    return getattr(module, case["class"])(
+        image_processor=m.qwen3.Qwen3VLImageProcessor(
+            patch_size=2, min_pixels=16, max_pixels=16
+        ),
+        video_processor=m.qwen3.Qwen3VLVideoProcessor(
+            patch_size=2, min_pixels=16, max_pixels=64
+        ),
+        tokenizer=tokenizer,
+        chat_template=tokenizer.chat_template,
+        **case.get("kwargs", {}),
+    )
+
+
 def _make_processor(name):
+    if name == "wemm_video":
+        return _native_qwen_processor(name)
     case = SMOKE_PROCESSORS[name]
     defaults = DATA["smoke_defaults"].get(case.get("family"), {})
     case = deepcopy({**defaults, **case})
@@ -1082,6 +1257,7 @@ def test_processor_mlx_outputs(name, with_image):
             "gemma3": "<boi>",
             "ernie4_5_moe_vl": "<|IMAGE_START|><|image@placeholder|><|IMAGE_END|>",
         }.get(name, getattr(p, "image_token", "<image>"))
+        token = SMOKE_PROCESSORS[name].get("image_placeholder", token)
         images = [_make_image()]
         if name in ("smolvlm", "mllama", "idefics2", "idefics3", "pixtral", "mistral3"):
             images = [images]
@@ -1729,6 +1905,124 @@ def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     assert "<0.2 seconds>" in rendered and "<1.2 seconds>" in rendered
 
 
+@pytest.mark.parametrize(
+    "duration,expected",
+    [(0.05, [300]), (1.2, [6, 294]), (2.3, [8, 7, 285]), (30, [10] * 30)],
+)
+def test_audio_timestamps_keep_padded_tail(duration, expected):
+    groups, times = m.wemm.audio_timestamp_groups(300, 0.1, duration)
+    assert groups == expected
+    assert times == list(range(len(expected)))
+
+
+@pytest.mark.parametrize(
+    "order", [("audio", "video", "audio"), ("video", "audio", "audio")]
+)
+def test_processor_preserves_audio_order_across_video(monkeypatch, order):
+    processor = _make_processor("wemm_video")
+    monkeypatch.setattr(
+        processor,
+        "_audio_features",
+        lambda source, **kw: (
+            np.full((1, 4, 3000), float(source), dtype=np.float32),
+            1.5,
+        ),
+    )
+    monkeypatch.setattr(
+        processor,
+        "_video",
+        lambda *a, **kw: (
+            {
+                "pixel_values_videos": np.zeros((8, 24)),
+                "video_grid_thw": np.array([[2, 2, 2]]),
+            },
+            {"frames_indices": [0, 2, 4, 6], "fps": 4},
+        ),
+    )
+    prompt = "".join(m.wemm.PLACEHOLDERS[kind] for kind in order)
+    inputs = processor(
+        text=prompt,
+        audio=[1, 3],
+        videos=[{"video": "unused.mp4", "audio": 2, "use_audio_in_video": True}],
+    )
+    assert inputs["audio_feature"].shape == (3, 4, 3000)
+    np.testing.assert_array_equal(
+        np.asarray(inputs["audio_feature"][:, 0, 0]),
+        [1, 2, 3] if order[0] == "audio" else [2, 1, 3],
+    )
+    pad = processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+    assert int((inputs["input_ids"] == pad).sum()) == 900
+
+
+def test_prepared_video_keeps_path_for_soundtrack(monkeypatch):
+    processor = _make_processor("wemm_video")
+    sources = []
+
+    def video(source, *a, **kw):
+        sources.append(source)
+        return (
+            {
+                "pixel_values_videos": np.zeros((8, 24)),
+                "video_grid_thw": np.array([[2, 2, 2]]),
+            },
+            {"frames_indices": [0, 1, 2, 3], "fps": 2},
+        )
+
+    monkeypatch.setattr(processor, "_video", video)
+    monkeypatch.setattr(processor, "_soundtrack", lambda source: np.zeros(16000))
+    monkeypatch.setattr(
+        processor, "_audio_features", lambda *a, **kw: (np.zeros((1, 4, 3000)), 1)
+    )
+    data = prepare_inputs(
+        processor,
+        videos=["clip.mp4"],
+        prompts=m.wemm.PLACEHOLDERS["video"],
+        use_audio_in_video=True,
+    )
+    assert sources == ["clip.mp4"]
+    assert "audio_feature" in data
+
+
+def test_processor_rejects_missing_media_and_batch():
+    processor = _make_processor("wemm_video")
+    with pytest.raises(ValueError, match="Extra audio"):
+        processor(text=m.wemm.PLACEHOLDERS["audio"])
+    with pytest.raises(ValueError, match="placeholders differ"):
+        processor(text="Describe.", images=[Image.new("RGB", (4, 4))])
+    with pytest.raises(ValueError, match="one conversation"):
+        processor(text=["first", "second"])
+
+
+def test_video_tokens_use_source_frame_timestamps():
+    tokenizer = _make_processor("wemm_video").tokenizer
+    ids = m.wemm.video_token_ids(
+        tokenizer,
+        [2, 2, 2],
+        {"frames_indices": [0, 3, 6, 9], "fps": 3},
+        2,
+        2,
+        audio_count=300,
+        audio_duration=2,
+        window=0.1,
+    )
+    start, end, video, audio = [
+        tokenizer.convert_tokens_to_ids(t)
+        for t in (
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|video_pad|>",
+            "<|audio_pad|>",
+        )
+    ]
+    expected = []
+    for timestamp, count in [(0.5, 10), (2.5, 290)]:
+        expected += tokenizer.encode(
+            f"<{timestamp:.1f} seconds>", add_special_tokens=False
+        )
+        expected += [start, video] + [audio] * count + [end]
+    assert ids == expected
+
+
 class TestQwen3VLVideoTimestamps:
     """Qwen3-VL markers follow the frames that were actually sampled."""
 
@@ -1736,25 +2030,7 @@ class TestQwen3VLVideoTimestamps:
 
     @pytest.fixture
     def p(self):
-        tokens = [
-            "[UNK]",
-            "[PAD]",
-            "<|image_pad|>",
-            "<|video_pad|>",
-            "<|vision_start|>",
-            "<|vision_end|>",
-        ]
-        tokenizer = fast_tokenizer(
-            tokens,
-            tokenizer_class=RecordingTokenizer,
-            split=False,
-            additional_special_tokens=tokens[2:],
-        )
-        return c.qwen3(
-            image_processor=m.qwen3.Qwen3VLImageProcessor(),
-            video_processor=m.qwen3.Qwen3VLVideoProcessor(**PROFILES["qwen_video"]),
-            tokenizer=tokenizer,
-        )
+        return _native_qwen_processor("qwen3_vl", RecordingTokenizer)
 
     @staticmethod
     def markers(p):

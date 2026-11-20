@@ -225,7 +225,12 @@ def get_model_type(config: dict) -> Optional[str]:
 
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if "Lfm2BidirectionalForMaskedLM" in architectures:
+    if (
+        "WeMMVideoForConditionalGeneration" in architectures
+        or model_type == "wemm_qwen3_5_moe"
+    ):
+        model_type = "wemm_video"
+    elif "Lfm2BidirectionalForMaskedLM" in architectures:
         model_type = "lfm2_encoder"
     elif "RadioMBartPrefixForCausalLM" in architectures:
         model_type = "nemotron_parse_v3_5"
@@ -1105,12 +1110,12 @@ def load_processor(
 ) -> ProcessorMixin:
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
-        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-
-        # Get the tokenizer object
-        tokenizer_obj = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
+        tokenizer_obj = getattr(processor, "tokenizer", processor)
+        tokenizer_path = Path(model_path)
+        resolved_path = getattr(tokenizer_obj, "name_or_path", None)
+        if not tokenizer_path.is_dir() and isinstance(resolved_path, (str, Path)):
+            tokenizer_path = Path(resolved_path) if resolved_path else tokenizer_path
+        detokenizer_class = load_tokenizer(tokenizer_path, return_tokenizer=False)
 
         # Non-text models (depth, detection) have no decode(); skip detokenizer
         try:
@@ -2105,8 +2110,8 @@ def prepare_inputs(
 
     video_fps = None
     supplied_video_metadata = kwargs.pop("video_metadata", None)
-    video_metadata = None
-    if has_videos:
+    video_metadata = supplied_video_metadata
+    if has_videos and not getattr(processor, "handles_video_loading", False):
         if not isinstance(videos, list):
             videos = [videos]
         sampling_overrides = {
