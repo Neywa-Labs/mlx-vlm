@@ -2017,7 +2017,9 @@ class BatchRotatingKVCache(_BaseCache):
         mask = linds >= rinds
         mask &= linds < rinds + window_size
         in_place = N == 1 and self._lengths is None
-        if (trim_size := self._idx - self.max_size + int(not in_place)) > 0:
+        # A concat update first puts a rotated cache in temporal order.
+        idx = self.keys.shape[2] if not in_place and self.rotated else self._idx
+        if (trim_size := idx - self.max_size + int(not in_place)) > 0:
             left_padding = left_padding - trim_size
 
         rotated = in_place and (self.rotated or self._idx >= self.max_size)
