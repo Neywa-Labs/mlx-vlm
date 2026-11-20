@@ -180,7 +180,9 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         )
         video_processor = Qwen3VLVideoProcessor(
             **_qwen_vl_video_kwargs(
-                pretrained_model_name_or_path, default_patch_size=14
+                pretrained_model_name_or_path,
+                default_patch_size=14,
+                per_frame_budget=True,
             )
         )
 

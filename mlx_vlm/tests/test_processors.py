@@ -5439,3 +5439,82 @@ class TestResizeImageGuards:
     def test_small_image_upscale_behavior_is_unchanged(self):
         img = Image.new("RGB", (100, 150))
         assert resize_image(img, (320, 320)).size == (213, 320)
+
+
+class TestQwen2VideoPerFrameBudget:
+    """Qwen2-VL/Qwen2.5-VL cap each video frame, not the whole clip."""
+
+    @staticmethod
+    def _module():
+        return importlib.import_module("mlx_vlm.models.qwen3_vl.processing_qwen3_vl")
+
+    def _processor(self, **overrides):
+        kwargs = dict(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=False,
+            do_normalize=False,
+            min_pixels=100352,
+            max_pixels=602112,
+        )
+        kwargs.update(overrides)
+        return self._module().Qwen3VLVideoProcessor(**kwargs)
+
+    def test_frame_budget_does_not_shrink_with_clip_length(self):
+        video = np.zeros((8, 3, 480, 640), dtype=np.uint8)
+        _, frame_thw = self._processor(budget_scope="frame")._process_one(video)
+        _, clip_thw = self._processor()._process_one(video)
+        # 480x640 fits the per-frame budget, so every frame keeps its size.
+        assert frame_thw == [4, 34, 46]
+        # The clip-wide budget halves the resolution of every frame at 8 frames.
+        assert clip_thw == [4, 16, 22]
+
+    def test_per_frame_kwargs_ignore_image_pixel_size(self, tmp_path):
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "patch_size": 14,
+                    "size": {"shortest_edge": 3136, "longest_edge": 12845056},
+                }
+            )
+        )
+        with patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")):
+            kwargs = self._module()._qwen_vl_video_kwargs(
+                tmp_path, default_patch_size=14, per_frame_budget=True
+            )
+        assert kwargs["budget_scope"] == "frame"
+        assert kwargs["patch_size"] == 14
+        # The image budget (3136 / 12845056) must not leak into per-frame caps.
+        assert kwargs["min_pixels"] == 100352
+        assert kwargs["max_pixels"] == 602112
+
+    def test_video_config_still_wins_for_per_frame_mode(self, tmp_path):
+        (tmp_path / "video_preprocessor_config.json").write_text(
+            json.dumps({"size": {"shortest_edge": 50176, "longest_edge": 301056}})
+        )
+        kwargs = self._module()._qwen_vl_video_kwargs(
+            tmp_path, default_patch_size=14, per_frame_budget=True
+        )
+        assert kwargs["budget_scope"] == "frame"
+        assert (kwargs["min_pixels"], kwargs["max_pixels"]) == (50176, 301056)
+
+    def test_clip_wide_budget_keeps_reading_image_config(self, tmp_path):
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "patch_size": 14,
+                    "size": {"shortest_edge": 3136, "longest_edge": 12845056},
+                }
+            )
+        )
+        with patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")):
+            kwargs = self._module()._qwen_vl_video_kwargs(
+                tmp_path, default_patch_size=14
+            )
+        assert "budget_scope" not in kwargs
+        assert (kwargs["min_pixels"], kwargs["max_pixels"]) == (3136, 12845056)
+
+    def test_unknown_budget_scope_is_rejected(self):
+        with pytest.raises(ValueError, match="budget_scope"):
+            self._processor(budget_scope="clip")

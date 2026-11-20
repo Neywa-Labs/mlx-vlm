@@ -177,6 +177,11 @@ def _image_counts_per_text(text, images, num_images, image_token):
     )
 
 
+# Defaults of HF Qwen2-VL/Qwen2.5-VL video processors for the per-frame budget.
+_QWEN_VL_VIDEO_MIN_PIXELS = 100352
+_QWEN_VL_VIDEO_MAX_PIXELS = 602112
+
+
 def _smart_resize_video(
     num_frames: int,
     height: int,
@@ -519,8 +524,13 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         fps: float = 2.0,
         min_frames: int = 4,
         max_frames: int = 768,
+        budget_scope: str = "video",
         **kwargs,
     ):
+        if budget_scope not in ("video", "frame"):
+            raise ValueError(
+                f"budget_scope must be 'video' or 'frame', got {budget_scope!r}"
+            )
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.merge_size = merge_size
@@ -535,6 +545,7 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         self.fps = fps
         self.min_frames = min_frames
         self.max_frames = max_frames
+        self.budget_scope = budget_scope
 
     def _process_one(self, video: np.ndarray) -> Tuple[np.ndarray, List[int]]:
         if video.ndim != 4:
@@ -546,15 +557,27 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
             video = np.repeat(video, 3, axis=1)
             C = 3
 
-        resized_h, resized_w = _smart_resize_video(
-            num_frames=T,
-            height=H,
-            width=W,
-            temporal_factor=self.temporal_patch_size,
-            factor=self.patch_size * self.merge_size,
-            min_pixels=self.min_pixels,
-            max_pixels=self.max_pixels,
-        )
+        factor = self.patch_size * self.merge_size
+        if self.budget_scope == "frame":
+            # Qwen2-VL/Qwen2.5-VL size every frame with the image smart_resize,
+            # so the pixel budget must not shrink as the clip gets longer.
+            resized_h, resized_w = _smart_resize_image(
+                height=H,
+                width=W,
+                factor=factor,
+                min_pixels=self.min_pixels,
+                max_pixels=self.max_pixels,
+            )
+        else:
+            resized_h, resized_w = _smart_resize_video(
+                num_frames=T,
+                height=H,
+                width=W,
+                temporal_factor=self.temporal_patch_size,
+                factor=factor,
+                min_pixels=self.min_pixels,
+                max_pixels=self.max_pixels,
+            )
         video = _resize_video_frames(video, resized_h, resized_w)
 
         video_f = video.astype(np.float32)
@@ -716,14 +739,21 @@ def _qwen_vl_image_kwargs(pretrained_model_name_or_path, default_patch_size: int
     return out
 
 
-def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
+def _qwen_vl_video_kwargs(
+    pretrained_model_name_or_path,
+    default_patch_size: int = 16,
+    per_frame_budget: bool = False,
+):
     """Read Qwen-VL video processor kwargs out of a checkpoint."""
     raw = _load_qwen_vl_json(
         pretrained_model_name_or_path, "video_preprocessor_config.json"
     )
+    video_cfg_present = raw is not None
     if raw is None:
         # Older checkpoints (e.g. qwen2_vl) keep video settings inside
-        # preprocessor_config.json alongside the image settings.
+        # preprocessor_config.json alongside the image settings. Their size
+        # entry describes single images, not clips, so it is only reused when
+        # the clip-wide budget is requested.
         raw = (
             _load_qwen_vl_json(
                 pretrained_model_name_or_path, "preprocessor_config.json"
@@ -747,15 +777,22 @@ def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int
     ):
         if k in raw:
             out[k] = raw[k]
-    size = raw.get("size") or {}
-    if size.get("shortest_edge") is not None:
-        out["min_pixels"] = size["shortest_edge"]
-    if size.get("longest_edge") is not None:
-        out["max_pixels"] = size["longest_edge"]
-    if raw.get("min_pixels") is not None:
-        out["min_pixels"] = raw["min_pixels"]
-    if raw.get("max_pixels") is not None:
-        out["max_pixels"] = raw["max_pixels"]
+    if video_cfg_present or not per_frame_budget:
+        size = raw.get("size") or {}
+        if size.get("shortest_edge") is not None:
+            out["min_pixels"] = size["shortest_edge"]
+        if size.get("longest_edge") is not None:
+            out["max_pixels"] = size["longest_edge"]
+        if raw.get("min_pixels") is not None:
+            out["min_pixels"] = raw["min_pixels"]
+        if raw.get("max_pixels") is not None:
+            out["max_pixels"] = raw["max_pixels"]
+    if per_frame_budget:
+        # HF Qwen2-VL/Qwen2.5-VL video processors apply smart_resize per frame
+        # and cap each frame with the video defaults below, not the whole clip.
+        out["budget_scope"] = "frame"
+        out.setdefault("min_pixels", _QWEN_VL_VIDEO_MIN_PIXELS)
+        out.setdefault("max_pixels", _QWEN_VL_VIDEO_MAX_PIXELS)
     return out
 
 
