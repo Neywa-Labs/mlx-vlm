@@ -31,6 +31,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     SpeculativePrefill,
+    _speculative_constraints,
     make_speculative_batch,
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -265,7 +266,8 @@ def generate_step(
           is supported via the same ``get_input_embeddings`` path the normal
           decoder uses; decode itself is text-only. ``temperature`` and
           ``sampler`` are respected; ``logprobs`` is always ``None`` on the
-          speculative path.
+          speculative path. A structured-output processor in
+          ``logits_processors`` masks every verify position of an MTP drafter.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
 
@@ -539,6 +541,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            logits_processors=logits_processors,
             thinking_budget_criteria=thinking_budget_criteria,
         )
         return
@@ -1621,6 +1624,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        logits_processors: Optional[List[Any]] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
@@ -1639,6 +1643,8 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        # Per-row processors: structured-output ones mask the verify blocks.
+        self.logits_processors = list(logits_processors or [])
         self.thinking_budget_criteria = thinking_budget_criteria or []
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
@@ -1672,6 +1678,7 @@ class SpeculativeGenerationBatch:
         self.hidden = None
         self.shared_kv_states = None
         self.prompt_tokens = None
+        self.logits_processors = []
         self._batch_state = None
         self._batch_rows = []
         self._pending_first = []
@@ -1696,6 +1703,7 @@ class SpeculativeGenerationBatch:
             "_num_tokens",
             "_finished",
             "thinking_budget_criteria",
+            "logits_processors",
         ):
             values = getattr(self, name)
             setattr(row, name, [values[index]] if values else [])
@@ -1723,6 +1731,10 @@ class SpeculativeGenerationBatch:
             self._batch_rows.extend(incoming)
             self._pending_first.extend(start + row for row in other._pending_first)
             self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+            processors = self.logits_processors or [None] * start
+            self.logits_processors = processors + (
+                other.logits_processors or [None] * len(other._all_uids)
+            )
             self._refresh_uids()
             return
         raise RuntimeError("Cannot extend an active speculative generation batch.")
@@ -1786,6 +1798,8 @@ class SpeculativeGenerationBatch:
                 self.thinking_budget_criteria = [
                     self.thinking_budget_criteria[row] for row in rows
                 ]
+            if self.logits_processors:
+                self.logits_processors = [self.logits_processors[row] for row in rows]
             self._finished = [False] * len(rows)
             self._batch_rows = list(range(len(rows)))
 
@@ -1809,10 +1823,15 @@ class SpeculativeGenerationBatch:
             self._ensure_batch_state()
             rows = self._batch_rows[:]
             budgets = [self.max_tokens[row] - self._num_tokens[row] for row in rows]
+            constraints = _speculative_constraints(
+                self.draft_kind, self.logits_processors
+            )
+            options = {} if constraints is None else {"constraints": constraints}
             emitted = self._batch_state.step(
                 budgets,
                 [self._num_tokens[row] for row in rows],
                 self.thinking_budget_criteria,
+                **options,
             )
             for position in range(max(map(len, emitted))):
                 tokens = [None] * len(self._all_uids)
@@ -1884,6 +1903,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            logits_processors=self.logits_processors,
             thinking_budget_criteria=self.thinking_budget_criteria,
         )
 
@@ -2557,6 +2577,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
