@@ -22,6 +22,7 @@ from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import (
+    CONTEXT_WINDOW_ATTR,
     apply_top_k,
     clamp_temperature,
     greedy_argmax,
@@ -1245,9 +1246,11 @@ class GenerationBatch:
                             last_tokens[i], sample_logits
                         )
                     else:
-                        sample_logits = processor(
-                            mx.array(self.token_context[i]), sample_logits
-                        )
+                        window = getattr(processor, CONTEXT_WINDOW_ATTR, None)
+                        context = self.token_context[i]
+                        if isinstance(window, int) and window > 0:
+                            context = context[-window:]
+                        sample_logits = processor(mx.array(context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -2495,9 +2498,11 @@ class PromptProcessingBatch:
                 sample_logits = logits[i : i + 1]
                 processors = self.logits_processors[i] or []
                 for processor in processors:
-                    sample_logits = processor(
-                        mx.array(self._token_context[i]), sample_logits
-                    )
+                    window = getattr(processor, CONTEXT_WINDOW_ATTR, None)
+                    context = self._token_context[i]
+                    if isinstance(window, int) and window > 0:
+                        context = context[-window:]
+                    sample_logits = processor(mx.array(context), sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 

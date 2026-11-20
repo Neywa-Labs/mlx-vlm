@@ -8,6 +8,11 @@ import mlx.core as mx
 
 MIN_SAMPLING_TEMPERATURE = 0.01
 
+# A logits processor may expose this attribute to declare how many trailing
+# tokens it inspects. Batched decoding then copies only that tail to the device
+# instead of the full generated history.
+CONTEXT_WINDOW_ATTR = "_mlx_vlm_context_window"
+
 
 @partial(mx.compile, shapeless=True)
 def greedy_argmax(logits: mx.array) -> mx.array:
@@ -453,6 +458,7 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
             logits = logits[:, :-1]
         return logits
 
+    setattr(repetition_penalty_processor, CONTEXT_WINDOW_ATTR, context_size)
     return repetition_penalty_processor
 
 
@@ -480,6 +486,7 @@ def make_presence_penalty(penalty: float, context_size: int = 20):
             logits = logits[:, :-1]
         return logits
 
+    setattr(presence_penalty_processor, CONTEXT_WINDOW_ATTR, context_size)
     return presence_penalty_processor
 
 
@@ -510,6 +517,7 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
             logits = logits[:, :-1]
         return logits
 
+    setattr(frequency_penalty_processor, CONTEXT_WINDOW_ATTR, context_size)
     return frequency_penalty_processor
 
 
