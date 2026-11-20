@@ -5338,3 +5338,150 @@ class TestResizeImageGuards:
     def test_small_image_upscale_behavior_is_unchanged(self):
         img = Image.new("RGB", (100, 150))
         assert resize_image(img, (320, 320)).size == (213, 320)
+
+
+class TestPhi3VProcessorFixes:
+    """Regression tests for phi3_v text chunking and HD padding fidelity.
+
+    Covers two bugs:
+    - the first real text token after an image placeholder was dropped;
+    - the HD transform stretched images to the padded size and never added
+      the reference white, vertically centered padding.
+    """
+
+    def _tokenizer(self):
+        class _Stub:
+            bos_token_id = 1
+            bos_token = "<s>"
+
+            def encode(self, text, add_special_tokens=True, **kwargs):
+                ids = [ord(c) for c in text]
+                return [self.bos_token_id] + ids if add_special_tokens else ids
+
+        return _Stub()
+
+    def _processor(self, num_crops=4):
+        from transformers.processing_utils import ProcessorMixin
+
+        from mlx_vlm.models.phi3_v.processing_phi3_v import (
+            Phi3VImageProcessor,
+            Phi3VProcessor,
+        )
+
+        image_processor = Phi3VImageProcessor(num_crops=num_crops)
+        tokenizer = self._tokenizer()
+        with patch.object(ProcessorMixin, "__init__", return_value=None):
+            processor = Phi3VProcessor(image_processor, tokenizer)
+        processor.image_processor = image_processor
+        processor.tokenizer = tokenizer
+        return processor
+
+    def test_text_after_image_keeps_first_token(self):
+        processor = self._processor()
+        image = Image.new("RGB", (64, 64), (255, 0, 0))
+        out = processor._convert_images_texts_to_inputs(
+            [image], "Q<|image_1|>What is this?"
+        )
+        ids = out["input_ids"].tolist()[0]
+        num_image_tokens = processor.image_processor.calc_num_image_tokens(image)
+        # BOS + "Q", then the image pad, then the untouched text chunk.
+        assert ids[0] == 1
+        assert ids[1] == ord("Q")
+        assert ids[2 : 2 + num_image_tokens] == [-1] * num_image_tokens
+        tail = ids[2 + num_image_tokens :]
+        assert tail == [ord(c) for c in "What is this?"]
+        assert tail[0] == ord("W")  # previously swallowed
+
+    def test_multi_image_chunks_keep_first_tokens(self):
+        processor = self._processor()
+        images = [Image.new("RGB", (64, 64), (255, 0, 0)) for _ in range(2)]
+        out = processor._convert_images_texts_to_inputs(
+            images, "A<|image_1|>B<|image_2|>C"
+        )
+        ids = out["input_ids"].tolist()[0]
+        n1 = processor.image_processor.calc_num_image_tokens(images[0])
+        n2 = processor.image_processor.calc_num_image_tokens(images[1])
+        assert ids[0] == 1 and ids[1] == ord("A")
+        assert ids[2 + n1] == ord("B")
+        assert ids[2 + n1 + 1 + n2] == ord("C")
+
+    def test_hd_transform_portrait_white_padding_no_stretch(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import (
+            _calc_hd_transform_size,
+            _hd_transform,
+        )
+
+        image = Image.new("RGB", (100, 150), (255, 0, 0))
+        hd = _hd_transform(image, hd_num=4)
+        assert hd.size == (672, 672)
+        assert hd.size == _calc_hd_transform_size(100, 150, 4)
+        arr = np.array(hd)
+        # Portrait padding lands on the left/right after transposing back.
+        assert (arr[:, 0, :] == 255).all()
+        assert (arr[:, -1, :] == 255).all()
+        # Content keeps its aspect ratio (448x672 band) instead of stretching.
+        assert (arr[336, 336] == [255, 0, 0]).all()
+        content_width = 672 - 2 * 112
+        assert content_width / 672 == pytest.approx(100 / 150)
+
+    def test_hd_transform_landscape_white_padding_no_stretch(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import _hd_transform
+
+        image = Image.new("RGB", (150, 100), (255, 0, 0))
+        hd = _hd_transform(image, hd_num=4)
+        assert hd.size == (672, 672)
+        arr = np.array(hd)
+        # Landscape padding lands on the top/bottom.
+        assert (arr[0, :, :] == 255).all()
+        assert (arr[-1, :, :] == 255).all()
+        assert (arr[336, 336] == [255, 0, 0]).all()
+
+    def test_pad_to_336_height_only_white_centered(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import _pad_to_336
+
+        image = Image.new("RGB", (336, 448), (255, 0, 0))
+        padded = _pad_to_336(image)
+        assert padded.size == (336, 672)  # width unchanged, height padded
+        arr = np.array(padded)
+        assert (arr[:112] == 255).all()
+        assert (arr[-112:] == 255).all()
+        assert (arr[112:560, :, 0] == 255).all()
+        assert (arr[112:560, :, 1:] == 0).all()
+
+    def test_pad_to_336_noop_when_divisible(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import _pad_to_336
+
+        image = Image.new("RGB", (336, 336), (255, 0, 0))
+        assert _pad_to_336(image) is image
+
+    def test_normalized_white_padding_in_tiles(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import (
+            OPENAI_CLIP_MEAN,
+            OPENAI_CLIP_STD,
+            Phi3VImageProcessor,
+        )
+
+        processor = Phi3VImageProcessor(num_crops=4)
+        image = Image.new("RGB", (100, 150), (255, 0, 0))
+        out = processor.preprocess([image])
+        pixels = np.array(out["pixel_values"])  # (B, T, C, H, W)
+        white = (1.0 - np.array(OPENAI_CLIP_MEAN)) / np.array(OPENAI_CLIP_STD)
+        # Index 0 is the global image; index 1 is the first 336x336 tile,
+        # whose top-left corner sits in the white padding.
+        np.testing.assert_allclose(pixels[0, 1, :, 0, 0], white, atol=1e-4)
+
+    def test_image_size_and_token_count_unchanged(self):
+        from mlx_vlm.models.phi3_v.processing_phi3_v import (
+            Phi3VImageProcessor,
+            _calc_hd_transform_size,
+        )
+
+        processor = Phi3VImageProcessor(num_crops=4)
+        for size in [(100, 150), (150, 100), (64, 64), (336, 336)]:
+            image = Image.new("RGB", size, (255, 0, 0))
+            pixels, image_size = processor._process_single_image(image)
+            assert image_size == _calc_hd_transform_size(*size, 4)
+            hd_h, hd_w = image_size
+            expected_tiles = (hd_h // 336) * (hd_w // 336) + 1
+            assert pixels.shape[0] == expected_tiles
+            assert pixels.shape[2:] == (336, 336)
