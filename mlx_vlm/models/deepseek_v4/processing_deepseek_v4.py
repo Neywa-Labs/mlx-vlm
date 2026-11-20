@@ -332,9 +332,6 @@ def load_deepseek_v4_chat_template(model_path, **kwargs) -> Optional[str]:
 class DeepseekV4Processor(ProcessorMixin):
     attributes = ["tokenizer"]
     tokenizer_class = "AutoTokenizer"
-    # Prompts are rendered in code (encoding_dsv4), so there is no chat template
-    # for the tool registry to inspect; declare the DSML parser explicitly.
-    tool_parser_type = "deepseek_v4"
 
     def __init__(
         self,
@@ -370,6 +367,12 @@ class DeepseekV4Processor(ProcessorMixin):
     @chat_template.setter
     def chat_template(self, value):
         self.tokenizer.chat_template = value
+
+    @property
+    def tool_parser_type(self):
+        # Only the built-in Python encoder guarantees DSML. A checkpoint's
+        # custom template must select its parser through the normal registry.
+        return "deepseek_v4" if self.chat_template == DEFAULT_CHAT_TEMPLATE else None
 
     @staticmethod
     def _content_to_text(content):
