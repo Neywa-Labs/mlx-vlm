@@ -4039,6 +4039,60 @@ class TestLoadVideo:
         assert metadata.timestamps[0] == pytest.approx(0.0)
         assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
 
+    def test_requested_interval_keeps_only_those_source_frames(self, tmp_path):
+        cv2 = pytest.importorskip("cv2")
+        colors = (
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (255, 0, 255),
+            (0, 255, 255),
+        )
+        path = tmp_path / "six.mp4"
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 1.0, (32, 32))
+        for rgb in colors:
+            frame = np.full((32, 32, 3), rgb[::-1], np.uint8)
+            writer.write(frame)
+        writer.release()
+
+        clipped, metadata = load_video(
+            str(path),
+            fps=1.0,
+            nframes=3,
+            frame_factor=1,
+            start_time=2,
+            end_time=4,
+        )
+        assert metadata.frames_indices == [2, 3, 4]
+        names = ("red", "green", "blue", "yellow", "magenta", "cyan")
+
+        def nearest(pixel):
+            return names[
+                min(
+                    range(len(colors)),
+                    key=lambda i: sum((int(a) - b) ** 2 for a, b in zip(pixel, colors[i])),
+                )
+            ]
+
+        assert [nearest(frame[:, 0, 0]) for frame in clipped] == [
+            "blue",
+            "yellow",
+            "magenta",
+        ]
+        assert metadata.timestamps == pytest.approx([2.0, 3.0, 4.0])
+
+        _, zero = load_video(
+            str(path), nframes=1, frame_factor=1, start_time=0, end_time=1
+        )
+        assert zero.frames_indices == [0]
+
+        _, whole = load_video(str(path), nframes=6, frame_factor=1)
+        assert whole.frames_indices == [0, 1, 2, 3, 4, 5]
+
+        with pytest.raises(ValueError, match="Empty video interval"):
+            load_video(str(path), nframes=1, frame_factor=1, start_time=5, end_time=1)
+
 
 class TestResolveVideoSampling:
     def test_processor_beats_defaults(self):
