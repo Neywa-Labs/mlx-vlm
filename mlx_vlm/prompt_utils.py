@@ -36,6 +36,7 @@ MODEL_CONFIG = {
     "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,
     "idefics3": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "granite_docling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "lfm3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -121,6 +122,7 @@ MODEL_CONFIG = {
     "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "inkling2": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling2_loop": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,

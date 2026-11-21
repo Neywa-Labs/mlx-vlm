@@ -1557,6 +1557,15 @@ class TestVisionFeatureCache:
         assert square != wide
         assert square == processed_image_key(mx.zeros((16, 3)), mx.array([[1, 4, 4]]))
 
+    def test_processed_key_separates_granite_docling_routes(self):
+        pixels = mx.zeros((1, 2, 3, 8, 8))
+        coarse = processed_image_key(pixels)
+        fine = processed_image_key(pixels, tile_fine_mask=mx.array([True]))
+        assert coarse != fine
+        assert fine == processed_image_key(
+            mx.zeros((1, 2, 3, 8, 8)), tile_fine_mask=mx.array([True]), max_tokens=8
+        )
+
     def test_processed_key_handles_ragged_image_batches(self):
         images = [mx.zeros((4, 3)), mx.ones((16, 3))]
         key = processed_image_key(images)
@@ -1928,7 +1937,9 @@ def test_layer_major_threshold(managers, monkeypatch):
 
 def test_disk_block_lifecycle(managers, monkeypatch):
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "1")
-    manager = managers("disk", blocks=1)
+    # Disk restores check both free RAM and the manager's memory headroom.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=1, budget=1 << 20)
     first, second = list(range(48)), list(range(100, 148))
     manager.release(store_blocks(manager, first))
     manager.disk.flush()
@@ -1940,7 +1951,7 @@ def test_disk_block_lifecycle(managers, monkeypatch):
     size = manager.disk.disk_bytes
     assert size > 0 and manager.disk.dir.exists()
     manager.close()
-    reader = managers("disk")
+    reader = managers("disk", budget=1 << 20)
     warm, count = reader.lookup_prefix_disk_cache(second)
     assert count == 48 and all(c.offset == 48 for c in warm)
     assert reader.stats_snapshot()["pool_used"] == 0
@@ -1951,8 +1962,10 @@ def test_disk_block_lifecycle(managers, monkeypatch):
 
 
 @parametrize("evicted", [1, 2])
-def test_disk_prefix_with_evicted_leading_blocks(managers, evicted):
-    manager = managers("disk", blocks=3)
+def test_disk_prefix_with_evicted_leading_blocks(managers, evicted, monkeypatch):
+    # Keep prefix restoration independent of the runner's available memory.
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    manager = managers("disk", blocks=3, budget=1 << 20)
     tokens = list(range(48))
     source = [filled(C.KVCache(), 48, heads=1, dim=4)]
     stored = manager.store_kv_blocks(

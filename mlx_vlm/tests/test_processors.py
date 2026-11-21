@@ -1506,6 +1506,66 @@ class TestQwen3VLProcessor:
         assert output["pixel_values_videos"].shape == (512, 1176)
 
 
+class TestQwen2_5VLVideoTemporalSpacing:
+    def _processor(self):
+        p = _make_processor("qwen2_5_vl")
+        p.video_processor = _stub("qwen_video")
+        return p
+
+    def _videos(self):
+        return [np.zeros((4, 224, 224, 3), np.uint8)]
+
+    def test_second_per_grid_ts_from_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos(), fps=2.0)
+        assert result["second_per_grid_ts"].tolist() == [1.0]
+        assert "fps" not in p.tokenizer.last_kwargs
+
+    def test_second_per_grid_ts_per_video_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos(), fps=[4.0])
+        assert result["second_per_grid_ts"].tolist() == [0.5]
+
+    def test_second_per_grid_ts_defaults_to_processor_fps(self):
+        p = self._processor()
+        result = p(text=["<|video_pad|>"], videos=self._videos())
+        assert result["second_per_grid_ts"].tolist() == [1.0]
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            NS(sampled_fps=4.0),
+            {"fps": 8.0, "total_num_frames": 8, "frames_indices": [0, 2, 4, 6]},
+        ],
+    )
+    def test_second_per_grid_ts_from_video_metadata(self, metadata):
+        p = self._processor()
+        result = p(
+            text=["<|video_pad|>"],
+            videos=self._videos(),
+            video_metadata=[metadata],
+        )
+        assert result["second_per_grid_ts"].tolist() == [0.5]
+        assert "video_metadata" not in p.tokenizer.last_kwargs
+
+    @pytest.mark.parametrize("fps", [3.0, 4.0])
+    def test_prepare_inputs_preserves_sampled_fps(self, fps):
+        result = prepare_inputs(
+            self._processor(), prompts=["<|video_pad|>"], videos=self._videos(), fps=fps
+        )
+        assert result["second_per_grid_ts"].tolist() == pytest.approx([2 / fps])
+
+    def test_fps_count_mismatch_raises(self):
+        p = self._processor()
+        with pytest.raises(ValueError, match="length of fps"):
+            p(text=["<|video_pad|>"], videos=self._videos(), fps=[2.0, 2.0])
+
+    def test_non_positive_fps_raises(self):
+        p = self._processor()
+        with pytest.raises(ValueError, match="fps must be positive"):
+            p(text=["<|video_pad|>"], videos=self._videos(), fps=0.0)
+
+
 def test_pixtral_image_preprocess_resizes_to_patch_multiple_and_pads():
     image_processor = m.pixtral_ip.PixtralImageProcessor(**PROFILES["pixtral_image"])
     wide = Image.fromarray(np.zeros((31, 55, 3), dtype=np.uint8))
@@ -2944,6 +3004,12 @@ WIRE_CALLS = {
     '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
     "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
     '"parameters":{"city":"Paris","days":3}}<|END_ACTION|>',
+    "deepseek_v4": "<｜DSML｜tool_calls>\n"
+    '<｜DSML｜invoke name="get_weather">\n'
+    '<｜DSML｜parameter name="city" string="true">Paris</｜DSML｜parameter>\n'
+    '<｜DSML｜parameter name="days" string="false">3</｜DSML｜parameter>\n'
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜tool_calls>",
     "gemma4": '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>',
     "glm47": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
     "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
@@ -2966,6 +3032,8 @@ WIRE_CALLS = {
     "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
     "harmony": "<|channel|>commentary to=functions.get_weather <|constrain|>json"
     '<|message|>{"city": "Paris", "days": 3}<|call|>',
+    "inkling": '<|message_model|>get_weather<|content_invoke_tool_json|>{"name":'
+    '"get_weather","args":{"city":"Paris","days":3}}<|end_message|>',
     "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
     "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
     "<parameter=days>3</parameter></function></tool_call>",
@@ -3033,6 +3101,54 @@ def test_parser_contract(name):
         assert result.remaining_text == text
 
 
+@pytest.mark.parametrize(
+    "query,limit,expected",
+    [
+        ("weather", "5", dict(query="weather", limit=5)),
+        ("null", "null", dict(query=None, limit=None)),
+    ],
+)
+def test_minimax_m2_nullable_parameters(query, limit, expected):
+    tools = [
+        dict(
+            type="function",
+            function=dict(
+                name="search",
+                parameters=dict(
+                    type="object",
+                    properties=dict(
+                        query={"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        limit={"type": ["integer", "null"]},
+                    ),
+                ),
+            ),
+        )
+    ]
+    text = (
+        '<minimax:tool_call><invoke name="search">'
+        f'<parameter name="query">{query}</parameter>'
+        f'<parameter name="limit">{limit}</parameter>'
+        "</invoke></minimax:tool_call>"
+    )
+
+    assert _parse("minimax_m2", text, tools) == _call("search", **expected)
+
+
+@pytest.mark.parametrize("value", ["inf", "1e309"])
+def test_minimax_m2_preserves_string_on_numeric_overflow(value):
+    tools = _weather_tools(radius=["number", "string", "null"])
+    text = (
+        '<minimax:tool_call><invoke name="get_weather">'
+        f'<parameter name="radius">{value}</parameter>'
+        "</invoke></minimax:tool_call>"
+    )
+
+    result = process_tool_calls(text, load_tool_module("minimax_m2"), tools)
+
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0]["function"]["arguments"]) == {"radius": value}
+
+
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_selection(name):
     # Specific formats must outrank the generic JSON fallback.
@@ -3050,6 +3166,101 @@ def test_parser_selection(name):
     processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=template))
     assert _infer_tool_parser_from_processor(processor) == name
     assert _infer_tool_parser("anything", override=name) == name
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("with_system", [False, True])
+def test_deepseek_vision_tools_round_trip(thinking, with_system):
+    processor = c.deepseek(fast_tokenizer())
+    messages = [
+        dict(
+            role="user",
+            content=[
+                dict(type="text", text="Use get_weather for this city:"),
+                dict(type="image_url", image_url=dict(url="city.png")),
+            ],
+        )
+    ]
+    if with_system:
+        messages.insert(0, dict(role="system", content="Use the provided tools."))
+    original = deepcopy(messages)
+
+    def render():
+        return apply_chat_template(
+            processor,
+            dict(model_type="deepseek_v4"),
+            messages,
+            tools=WEATHER_TOOLS,
+            enable_thinking=thinking,
+            reasoning_effort="high",
+            num_images=1,
+        )
+
+    prompt = render()
+    assert '"name": "get_weather"' in prompt
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert prompt.count("<｜deepseek_image｜>") == 1
+    suffix = "<｜Assistant｜>" + ("<think>" if thinking else "</think>")
+    assert prompt.endswith(suffix)
+    assert ("Reasoning Effort:" in prompt) == thinking
+    assert messages == original
+
+    calls = process_tool_calls(
+        WIRE_CALLS["deepseek_v4"], load_tool_module("deepseek_v4"), WEATHER_TOOLS
+    ).calls
+    messages.extend(
+        [
+            dict(role="assistant", content=None, tool_calls=calls),
+            dict(role="tool", tool_call_id=calls[0]["id"], content="Sunny, 18 C"),
+        ]
+    )
+    continued = render()
+    assert '<｜DSML｜invoke name="get_weather">' in continued
+    assert "<tool_result>Sunny, 18 C</tool_result>" in continued
+    assert continued.count("<｜deepseek_image｜>") == 1
+    assert continued.endswith(suffix)
+
+
+@pytest.mark.parametrize(
+    "template,expected",
+    [
+        (None, "deepseek_v4"),
+        ("[TOOL_CALLS]", "mistral"),
+        ("<arg_key>", "glm47"),
+        ("{{ messages[0]['content'] }}", None),
+    ],
+)
+def test_deepseek_parser_follows_active_encoder(template, expected):
+    processor = c.deepseek(fast_tokenizer())
+    if template is not None:
+        processor.chat_template = template
+        assert processor.apply_chat_template(
+            [dict(role="user", content="Hello")], tokenize=False
+        ) == ("Hello" if expected is None else template)
+    assert _infer_tool_parser_from_processor(processor) == expected
+    assert (
+        _infer_tool_parser_from_processor(processor, override="json_tools")
+        == "json_tools"
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 17])
+def test_deepseek_streamed_tool_calls(chunk_size):
+    from mlx_vlm.tools.streaming import ToolCallDeltaState
+
+    parser = load_tool_module("deepseek_v4")
+    state = ToolCallDeltaState(parser, WEATHER_TOOLS)
+    wire = WIRE_CALLS["deepseek_v4"]
+    deltas = [
+        delta
+        for start in range(0, len(wire), chunk_size)
+        for delta in state.feed(wire[start : start + chunk_size])
+    ]
+    calls = process_tool_calls(wire, parser, WEATHER_TOOLS).calls
+    deltas.extend(state.finish(calls))
+    arguments = "".join(delta["function"].get("arguments", "") for delta in deltas)
+    assert json.loads(arguments) == WEATHER_ARGS
+    assert next(delta["id"] for delta in deltas if "id" in delta) == calls[0]["id"]
 
 
 @pytest.mark.parametrize(
@@ -3426,6 +3637,47 @@ def test_harmony_ignores_plain_commentary_preamble():
     assert result.remaining_text == preamble
 
 
+INKLING_THINKING = (
+    "<|message_model|><|content_thinking|>The user wants the weather.<|end_message|>"
+)
+
+
+@pytest.mark.parametrize(
+    "output,count",
+    [
+        (INKLING_THINKING + WIRE_CALLS["inkling"], 1),
+        (
+            INKLING_THINKING
+            + "<|message_model|><|content_text|>Checking.<|end_message|>"
+            + WIRE_CALLS["inkling"]
+            + INKLING_THINKING
+            + WIRE_CALLS["inkling"],
+            2,
+        ),
+    ],
+    ids=["thinking-then-call", "text-and-two-calls"],
+)
+def test_inkling_extracts_calls_from_message_framing(output, count):
+    result = process_tool_calls(output, load_tool_module("inkling"), WEATHER_TOOLS)
+    assert len(result.calls) == count
+    for call in result.calls:
+        assert call["function"]["name"] == "get_weather"
+        assert json.loads(call["function"]["arguments"]) == WEATHER_ARGS
+    # Every message is sliced out, so no thinking or recipient header remains.
+    assert result.remaining_text == ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"name":"get_weather","args":{"city":', '{"args":{}}', '{"name":"f","args":[]}'],
+    ids=["truncated", "no-name", "non-object-arguments"],
+)
+def test_inkling_drops_malformed_call(body):
+    output = f"<|message_model|>f<|content_invoke_tool_json|>{body}<|end_message|>"
+    result = process_tool_calls(output, load_tool_module("inkling"), None)
+    assert result.calls == []
+
+
 # Loading and utility contracts
 
 
@@ -3593,6 +3845,110 @@ def test_prepare_inputs_text_options_do_not_forward_media_or_generation_options(
 
     assert actual["input_ids"].shape == (1, 4)
     assert unrelated.keys().isdisjoint(spy.call_args.kwargs)
+
+
+@pytest.fixture
+def granite_docling_processor():
+    from mlx_vlm.models.granite_docling.processing_granite_docling import (
+        GraniteDoclingImageProcessor,
+        GraniteDoclingProcessor,
+    )
+
+    tokenizer = fast_tokenizer()
+    tokenizer.add_tokens(
+        [
+            "<image>",
+            "<fake_token_around_image>",
+            "<row_1_col_1>",
+            "<row_1_col_2>",
+            "<global-img>",
+        ],
+        special_tokens=True,
+    )
+    return GraniteDoclingProcessor(
+        GraniteDoclingImageProcessor(size={"height": 32, "width": 32}),
+        tokenizer,
+        image_seq_len=4,
+        chat_template="{{ messages[0]['content'] }}",
+    )
+
+
+def test_granite_docling_processor_load_and_route(tmp_path, granite_docling_processor):
+    processor = granite_docling_processor
+    processor.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text('{"model_type": "granite_docling"}')
+    loaded = load_processor(tmp_path, add_detokenizer=False)
+    assert type(loaded) is type(processor)
+    assert loaded.chat_template == processor.chat_template
+    assert loaded.image_seq_len == 4
+
+    loaded.image_processor.fine_route = True
+    for options, tokens in [
+        ({}, 48),
+        ({"fine_route": False}, 12),
+        ({"fine_route": True}, 48),
+    ]:
+        outputs = prepare_inputs(
+            loaded, images=[Image.new("RGB", (64, 32))], prompts="<image>", **options
+        )
+        assert int((outputs["input_ids"] == loaded.image_token_id).sum()) == tokens
+        assert outputs["pixel_values"].shape == (1, 3, 3, 32, 32)
+        assert outputs["pixel_attention_mask"].tolist() == [[True, True, True]]
+        assert ("tile_fine_mask" in outputs) == (tokens == 48)
+
+
+def test_granite_docling_tile_limits_and_transparency(granite_docling_processor):
+    processor = granite_docling_processor.image_processor
+    assert processor.get_tile_grid(19, 800) == (1, 16)
+    assert processor.get_tile_grid(256, 512, {"max_patches": 4}) == (1, 2)
+    assert processor.get_tile_grid(
+        256,
+        512,
+        {
+            "max_patches": 4,
+            "dense_max_patches": 12,
+            "dense_min_aspect": 1.1,
+            "dense_max_aspect": 2.5,
+            "dense_max_scale": 0.75,
+        },
+    ) == (2, 4)
+
+    transparent = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+    white = Image.new("RGB", transparent.size, "white")
+    np.testing.assert_array_equal(
+        processor(transparent)["pixel_values"], processor(white)["pixel_values"]
+    )
+
+
+@pytest.mark.parametrize("fine_route", [False, True])
+def test_granite_docling_matches_transformers_pil(
+    granite_docling_processor, fine_route
+):
+    reference = pytest.importorskip(
+        "transformers.models.granite_docling.processing_granite_docling"
+    )
+    from transformers import GraniteDoclingImageProcessorPil
+
+    local = granite_docling_processor
+    oracle = reference.GraniteDoclingProcessor(
+        GraniteDoclingImageProcessorPil(size={"height": 32, "width": 32}),
+        local.tokenizer,
+        image_seq_len=4,
+    )
+    rng = np.random.default_rng(41)
+    square = Image.fromarray(rng.integers(0, 256, (28, 31, 3), dtype=np.uint8))
+    wide = Image.fromarray(rng.integers(0, 256, (60, 128, 4), dtype=np.uint8))
+    options = dict(
+        images=[[square, wide], [], [square]],
+        text=["first <image> then <image>", "text only", "<image>"],
+        fine_route=fine_route,
+        padding=True,
+        return_tensors="np",
+    )
+    actual, expected = local(**options), oracle(**options)
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        np.testing.assert_array_equal(actual[key], expected[key])
 
 
 @pytest.mark.parametrize("wrapped", [False, True])

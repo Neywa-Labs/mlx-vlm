@@ -61,7 +61,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
-| Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
+| Inkling 2 Mini and Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
 | SenseNova-Loop-9B | [Docs](mlx_vlm/models/sensenova_loop/README.md) |
 | LFM3-Audio | [Docs](mlx_vlm/models/lfm3_audio/README.md) |
@@ -94,6 +94,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | PP-DocLayoutV3 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite Vision (4.0, 4.1) | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| Granite for Docling | [Docs](mlx_vlm/models/granite_docling/README.md) |
 | MiniCPM-OCR 1.0 | [Docs](mlx_vlm/models/minicpm_ocr/README.md) |
 | MiniCPM-OCR Jev | [Docs](mlx_vlm/models/minicpm_ocr_jev/README.md) |
 | MiniCPM-V 4.7 | [Docs](https://github.com/Neywa-Labs/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_7/README.md) |
@@ -109,6 +110,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Ripple | [Docs](mlx_vlm/models/ricursive/README.md) |
 | Nemotron 3.5 Super VL / Bolt / Nano Omni | [Docs](mlx_vlm/models/nemotron_h_nano_omni/README.md) |
 | Idol (image to 3D Gaussian splats) | [Docs](mlx_vlm/models/idol/README.md) |
+| Depth Pro 2 (image and video depth) | [Docs](mlx_vlm/models/depth_pro_2/README.md) · [S](https://huggingface.co/nativ-community/DepthPro2-S) · [B](https://huggingface.co/nativ-community/DepthPro2-B) · [L](https://huggingface.co/nativ-community/DepthPro2-L) · [H+](https://huggingface.co/nativ-community/DepthPro2-H) |
 
 ## Installation
 
