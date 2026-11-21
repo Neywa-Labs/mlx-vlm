@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 
@@ -227,6 +229,104 @@ def test_training_updates_and_saves(monkeypatch, missing_adapter):
             "0000001_adapters.safetensors",
             "adapters.safetensors",
         ]
+
+
+def _shuffle_dataset(size=8):
+    return [
+        dict(input_ids=mx.array([idx]), attention_mask=mx.ones(1, mx.int32))
+        for idx in range(size)
+    ]
+
+
+def _batch_order(dataset, **kwargs):
+    batches = iterate_batches(dataset, batch_size=2, max_seq_length=1, **kwargs)
+    return [next(batches)["input_ids"][0, 0].item() // 2 for _ in range(4)]
+
+
+def test_iterate_batches_single_process_keeps_global_rng():
+    dataset = _shuffle_dataset()
+    np.random.seed(42)
+    expected = np.random.permutation(4).tolist()
+    np.random.seed(42)
+    assert _batch_order(dataset, train=True) == expected
+
+
+def test_iterate_batches_explicit_seed_is_reproducible():
+    dataset = _shuffle_dataset()
+    np.random.seed(1)
+    first = _batch_order(dataset, train=True, seed=7)
+    np.random.seed(999)
+    assert _batch_order(dataset, train=True, seed=7) == first
+    assert first == np.random.default_rng(7).permutation(4).tolist()
+
+
+def test_iterate_batches_distributed_ranks_share_shuffle(monkeypatch):
+    dataset = _shuffle_dataset()
+    state = {"rank": 0}
+    world = NS(rank=lambda: state["rank"], size=lambda: 2)
+    monkeypatch.setattr(mx.distributed, "init", lambda: world)
+
+    def shard(rank, process_seed):
+        state["rank"] = rank
+        # Independent processes start with unrelated NumPy RNG states.
+        np.random.seed(process_seed)
+        batches = iterate_batches(dataset, batch_size=2, max_seq_length=1, train=True)
+        return [next(batches)["input_ids"][0, 0].item() for _ in range(4)]
+
+    left, right = shard(0, 0), shard(1, 1)
+    expected = np.random.default_rng(0).permutation(4)
+    for position, global_batch in enumerate(expected):
+        assert sorted((left[position], right[position])) == [
+            2 * int(global_batch),
+            2 * int(global_batch) + 1,
+        ]
+
+
+@pytest.mark.parametrize("iters,expected_w,updates", [(5, -23.5, 3), (4, -7.5, 2)])
+def test_train_applies_trailing_partial_accumulation(
+    monkeypatch, iters, expected_w, updates
+):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = mx.zeros((1,))
+
+        def __call__(self, *args, **kwargs):
+            return NS(logits=mx.zeros((1, 3, 10)))
+
+    batches = [dict(scale=float(s)) for s in (1.0, 2.0, 4.0, 8.0, 16.0)]
+
+    def loss_fn(model, batch, **kwargs):
+        return model.w.sum() * batch["scale"], {}
+
+    model = Model()
+    optimizer = optim.SGD(learning_rate=1.0)
+    update = Mock(wraps=optimizer.update)
+    monkeypatch.setattr(optimizer, "update", update)
+    monkeypatch.setattr(
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.mx.save_safetensors", Mock()
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.trainer.vlm.cross_entropy.trainer.iterate_batches",
+        Mock(return_value=iter(batches[:iters])),
+    )
+    train(
+        model,
+        optimizer,
+        MagicMock(__len__=lambda self: iters),
+        None,
+        TrainingArgs(
+            iters=iters,
+            batch_size=1,
+            gradient_accumulation_steps=2,
+            grad_clip=None,
+            steps_per_report=100,
+            steps_per_save=100,
+        ),
+        loss_fn=loss_fn,
+    )
+    assert update.call_count == updates
+    assert model.w.item() == pytest.approx(expected_w)
 
 
 def test_completion_mask_is_used_without_passing_to_model():

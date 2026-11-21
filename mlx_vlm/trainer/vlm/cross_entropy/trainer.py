@@ -196,7 +196,7 @@ def _drops_image_tokens(input_ids, image_token_id, max_seq_length):
     return kept != total
 
 
-def iterate_batches(dataset, batch_size, max_seq_length, train=False):
+def iterate_batches(dataset, batch_size, max_seq_length, train=False, seed=None):
     indices = list(range(len(dataset)))
     if len(dataset) < batch_size:
         raise ValueError(f"Dataset must have at least {batch_size} examples")
@@ -210,14 +210,20 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         for i in range(0, len(indices) - batch_size + 1, batch_size)
     ]
 
+    # Independent processes must shuffle identically, otherwise each rank
+    # averages gradients from unrelated global batches. Mirror the guard in
+    # common.utils.iterate_batch_indices; single-process runs keep NumPy's
+    # global RNG behavior.
+    if seed is None and step > 1:
+        seed = 0
+    rng = np.random if seed is None else np.random.default_rng(seed)
+
     image_token_id = _dataset_image_token_id(dataset)
     warned_indices = set()
 
     while True:
         order = (
-            np.random.permutation(len(batch_indices))
-            if train
-            else range(len(batch_indices))
+            rng.permutation(len(batch_indices)) if train else range(len(batch_indices))
         )
         yielded_any = False
         for b in order:
@@ -444,6 +450,20 @@ def train(
 
     state = [model.state, optimizer.state, mx.random.state]
 
+    def apply_update(grad, accum_steps):
+        # Average grads across ranks entirely on the CPU stream and
+        # materialize before any GPU-stream consumer, so the blocking ring
+        # all-reduce never keeps a Metal command buffer in flight — a slow
+        # peer would otherwise stall it past Metal's ~5s command-buffer
+        # watchdog and crash the run. See issue #2179.
+        if world_size > 1:
+            with mx.stream(mx.cpu):
+                grad = average_gradients(grad, communication_stream=mx.cpu)
+            mx.eval(grad)
+        if accum_steps > 1:
+            grad = tree_map(lambda x: x / accum_steps, grad)
+        optimizer.update(model, grad)
+
     def step(batch, prev_grad, do_update):
         output, grad = loss_value_and_grad(model, batch)
         lvalue, metrics = normalize_loss_output(output)
@@ -456,18 +476,7 @@ def train(
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
         if do_update:
-            # Average grads across ranks entirely on the CPU stream and
-            # materialize before any GPU-stream consumer, so the blocking ring
-            # all-reduce never keeps a Metal command buffer in flight — a slow
-            # peer would otherwise stall it past Metal's ~5s command-buffer
-            # watchdog and crash the run. See issue #2179.
-            if world_size > 1:
-                with mx.stream(mx.cpu):
-                    grad = average_gradients(grad, communication_stream=mx.cpu)
-                mx.eval(grad)
-            if grad_accum_steps > 1:
-                grad = tree_map(lambda x: x / grad_accum_steps, grad)
-            optimizer.update(model, grad)
+            apply_update(grad, grad_accum_steps)
             grad = None
 
         return lvalue, metrics, grad
@@ -570,6 +579,14 @@ def train(
                 f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
+
+    # Apply the trailing incomplete accumulation so its microsteps are not
+    # silently dropped, mirroring common.utils.apply_final_accumulated_gradients.
+    partial_steps = args.iters % grad_accum_steps
+    if grad_accum is not None and partial_steps:
+        apply_update(grad_accum, partial_steps)
+        mx.eval(model.state, optimizer.state)
+        grad_accum = None
 
     # Save final weights
     if rank == 0:
