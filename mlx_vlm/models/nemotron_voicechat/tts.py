@@ -449,7 +449,8 @@ class RVQEARTTSModel(nn.Module):
         embeddings = mx.concatenate([self.rvq_embs, padding], axis=1)
         for idx in range(self.config.num_quantizers):
             result = result + embeddings[idx, code[..., idx]]
-        return result
+        # A float32 sum would promote half-precision weights on every matmul.
+        return result.astype(self.rvq_embs.dtype)
 
     def _condition(
         self,

@@ -30,11 +30,22 @@ class Perception(nn.Module):
         self.encoder = Conformer(config.encoder)
         self.proj = nn.Linear(config.encoder.d_model, config.output_dim, bias=True)
 
+    @property
+    def compute_dtype(self) -> mx.Dtype:
+        """The encoder weights' float dtype (a quantized layer's scales)."""
+        out = self.encoder.pre_encode.out
+        scales = getattr(out, "scales", None)
+        dtype = (scales if scales is not None else out.weight).dtype
+        return dtype if mx.issubdtype(dtype, mx.floating) else mx.float32
+
     def __call__(
         self, mel: mx.array, lengths: Optional[mx.array] = None
     ) -> tuple[mx.array, mx.array, mx.array]:
+        # float32 features would promote half-precision weights on every matmul.
         encoded, lengths = self.encoder(
-            mel, lengths=lengths, att_context_size=self.encoder.args.att_context_size[0]
+            mel.astype(self.compute_dtype),
+            lengths=lengths,
+            att_context_size=self.encoder.args.att_context_size[0],
         )
         return self.proj(encoded), lengths, encoded
 
