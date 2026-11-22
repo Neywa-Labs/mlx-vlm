@@ -257,7 +257,21 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    has_quantizable_layer = any(
+        isinstance(layer_cache, cache.QuantizedKVCache)
+        or (
+            hasattr(layer_cache, "to_quantized")
+            and not isinstance(
+                layer_cache, (cache.RotatingKVCache, cache.BatchRotatingKVCache)
+            )
+        )
+        for layer_cache in prompt_cache
+    )
     for index, layer_cache in enumerate(prompt_cache):
+        if has_quantizable_layer and isinstance(
+            layer_cache, (cache.RotatingKVCache, cache.BatchRotatingKVCache)
+        ):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start

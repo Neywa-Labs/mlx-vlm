@@ -678,8 +678,9 @@ class Gemma4TextModel(nn.Module):
             kvs, offset = intermediates[prev_idx]
             if trimmed_prefix:
                 offset = offset + trimmed_prefix
+            layer_cache = cache[prev_idx] if kvs is not None else c
             h, kvs, offset = layer(
-                h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
+                h, m, layer_cache, per_layer_input=pli, shared_kv=kvs, offset=offset
             )
             intermediates[idx] = (kvs, offset)
             if hidden_sink is not None and idx in capture_set:
