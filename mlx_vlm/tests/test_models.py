@@ -2897,6 +2897,82 @@ def test_embedding_gemma2_sliding_attention_includes_window_boundary(
     np.testing.assert_allclose(baseline, outside, atol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "length, window, block_size, padded",
+    [(37, 5, 8, False), (37, 5, 8, True), (50, 3, 16, True), (23, 9, 7, False)],
+)
+def test_embedding_gemma2_sliding_blocks_match_dense_mask(
+    length, window, block_size, padded
+):
+    language = importlib.import_module("mlx_vlm.models.embedding_gemma2.language")
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((2, 2, length, 8)) for _ in range(3))
+    key_mask = None
+    valid = mx.ones((2, length), dtype=mx.bool_)
+    if padded:
+        valid = mx.arange(length)[None] < mx.array([[length], [length - 6]])
+        key_mask = valid[:, None, None, :]
+    positions = mx.arange(length)
+    dense = mx.abs(positions[:, None] - positions[None, :]) <= window
+    if key_mask is not None:
+        dense = dense & key_mask
+    blocks = language.sliding_window_blocks(length, window, block_size, key_mask)
+    assert len(blocks) == -(-length // block_size)
+    expected = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=dense)
+    actual = language.attention(q, k, v, blocks)
+    # Padding queries whose whole window is padding have no defined output.
+    query_valid = valid[:, None, :, None]
+    np.testing.assert_allclose(
+        mx.where(query_valid, actual, 0),
+        mx.where(query_valid, expected, 0),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_embedding_gemma2_blocked_sliding_attention_matches_dense(
+    embedding_gemma2_case, monkeypatch, padded
+):
+    module, config = embedding_gemma2_case
+    language = importlib.import_module("mlx_vlm.models.embedding_gemma2.language")
+    mx.random.seed(42)
+    model = module.Model(config)
+    ids = mx.random.randint(1, 50, (2, 19))
+    mask = mx.ones_like(ids)
+    if padded:
+        mask = (mx.arange(19)[None] < mx.array([[19], [12]])).astype(mx.int32)
+    dense = model(ids, attention_mask=mask)
+    # Window 3 with blocks of 4 splits 19 tokens into 5 query blocks.
+    monkeypatch.setattr(language, "SLIDING_BLOCK_SIZE", 4)
+    blocked = model(ids, attention_mask=mask)
+    valid = mask[..., None].astype(mx.bool_)
+    np.testing.assert_allclose(
+        mx.where(valid, blocked.last_hidden_state, 0),
+        mx.where(valid, dense.last_hidden_state, 0),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        blocked.text_embeds, dense.text_embeds, atol=1e-5, rtol=1e-5
+    )
+
+
+def test_embedding_gemma2_missing_mask_matches_all_valid_mask(embedding_gemma2_case):
+    module, config = embedding_gemma2_case
+    mx.random.seed(42)
+    model = module.Model(config)
+    ids = mx.random.randint(1, 50, (2, 9))
+    unmasked = model(ids)
+    masked = model(ids, attention_mask=mx.ones_like(ids))
+    np.testing.assert_allclose(
+        unmasked.last_hidden_state, masked.last_hidden_state, atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        unmasked.text_embeds, masked.text_embeds, atol=1e-5, rtol=1e-5
+    )
+
+
 def test_embedding_gemma2_explicit_position_ids(embedding_gemma2_case):
     module, config = embedding_gemma2_case
     mx.random.seed(42)
