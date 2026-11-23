@@ -1270,6 +1270,11 @@ mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme
 
 Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
 
+Two opt-in switches speed up attention over a long uniform KV cache:
+
+- `MLX_VLM_QUANT_DECODE_KERNEL=1`: one-token decode over a 6-bit cache with head dimension 256 for queries, keys and values (e.g. Qwen3.5) uses fused Metal kernels that read each packed K/V row once for all query heads that share it, from 1,024 cached tokens on.
+- `MLX_VLM_QUANT_PREFILL_SDPA=1`: multi-token (prefill) attention over a uniform quantized cache dequantizes K/V and calls `mx.fast.scaled_dot_product_attention` instead of materialising heads x chunk x keys scores, so larger `--prefill-step-size` chunks fit in memory. An additive mask whose dtype differs from the queries' uses the existing path.
+
 ##### Per-tensor KV quantization
 
 Keys and values do not have to share a bit-width or a backend. A fractional `--kv-bits` already splits the budget — `3.5` gives 3-bit keys and 4-bit values — and `--kv-key-bits` / `--kv-value-bits` override either side:
