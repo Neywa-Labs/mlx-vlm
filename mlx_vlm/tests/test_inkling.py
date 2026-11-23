@@ -176,6 +176,76 @@ def test_inkling2_attention_head_kernel_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    "device,metal,dim,dtype",
+    [
+        (mx.cpu, True, 128, mx.bfloat16),
+        (mx.gpu, False, 128, mx.bfloat16),
+        (mx.gpu, True, 132, mx.bfloat16),
+        (mx.gpu, True, 512, mx.bfloat16),
+        (mx.gpu, True, 128, mx.float16),
+        (mx.gpu, True, 128, mx.float32),
+    ],
+)
+def test_inkling2_relative_attention_kernel_fallback(
+    monkeypatch, device, metal, dim, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(
+        kernels, "_relative_attention_kernel", _forbid("relative attention")
+    )
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((1, 2, 4, dim), dtype)
+    r = mx.zeros((1, 4, 2, 16), dtype)
+    sinks = mx.zeros((1, 4, 2), dtype)
+    assert (
+        kernels.relative_attention(q, q, q, r, mx.zeros((16, 8)), sinks, 0.1, 0) is None
+    )
+
+
+def test_inkling2_relative_attention_kernel_only_in_inference(monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.language import Attention
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+    # The kernel has no gradient, so training keeps the differentiable masked
+    # path: gradients reach the query projection of a multi-token block (the
+    # relative-bias inputs go through the mask kernel, so only q_proj trains).
+    cfg = Inkling2TextConfig(
+        hidden_size=32,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=1,
+        local_layer_ids=[0],
+        n_layers_per_attn_res_block=1,
+    )
+    attn = Attention(cfg, 1)
+    attn.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, 16, 32), key=mx.random.key(0)).astype(mx.bfloat16)
+    calls = []
+    original = kernels.relative_attention
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "relative_attention", counted)
+    attn.eval()
+    mx.eval(attn(x))
+    assert calls
+    monkeypatch.setattr(
+        kernels, "relative_attention", _forbid("inference-only relative attention")
+    )
+    attn.train()
+    attn.freeze()
+    attn.q_proj.unfreeze()
+    _, grads = nn.value_and_grad(attn, lambda x: attn(x).astype(mx.float32).sum())(x)
+    grad = grads["q_proj"]["weight"].astype(mx.float32)
+    assert mx.all(mx.isfinite(grad)).item() and mx.any(grad != 0).item()
+
+
 def test_inkling2_mini_attention_uses_head_kernel_only_in_inference(monkeypatch):
     from mlx_vlm.models.inkling2 import kernels
     from mlx_vlm.models.inkling2.config import LoopConfig

@@ -470,37 +470,60 @@ class Attention(nn.Module):
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
         size = k.shape[2]
         padding = getattr(kv, "left_padding", None)
-        mask = banded_additive_mask(
-            r,
-            self.rel_proj.astype(x.dtype),
-            size - length,
-            size,
-            self.sliding,
-            self.rel_extent,
-            left_padding=padding,
-            shape_ref=k,
-        )
-        # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
         sinks = self.sink_proj(x)
         if self.sharding_group is not None:
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
-        sinks = sinks.transpose(0, 2, 1)[..., None]
-        mask = mx.concatenate([mask, sinks], axis=-1)
-        if isinstance(kv, AttentionSinkKVCache):
-            k, v = kv.with_sink(size)
-        else:
-            k = mx.concatenate(
-                [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+        out = None
+        if length > 1 and not self.training:
+            from .kernels import relative_attention
+
+            # Prefill chunks and verify blocks: the kernel adds the relative
+            # bias and the sink inside its online softmax, so it needs neither
+            # the heads x queries x keys mask below (4 GB per 2,048-token chunk
+            # at 41K keys) nor a K/V copy with a sink row. A batch row's left
+            # padding is its first valid key. Inference only: the kernel has
+            # no gradient, so training keeps the differentiable masked path.
+            out = relative_attention(
+                q,
+                k,
+                v,
+                r,
+                self.rel_proj,
+                sinks,
+                self.head_dim**-0.5,
+                self.sliding,
+                None if padding is None else mx.maximum(padding, 0),
             )
-            v = mx.concatenate(
-                [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+        if out is None:
+            mask = banded_additive_mask(
+                r,
+                self.rel_proj.astype(x.dtype),
+                size - length,
+                size,
+                self.sliding,
+                self.rel_extent,
+                left_padding=padding,
+                shape_ref=k,
             )
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.head_dim**-0.5, mask=mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
+            # A query-dependent sink is represented by a zero K/V and its own
+            # logit.
+            sinks = sinks.transpose(0, 2, 1)[..., None]
+            mask = mx.concatenate([mask, sinks], axis=-1)
+            if isinstance(kv, AttentionSinkKVCache):
+                k, v = kv.with_sink(size)
+            else:
+                k = mx.concatenate(
+                    [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+                )
+                v = mx.concatenate(
+                    [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+                )
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.head_dim**-0.5, mask=mask
+            ).transpose(0, 2, 1, 3)
+        out = out.reshape(b, length, -1)
         out = (
             out.astype(mx.float32)
             * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
