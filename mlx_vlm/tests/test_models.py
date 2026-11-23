@@ -2756,6 +2756,42 @@ def test_qwen3_vl_sanitize_drops_lm_head_only_when_tied(tied):
     assert model.sanitize(dict(once)).keys() == once.keys()
 
 
+def test_qwen3_vl_patch_embed_is_a_matmul_over_the_patch(monkeypatch):
+    module = importlib.import_module("mlx_vlm.models.qwen3_vl")
+    fields = model_case("TestGetInputEmbeddings.qwen3_vl_input_embeddings")["config"]
+    config = build_config(module, fields).vision_config
+    mx.random.seed(31)
+    embed = module.VisionModel(config).patch_embed
+    embed.proj.bias = mx.random.normal(embed.proj.bias.shape)
+    shape = (config.in_channels, config.temporal_patch_size) + (config.patch_size,) * 2
+    pixels = mx.random.normal((16, math.prod(shape)))
+    conv = embed.proj(pixels.reshape(-1, *shape).moveaxis(1, 4))
+
+    def fail(*args, **kwargs):
+        raise AssertionError("patch embed should not call conv3d")
+
+    monkeypatch.setattr(mx, "conv3d", fail)
+    np.testing.assert_allclose(
+        embed(pixels), conv.reshape(16, -1), rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.skipif("MLX_DISABLE_COMPILE" in os.environ, reason="compile disabled")
+def test_qwen3_vl_rotary_is_compiled(monkeypatch):
+    vision = importlib.import_module("mlx_vlm.models.qwen3_vl.vision")
+    calls = []
+    rotate_half = vision.rotate_half
+    monkeypatch.setattr(
+        vision, "rotate_half", lambda x: calls.append(1) or rotate_half(x)
+    )
+    x = mx.random.normal((1, 7, 2, 8))
+    freqs = mx.random.normal((7, 4))
+    for _ in range(2):
+        mx.eval(vision.apply_rotary_pos_emb_vision(x, freqs))
+    # A compiled function traces once per shape; an eager one runs every call.
+    assert len(calls) <= 1
+
+
 def test_lfm2_encoder_sanitize_and_dispatch():
     case = next(case for case in DATA["cases"] if case["module"] == "lfm2_encoder")
     module = importlib.import_module("mlx_vlm.models.lfm2_encoder")

@@ -27,6 +27,7 @@ def check_array_shape(arr):
         return False
 
 
+@mx.compile
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
     orig_dtype = tensor.dtype
 
@@ -84,17 +85,9 @@ class PatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        hidden_states = hidden_states.reshape(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        ).moveaxis(1, 4)
-
-        hidden_states = self.proj(hidden_states)
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        return hidden_states
+        # stride == kernel, so the Conv3d is a matmul over the flattened patch.
+        weight = self.proj.weight.moveaxis(4, 1).reshape(self.hidden_size, -1)
+        return hidden_states.reshape(-1, weight.shape[1]) @ weight.T + self.proj.bias
 
 
 class PatchMerger(nn.Module):
