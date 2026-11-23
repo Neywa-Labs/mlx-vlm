@@ -3085,6 +3085,32 @@ def test_continuation_checkpoint_keeps_compaction_reserve(path, managers, monkey
     assert manager._memory_headroom() >= live.keys.nbytes + live.values.nbytes
 
 
+@parametrize("evict", [True, False])
+def test_continuation_evicts_superseded_checkpoint_keeps_side_entry(
+    evict, managers, monkeypatch
+):
+    """APC_EVICT_SUPERSEDED=1, two entries: an agent's side request keeps its own
+    checkpoint while the conversation goes on, because the next turn's checkpoint
+    replaces the turn it extends instead of holding both (a whole cache each) and
+    pushing the side request's out. Off (the default) keeps the earlier turn for
+    an edited last message, and the side request's entry goes."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1" if evict else "0")
+    manager = managers(budget=1 << 30)
+    turn = list(range(64))
+    side = list(range(5000, 5032))
+    assert manager.store_exact_cache(turn, [allocated(64)])
+    assert manager.store_exact_cache(side, [allocated(32)])
+    assert manager.lookup_exact_cache(turn + [7])[1] == len(turn)
+    longer = turn + list(range(1000, 1064))
+    assert manager.store_exact_cache(longer, [allocated(128)])
+    resident = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+    kept = side if evict else turn
+    assert resident == sorted([len(kept), len(longer)])
+    assert manager.lookup_exact_cache(kept + [7])[1] == len(kept)
+    assert manager.lookup_exact_cache(longer + [7])[1] == len(longer)
+
+
 def test_accounting_and_eviction(memory_manager, monkeypatch):
     cache = NS(
         state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},

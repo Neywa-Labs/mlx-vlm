@@ -3127,6 +3127,11 @@ class APCManager:
         self.exact_cache_min_tokens = max(
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
+        # Opt-in: a checkpoint that extends resident ones (the same conversation's
+        # earlier turns) evicts them. With several entries the default keeps them
+        # for an edited or regenerated last message; an agent's conversation only
+        # grows, and they cost a whole cache each.
+        self.evict_superseded = os.environ.get("APC_EVICT_SUPERSEDED", "0") == "1"
         self.checkpoint_interval_tokens = max(
             0,
             int(
@@ -3691,6 +3696,18 @@ class APCManager:
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
+                if self.evict_superseded:
+                    # The checkpoints this one extends are the same conversation's
+                    # earlier turns. Kept beside it, a whole cache each, they push
+                    # out what the other entries are for (an agent's side request).
+                    for old in [
+                        k
+                        for k, e in self._exact_cache.items()
+                        if e.extra_hash == int(extra_hash)
+                        and len(e.token_ids) < len(token_tuple)
+                        and token_tuple[: len(e.token_ids)] == e.token_ids
+                    ]:
+                        del self._exact_cache[old]
                 self._exact_cache[key] = APCExactCacheEntry(
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
