@@ -26,7 +26,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from tokenizers import AddedToken, Tokenizer
+from tokenizers import AddedToken, Tokenizer, decoders
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import WordLevel
 from tokenizers.normalizers import NFKC
@@ -186,6 +186,42 @@ def test_spm_byte_tokens(vocab, trim, expected):
     else:
         assert "test" in detokenizer.text
         assert REPLACEMENT_CHAR in detokenizer.text
+
+
+@pytest.mark.parametrize("trim_space", [True, False], ids=["trim-space", "keep-space"])
+def test_spm_leading_space_matches_native_decoder(trim_space):
+    vocab = {piece: i for i, piece in enumerate(["▁", "▁world", "world", "<0x20>"])}
+    backend = Tokenizer(WordLevel(vocab))
+    steps = [decoders.Replace("▁", " "), decoders.ByteFallback(), decoders.Fuse()]
+    if trim_space:
+        steps.append(decoders.Strip(" ", 1, 0))
+    backend.decoder = decoders.Sequence(steps)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, clean_up_tokenization_spaces=False
+    )
+    detokenizer = SPMStreamingDetokenizer(tokenizer, trim_space=trim_space)
+
+    for pieces in (
+        ["▁", "▁world"],
+        ["▁", "▁", "▁world"],
+        ["▁", "▁"],
+        ["▁"],
+        ["▁", "<0x20>", "world"],
+        ["<0x20>", "▁world"],
+        ["world", "▁world"],
+    ):
+        tokens = tokenizer.convert_tokens_to_ids(pieces)
+        expected = tokenizer.decode(tokens)
+        detokenizer.reset()
+        streamer = _ServerTokenStreamer(tokenizer, detokenizer)
+        buffered, streamed = [], []
+        for token in tokens:
+            detokenizer.add_token(token)
+            buffered.append(detokenizer.last_segment)
+            streamed.append(streamer.advance(token, None))
+        detokenizer.finalize()
+        assert "".join(buffered) + detokenizer.last_segment == expected, pieces
+        assert "".join(streamed) + streamer.finalize() == expected, pieces
 
 
 def test_last_segment_basic():
