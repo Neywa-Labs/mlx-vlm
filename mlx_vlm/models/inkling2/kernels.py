@@ -188,6 +188,41 @@ def prepare_attention_heads(q, k, v, r, q_scale, r_scale, clip, rel_clip, eps):
     )
 
 
+# 8-bit global KV (MLX_VLM_INKLING_KV8): each key or value row (one token, one
+# head) is stored as its D values in int8 followed by their FP32 absmax scale as
+# 4 more int8, so a cache row is one ordinary int8 array of D + 4. Cache
+# classes, batch padding, trimming and prefix-cache copies handle it as any
+# other array, at D + 4 bytes a head-token instead of 2 * D. Keys are L2-clipped
+# and values RMS-normalised, so one scale per row suffices. The flash and
+# split-K kernels read the rows directly; the other paths unpack them.
+@mx.compile
+def kv8_pack(x):
+    """(..., D) float -> (..., D + 4) int8: values by the row absmax, then its scale."""
+    xf = x.astype(mx.float32)
+    scale = mx.max(mx.abs(xf), axis=-1, keepdims=True) / 127.0
+    values = mx.round(xf / mx.maximum(scale, 1e-30)).astype(mx.int8)
+    return mx.concatenate([values, scale.view(mx.int8)], axis=-1)
+
+
+def kv8_unpack(packed, dtype=mx.bfloat16):
+    """The inverse of kv8_pack: (..., D + 4) int8 -> (..., D) in dtype."""
+    d = packed.shape[-1] - 4
+    scale = mx.contiguous(packed[..., d:]).view(mx.float32)
+    return (packed[..., :d].astype(mx.float32) * scale).astype(dtype)
+
+
+def _packed_kv(q, k, v):
+    """False for BF16 K/V rows of D, True for kv8_pack rows, None otherwise."""
+    d = q.shape[-1]
+    if q.dtype != mx.bfloat16 or k.dtype != v.dtype or v.shape != k.shape:
+        return None
+    if k.dtype == mx.bfloat16 and k.shape[-1] == d:
+        return False
+    if k.dtype == mx.int8 and k.shape[-1] == d + 4:
+        return True
+    return None
+
+
 # The relative-attention kernel below is by Jun Kim (@jundot), from
 # ml-explore/mlx-lm pull request #2086 (mlx_lm/models/inkling2/kernels.py,
 # whose file header reads Copyright 2026 Apple Inc., MIT License):
@@ -250,8 +285,10 @@ _RELATIVE_ATTENTION_SOURCE = r"""
     const int last_diag = S - L + min(q0 + BQ, L) - 1;
     int first_key = WINDOW > 0 ? max(0, first_diag - WINDOW + 1) : 0;
     first_key = max(first_key, start);
-    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
-    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
+    // PACKED: each key/value row is D int8 values, then their FP32 scale
+    // (4 bytes, aligned as rows are D + 4 bytes and D is a multiple of 8).
+    auto k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
+    auto v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
 
     for (int k0 = first_key / BK * BK; k0 <= last_diag; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -259,19 +296,39 @@ _RELATIVE_ATTENTION_SOURCE = r"""
             const int r = c / (D / 8);
             const int col = (c % (D / 8)) * 8;
             const int key = k0 + r;
-            vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
-            vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            float kf[8], vf[8];
+            for (int j = 0; j < 8; ++j) {
+                kf[j] = 0.0f;
+                vf[j] = 0.0f;
+            }
             if (key < S) {
-                auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
-                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
-                kv[0] = kp[0];
-                kv[1] = kp[1];
-                vv[0] = vp[0];
-                vv[1] = vp[1];
+                auto krow = k_head + key * k_strides[2];
+                auto vrow = v_head + key * v_strides[2];
+                if (PACKED) {
+                    const float ks = *((const device float*)(krow + D));
+                    const float vs = *((const device float*)(vrow + D));
+                    const char4 ka = *((const device char4*)(krow + col));
+                    const char4 kb = *((const device char4*)(krow + col + 4));
+                    const char4 va = *((const device char4*)(vrow + col));
+                    const char4 vb = *((const device char4*)(vrow + col + 4));
+                    for (int j = 0; j < 4; ++j) {
+                        kf[j] = float(ka[j]) * ks;
+                        kf[j + 4] = float(kb[j]) * ks;
+                        vf[j] = float(va[j]) * vs;
+                        vf[j + 4] = float(vb[j]) * vs;
+                    }
+                } else {
+                    auto kp = (const device vec<T, 4>*)(krow + col);
+                    auto vp = (const device vec<T, 4>*)(vrow + col);
+                    for (int j = 0; j < 8; ++j) {
+                        kf[j] = float(kp[j / 4][j % 4]);
+                        vf[j] = float(vp[j / 4][j % 4]);
+                    }
+                }
             }
             for (int j = 0; j < 8; ++j) {
-                Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
-                Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+                Ks[(col + j) * LDK + r] = half(kf[j]);
+                Vs[r * LDV + col + j] = half(vf[j]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -360,24 +417,18 @@ def _relative_attention_kernel():
 def relative_attention(q, k, v, r, rel_proj, sinks, scale, window, key_start=None):
     """Causal attention with the relative bias and sink logit, or None for the MLX path.
 
-    q: (B, Hq, L, D) at the last L of the keys; k, v: (B, Hkv, S, D) without a
-    sink row; r: (B, L, Hq, d_rel); rel_proj: (d_rel, R), the bias at distances
-    below R; sinks: (B, L, Hq); key_start: (B,), each row's first valid key.
-    Returns (B, L, Hq, D).
+    q: (B, Hq, L, D) BF16 at the last L of the keys; k, v: (B, Hkv, S, D) BF16
+    without a sink row, or int8 rows of D + 4 from kv8_pack; r: (B, L, Hq,
+    d_rel); rel_proj: (d_rel, R), the bias at distances below R; sinks: (B, L,
+    Hq); key_start: (B,), each row's first valid key. Returns (B, L, Hq, D).
     """
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return None
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
+    packed = _packed_kv(q, k, v)
     # Threadgroup memory holds a K and a V tile in half precision.
-    if (
-        any(a.dtype != mx.bfloat16 for a in (q, k, v))
-        or D % 8
-        or D > 256
-        or Hq % Hkv
-        or v.shape != k.shape
-        or k.shape[0] != B
-    ):
+    if packed is None or D % 8 or D > 256 or Hq % Hkv or k.shape[0] != B:
         return None
     if key_start is None:
         key_start = mx.zeros((B,), mx.int32)
@@ -401,6 +452,7 @@ def relative_attention(q, k, v, r, rel_proj, sinks, scale, window, key_start=Non
             ("WINDOW", window),
             ("BQ", _BQ),
             ("TG", _TG),
+            ("PACKED", packed),
         ],
         grid=((L + _BQ - 1) // _BQ * _TG, Hq, B),
         threadgroup=(_TG, 1, 1),
@@ -449,15 +501,18 @@ def _decode_partials():
             l[h] = 0.0f;
             for (int e = 0; e < E; ++e) acc[h][e] = 0.0f;
         }
-        const device T* k_head = k + g * k_strides[1];
-        const device T* v_head = v + g * v_strides[1];
+        // PACKED: each key/value row is D int8 values, then their FP32 scale.
+        auto k_head = k + g * k_strides[1];
+        auto v_head = v + g * v_strides[1];
         for (int j = first + int(sg); j < end; j += SG) {
-            const device T* kp = k_head + size_t(j) * k_strides[2] + lane * E;
-            const device T* vp = v_head + size_t(j) * v_strides[2] + lane * E;
+            auto krow = k_head + size_t(j) * k_strides[2];
+            auto vrow = v_head + size_t(j) * v_strides[2];
+            const float ks = PACKED ? *((const device float*)(krow + D)) : 1.0f;
+            const float vs = PACKED ? *((const device float*)(vrow + D)) : 1.0f;
             float kv[E], vv[E];
             for (int e = 0; e < E; ++e) {
-                kv[e] = float(kp[e]);
-                vv[e] = float(vp[e]);
+                kv[e] = float(krow[lane * E + e]) * ks;
+                vv[e] = float(vrow[lane * E + e]) * vs;
             }
             // The relative bias covers the newest REL keys only.
             const int dist = S - 1 - j;
@@ -535,22 +590,22 @@ def _decode_combine():
 def decode_attention(q, k, v, rel, sinks, scale, key_start=None):
     """One query of one sequence over a chronological cache, or None for SDPA.
 
-    q: (1, HQ, 1, D); k, v: (1, HKV, S, D) with the query at the last key;
-    rel: (HQ, R), the bias at backward distances below R; sinks: (HQ,);
-    key_start: optional (1,) int array, the first valid key (left padding).
-    Returns (1, HQ, 1, D) in q's dtype.
+    q: (1, HQ, 1, D) BF16; k, v: (1, HKV, S, D) BF16 with the query at the last
+    key, or int8 rows of D + 4 from kv8_pack; rel: (HQ, R), the bias at backward
+    distances below R; sinks: (HQ,); key_start: optional (1,) int array, the
+    first valid key (left padding). Returns (1, HQ, 1, D) in q's dtype.
     """
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         return None
     _, hq, _, d = q.shape
     hkv, s = k.shape[1], k.shape[2]
+    packed = _packed_kv(q, k, v)
     if (
-        q.shape != (1, hq, 1, d)
-        or k.shape != (1, hkv, s, d)
-        or v.shape != k.shape
+        packed is None
+        or q.shape != (1, hq, 1, d)
+        or k.shape[:3] != (1, hkv, s)
         or rel.shape[0] != hq
         or sinks.shape != (hq,)
-        or any(a.dtype != mx.bfloat16 for a in (q, k, v))
         or d % 32
         or hq % hkv
         # Per-simdgroup partials for every query head of a KV head must fit
@@ -577,6 +632,7 @@ def decode_attention(q, k, v, rel, sinks, scale, key_start=None):
             ("REL", rel.shape[-1]),
             ("BS", _DECODE_BLOCK),
             ("SG", _DECODE_SIMDGROUPS),
+            ("PACKED", packed),
         ],
         grid=(nblocks * 32 * _DECODE_SIMDGROUPS, hkv, 1),
         threadgroup=(32 * _DECODE_SIMDGROUPS, 1, 1),

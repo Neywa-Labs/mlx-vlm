@@ -8198,6 +8198,115 @@ def test_inkling2_split_k_decode_matches_masked_attention(monkeypatch, padding):
     np.testing.assert_allclose(np.array(actual), np.array(expected), atol=3e-2, rtol=0)
 
 
+@pytest.mark.parametrize("path", ["kernels", "masked"])
+@pytest.mark.parametrize("padding", [None, 3])
+def test_inkling2_kv8_global_cache(monkeypatch, padding, path):
+    from mlx_vlm.models.inkling2 import kernels, language
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+    # MLX_VLM_INKLING_KV8=1, read when the attention layers are built, caches
+    # the global layers' keys and values as int8 rows with one FP32 scale each;
+    # sliding layers stay BF16. Prefill and decode on the model's own caches
+    # and on a one-row batch cache with left padding stay near the BF16 cache,
+    # both through the kernels (which read the packed rows) and the masked
+    # path (which unpacks them, AttentionSinkKVCache's sink row included).
+    calls = []
+    for name in ("relative_attention", "decode_attention"):
+        original = getattr(kernels, name)
+
+        def counted(q, k, *args, _original=original, _name=name, **kwargs):
+            out = None if path == "masked" else _original(q, k, *args, **kwargs)
+            calls.append((_name, k.dtype, out is not None))
+            return out
+
+        monkeypatch.setattr(kernels, name, counted)
+    # The split-K kernel from 64 keys, so the decode steps below use it.
+    monkeypatch.setattr(language, "_DECODE_KERNEL_MIN_KEYS", 64)
+    ids = (mx.arange(120) * 7 % 61 + 1)[None]
+
+    def run(kv8):
+        monkeypatch.setenv("MLX_VLM_INKLING_KV8", "1" if kv8 else "0")
+        # The split-K kernel needs a head_dim multiple of 32.
+        model = make_inkling2_model("mini", head_dim=32)
+        for layer in model.layers:
+            layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+        model.update(tree_map(lambda a: a.astype(mx.bfloat16), model.parameters()))
+        lm = model.language_model
+        prompt = ids[:, :100]
+        if padding is None:
+            cache = lm.make_cache()
+        else:
+            cache = _make_cache(lm, [padding])
+            prompt = mx.concatenate([mx.zeros((1, padding), mx.int32), prompt], 1)
+        steps = [lm(prompt, cache=cache).logits[:, -1:]]
+        steps += [lm(ids[:, i : i + 1], cache=cache).logits for i in range(100, 120)]
+        dtypes = {
+            (lm.model.layers[i].self_attn.is_sliding, c[0].keys.dtype)
+            for i, c in zip(lm.model.layer_indices, cache)
+        }
+        return np.array(mx.concatenate(steps, axis=1).astype(mx.float32)), dtypes
+
+    expected, dtypes = run(False)
+    assert dtypes == {(True, mx.bfloat16), (False, mx.bfloat16)}
+    calls.clear()
+    actual, dtypes = run(True)
+    assert dtypes == {(True, mx.bfloat16), (False, mx.int8)}
+    # Global layers: one prefill chunk and 20 decode steps, four visits each.
+    packed = [(name, used) for name, dtype, used in calls if dtype == mx.int8]
+    assert (
+        packed
+        == [("relative_attention", path == "kernels")] * 4
+        + [("decode_attention", path == "kernels")] * 80
+    )
+    # Up to ~0.05 here: int8 rows lose ~0.4% of their largest value.
+    np.testing.assert_allclose(actual, expected, atol=6e-2, rtol=0)
+
+
+def test_inkling2_kv8_checkpoints_never_restore_across_layouts(monkeypatch, tmp_path):
+    from mlx_vlm import apc
+    from mlx_vlm.models.cache import KVCache
+
+    # A disk-tier checkpoint outlives the process. After a restart with
+    # MLX_VLM_INKLING_KV8 toggled, a checkpoint of the other K/V layout (BF16
+    # rows of head_dim, int8 rows of head_dim + 4) must not be restored.
+    monkeypatch.setattr(apc, "_free_ram_bytes", lambda: 1 << 40)
+    monkeypatch.setenv("APC_DISK_MIN_FREE_RAM_GB", "0")
+    hashes = {}
+    for kv8 in (False, True):
+        monkeypatch.setenv("MLX_VLM_INKLING_KV8", "1" if kv8 else "0")
+        model = make_inkling2_model("mini", head_dim=32)
+        hashes[kv8] = apc.semantic_extra_hash(model=model.language_model)
+        assert apc.semantic_extra_hash(model=model) == hashes[kv8]
+    # A BF16 cache keeps the keys it had before this option existed.
+    assert hashes[False] == apc.semantic_extra_hash()
+
+    def manager(namespace):
+        disk = apc.DiskBlockStore(tmp_path, namespace=namespace)
+        result = apc.APCManager(num_blocks=8, block_size=16, disk=disk)
+        result.memory_max_bytes, result.memory_reserve_bytes = 1 << 30, 0
+        monkeypatch.setattr(result, "_memory_headroom", lambda: 1 << 40)
+        return result
+
+    tokens = list(range(1, 41))
+    for stored, other in ((False, True), (True, False)):
+        cache = KVCache()
+        cache.update_and_fetch(*[mx.ones((1, 1, len(tokens), 4))] * 2)
+        writer = manager(f"layout-{stored}")
+        assert writer.store_exact_cache(tokens, [cache], extra_hash=hashes[stored])
+        writer.disk.flush()
+        writer.close()
+        reader = manager(f"layout-{stored}")
+        assert (
+            reader.lookup_exact_cache(tokens + [99], extra_hash=hashes[other])[1] == 0
+        )
+        warm, count = reader.lookup_exact_cache(
+            tokens + [99], extra_hash=hashes[stored]
+        )
+        assert warm is not None and count == len(tokens)
+        reader.close()
+
+
 @pytest.mark.parametrize("inkling2_model", ["mini"], indirect=True)
 def test_inkling2_loop_restarts_and_captures(inkling2_model):
     lm = inkling2_model.language_model

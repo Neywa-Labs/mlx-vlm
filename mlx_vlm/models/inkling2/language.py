@@ -15,6 +15,7 @@
 
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -285,6 +286,10 @@ class Attention(nn.Module):
         self.sliding = config.sliding_window_size if self.is_sliding else 0
         self.rel_extent = self.sliding or config.rel_extent
         self.sharding_group = None
+        # MLX_VLM_INKLING_KV8=1: global layers cache keys and values as int8 rows
+        # with one FP32 scale each (kernels.kv8_pack), about half the bytes of
+        # BF16. Sliding layers keep their small windows in BF16.
+        self.kv8 = not self.is_sliding and os.environ.get("MLX_VLM_INKLING_KV8") == "1"
         self.head_start = 0
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -468,6 +473,10 @@ class Attention(nn.Module):
             r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         if kv is not None:
+            if self.kv8:
+                from .kernels import kv8_pack
+
+                k, v = kv8_pack(k), kv8_pack(v)
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
             # read in chronological order (ordinary RoPE attention does not care).
@@ -542,12 +551,19 @@ class Attention(nn.Module):
             if isinstance(kv, AttentionSinkKVCache):
                 k, v = kv.with_sink(size)
             else:
+                # kv8 rows are head_dim + 4 wide; their zero row unpacks to zero.
                 k = mx.concatenate(
-                    [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+                    [k, mx.zeros((b, self.n_kv, 1, k.shape[-1]), k.dtype)], axis=2
                 )
                 v = mx.concatenate(
-                    [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+                    [v, mx.zeros((b, self.n_kv, 1, v.shape[-1]), v.dtype)], axis=2
                 )
+            if k.dtype == mx.int8:
+                # MLX_VLM_INKLING_KV8 rows, including AttentionSinkKVCache's
+                # zero sink row (zero values and scale).
+                from .kernels import kv8_unpack
+
+                k, v = kv8_unpack(k, q.dtype), kv8_unpack(v, q.dtype)
             out = mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.head_dim**-0.5, mask=mask
             ).transpose(0, 2, 1, 3)
@@ -845,6 +861,16 @@ class LanguageModel(InklingLanguageModel):
         # Captures are per-token partial blocks; the shared prefill collector
         # retains them across chunks. Preserve the caller's target chunk size.
         return True
+
+    def apc_key_dependencies(self):
+        # Prefix-cache checkpoints hold the global layers' K/V in the layout they
+        # were built in, so a checkpoint of an int8 cache (MLX_VLM_INKLING_KV8)
+        # must never restore into a BF16 cache or the other way round, including
+        # from the disk tier after a restart. A BF16 cache adds nothing, so its
+        # keys are unchanged.
+        if any(layer.self_attn.kv8 for layer in self.model.layers):
+            return ("inkling2-kv8-v1",)
+        return ()
 
     def __call__(
         self,

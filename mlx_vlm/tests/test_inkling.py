@@ -450,3 +450,62 @@ def test_inkling2_split_k_decode_attention_fallback(
     assert (
         kernels.decode_attention(q, k, k, rel, mx.zeros((heads,), dtype), 1.0) is None
     )
+
+
+@pytest.mark.parametrize("start", [0, 700])
+def test_inkling2_kernels_read_kv8_packed_rows(start):
+    from mlx_vlm.models.inkling2.kernels import (
+        decode_attention,
+        kv8_pack,
+        kv8_unpack,
+        relative_attention,
+    )
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+
+    # MLX_VLM_INKLING_KV8 caches the global layers' rows as int8 plus one FP32
+    # scale each. The split-K decode kernel and the flash kernel read those
+    # rows directly: they must match the same rows dequantized and stay close
+    # to the unquantized cache, with a batch row's left padding. K/V are views
+    # of a larger cache buffer, as returned by the KV caches.
+    mx.random.seed(5)
+    keys, hq, hkv, d, d_rel, extent = 5000, 24, 8, 128, 16, 64
+    k = (mx.random.normal((2, hkv, keys + 256, d)) * 0.5).astype(mx.bfloat16)
+    v = mx.random.normal((2, hkv, keys + 256, d)).astype(mx.bfloat16)
+    kp, vp = kv8_pack(k)[:, :, :keys], kv8_pack(v)[:, :, :keys]
+    assert kp.dtype == mx.int8 and kp.shape == (2, hkv, keys, d + 4)
+    kd, vd = kv8_unpack(kp), kv8_unpack(vp)
+    k, v = k[:, :, :keys], v[:, :, :keys]
+
+    def as_np(a):
+        return np.array(a.astype(mx.float32))
+
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    rel = mx.random.normal((hq, extent)).astype(mx.bfloat16)
+    sinks = mx.random.normal((hq,)).astype(mx.bfloat16)
+    packed, dense, full = (
+        decode_attention(
+            q, a[:1], b[:1], rel, sinks, d**-0.5, key_start=mx.array([start])
+        )
+        for a, b in ((kp, vp), (kd, vd), (k, v))
+    )
+    assert packed is not None and packed.dtype == mx.bfloat16
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=2e-2)
+
+    n = 64
+    q = mx.random.normal((2, hq, n, d)).astype(mx.bfloat16)
+    r = mx.random.normal((2, n, hq, d_rel)).astype(mx.bfloat16)
+    rel_proj = mx.random.normal((d_rel, extent))
+    sinks = mx.random.normal((2, n, hq))
+    key_start = mx.array([0, start])
+    packed, dense, full = (
+        relative_attention(q, a, b, r, rel_proj, sinks, d**-0.5, 0, key_start)
+        for a, b in ((kp, vp), (kd, vd), (k, v))
+    )
+    assert packed is not None and packed.dtype == mx.bfloat16
+    # The kernel rounds dequantized rows to half, the dense path to BF16 first:
+    # outputs near 2.5 can differ by one BF16 step.
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=3e-2, rtol=1e-2)
