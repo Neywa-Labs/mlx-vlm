@@ -3068,6 +3068,51 @@ def test_long_prefix_pressure(memory_manager, monkeypatch):
     assert manager.stats_snapshot()["disk_hits"] == 1
 
 
+def test_server_prefill_reserve_keeps_the_checkpoint_a_follow_up_restores(
+    managers, monkeypatch
+):
+    """Before embedding a request the server reserves its prefill. A follow-up on a
+    long conversation must reserve only the suffix past the checkpoint it is about
+    to restore: a cold reserve for the whole prompt evicted that checkpoint first,
+    and the follow-up re-read the conversation."""
+    from mlx_vlm.server.generation import ResponseGenerator
+
+    manager = managers(budget=1 << 30)
+    tokens, suffix = list(range(64)), list(range(100, 116))
+    source = allocated(64)
+    coordinator = coordinate(manager, [source])
+    assert manager.store_exact_cache(tokens, [source], extra_hash=5)
+    # Room for the suffix's growth beside the checkpoint, not for the whole prompt twice.
+    size = P._cache_nbytes([source])
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: size)
+
+    class Embedded(Exception):
+        pass
+
+    def embed(*args, **kwargs):
+        raise Embedded
+
+    server = NS(
+        _log_prefill_started=lambda *a, **k: None,
+        _effective_prefill_step_size=lambda: 16,
+        _gpu_embed=embed,
+    )
+    request = NS(
+        rqueue=None,
+        raw_inputs={"input_ids": mx.array([tokens + suffix])},
+        prompt_tokens=len(tokens) + len(suffix),
+        args=NS(),
+        images=None,
+        apc_semantic_hash=5,
+    )
+    with pytest.raises(Embedded):
+        ResponseGenerator._start_batch_request(
+            server, request, NS(apc=coordinator), [], None
+        )
+    # Still resident for the generator's lookup.
+    assert manager.exact_prefix_hint(tokens + suffix, extra_hash=5) == len(tokens)
+
+
 def test_disk_backpressure(tmp_path, monkeypatch):
     disk = P.DiskBlockStore(tmp_path)
     disk.queue_max_bytes = 512

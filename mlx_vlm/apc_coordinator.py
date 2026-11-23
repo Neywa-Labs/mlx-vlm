@@ -53,8 +53,17 @@ class PrefillMemoryPlan:
             n - p for n, p in zip(self.lengths, self.prefix_lengths)
         )
         row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
+        # A restored prefix is allocated by its restore (``restore_bytes``, at the
+        # prompt's capacity), not grown by prefill, so only the suffix needs the
+        # growth reserve. Otherwise a short follow-up on a long conversation
+        # reserves twice the whole cache again on top of the restored copy.
+        restored = min(self.prefix_lengths)
+        if restored:
+            row_bytes -= sum(
+                c.footprint(restored, self.chunk_size) for c in self.components
+            )
         return self.extra_reserve_bytes + max(
-            0, 2 * len(self.lengths) * row_bytes - live_bytes
+            0, 2 * len(self.lengths) * max(0, row_bytes) - live_bytes
         )
 
     def observe(self, components, *, live_bytes: int) -> int:
@@ -139,6 +148,18 @@ class APCCoordinator:
             )
             return self.manager.prepare_prefill(reserve)
         return True
+
+    def prefix_hint(
+        self, token_ids, *, extra_hash: int = 0, min_prefix_tokens: int = 0
+    ) -> int:
+        """Resident checkpoint length a lookup of ``token_ids`` would restore,
+        found without copying it."""
+        hint = getattr(self.manager, "exact_prefix_hint", None)
+        if not self.enabled or hint is None:
+            return 0
+        return hint(
+            token_ids, extra_hash=extra_hash, min_prefix_tokens=min_prefix_tokens
+        )
 
     def finish_prefill(self) -> None:
         """Release the transient plan after admission is deferred or completed."""

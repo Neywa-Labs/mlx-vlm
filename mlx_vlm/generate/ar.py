@@ -2960,6 +2960,20 @@ class BatchGenerator:
             **lookup_kwargs,
         )
 
+    def _apc_prefix_hint(self, sequence) -> int:
+        """Length of the resident checkpoint this prompt would restore, so the
+        admission reserve before the lookup does not also budget a cold prefill
+        of the prefix the restore is about to provide."""
+        hint = getattr(getattr(self, "apc", None), "prefix_hint", None)
+        _, ids_list, _, prompt_kwargs, _, _ = sequence
+        if hint is None or not ids_list or len(ids_list) < 2:
+            return 0
+        return hint(
+            ids_list,
+            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            min_prefix_tokens=self._apc_safe_prefix_lookup_min(ids_list),
+        )
+
     def _release_prefill_pick(self, pick):
         if pick is not None:
             self.apc_manager.release(pick.get("matched_blocks", []))
@@ -2993,6 +3007,7 @@ class BatchGenerator:
                 coordinator.prepare_prefill(
                     len(sequence[1]),
                     prefill_step_size=self._prefill_chunk_size(1),
+                    prefix_lengths=[self._apc_prefix_hint(sequence)],
                     extra_reserve_bytes=merge_reserve,
                 )
                 try:

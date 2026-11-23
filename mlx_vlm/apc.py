@@ -3315,10 +3315,18 @@ class APCManager:
             evicted = 0
             while resident > target:
                 if self._exact_cache:
-                    resident -= _cache_nbytes(
-                        self._exact_cache[next(iter(self._exact_cache))].prompt_cache
-                    )
+                    entry = self._exact_cache[next(iter(self._exact_cache))]
+                    resident -= _cache_nbytes(entry.prompt_cache)
                     self._exact_cache.popitem(last=False)
+                    apc_trace(
+                        "evict",
+                        mode="exact",
+                        token_len=len(entry.token_ids),
+                        required_mb=required >> 20,
+                        prefill_reserve_mb=self._prefill_reserve_bytes >> 20,
+                        allocation_mb=allocation_bytes >> 20,
+                        target_mb=target >> 20,
+                    )
                 else:
                     block = self._free_head
                     while block is not None and block.block_hash is None:
@@ -3370,6 +3378,36 @@ class APCManager:
                 if shared < end:
                     boundary = max(boundary, shared)
         return boundary
+
+    def exact_prefix_hint(
+        self,
+        token_ids: Sequence[int],
+        *,
+        extra_hash: int = 0,
+        min_prefix_tokens: int = 0,
+    ) -> int:
+        """Longest resident exact-checkpoint prefix of ``token_ids``, without
+        restoring it: sizes the prefill reserve before the lookup copies it."""
+        if self._exact_cache_max <= 0:
+            return 0
+        tokens = tuple(int(t) for t in token_ids)
+        best = 0
+        with self.lock:
+            for entry in self._exact_cache.values():
+                if entry.extra_hash != extra_hash:
+                    continue
+                length = _checkpoint_match_len(
+                    tokens,
+                    entry.token_ids,
+                    len(tokens) - 1,
+                    self.block_size,
+                    _dense_checkpoint_trimmable(
+                        entry.prompt_cache, len(entry.token_ids)
+                    ),
+                )
+                if length > max(best, min_prefix_tokens):
+                    best = length
+        return best
 
     def lookup_exact_cache(
         self,
@@ -3549,6 +3587,18 @@ class APCManager:
             source_cache, prefix_len, prompt_capacity_tokens
         )
         if not self._make_room(restore_bytes):
+            apc_trace(
+                "restore",
+                mode="exact",
+                ok=False,
+                reason="memory",
+                token_len=prefix_len,
+                restore_mb=restore_bytes >> 20,
+                headroom_mb=self._memory_headroom() >> 20,
+                reserve_mb=self.memory_reserve_bytes >> 20,
+                prefill_reserve_mb=self._prefill_reserve_bytes >> 20,
+                resident_mb=self.resident_bytes() >> 20,
+            )
             with self.lock:
                 self.stats.memory_skips += 1
             if defer_on_pressure:
