@@ -54,7 +54,12 @@ from mlx_vlm.token_classification import (
     load_token_classification_model,
     load_token_classifier,
 )
-from mlx_vlm.utils import get_model_and_args, load_config, update_module_configs
+from mlx_vlm.utils import (
+    get_model_and_args,
+    get_model_type,
+    load_config,
+    update_module_configs,
+)
 
 EXTRACTION_DATA = json.loads(
     Path(__file__).with_name("extraction_cases.json").read_text()
@@ -317,12 +322,19 @@ def test_quantized_encoder_still_runs():
     assert bool(mx.all(mx.isfinite(encoded.astype(mx.float32))))
 
 
-def _write_checkpoint(root, *, sidecar=True, inline=False):
+def _write_checkpoint(
+    root,
+    *,
+    sidecar=True,
+    inline=False,
+    model_type="extractor",
+    architectures=("BoundaryExtractor",),
+):
     encoder = {"vocab_size": 128, "hidden_size": 64, "num_attention_heads": 4}
     config = {
-        "model_type": "extractor",
+        "model_type": model_type,
         "architecture": "boundary",
-        "architectures": ["BoundaryExtractor"],
+        "architectures": list(architectures),
     }
     if inline:
         config["encoder_config"] = encoder
@@ -347,16 +359,45 @@ def test_gliner_encoder_config_loading(tmp_path, sidecar, inline):
             load_config(root)
 
 
-def test_boundary_architecture_selects_the_gliner_module():
-    _, model_type = get_model_and_args(
+@pytest.mark.parametrize(
+    "sidecar,inline",
+    [(True, False), (False, True)],
+    ids=["sidecar", "inline"],
+)
+def test_schema_extraction_checkpoint_loads_encoder_config(tmp_path, sidecar, inline):
+    # Current checkpoints declare Gliner2ForSchemaExtraction with
+    # model_type "gliner2" instead of naming BoundaryExtractor.
+    root = _write_checkpoint(
+        tmp_path,
+        sidecar=sidecar,
+        inline=inline,
+        model_type="gliner2",
+        architectures=("Gliner2ForSchemaExtraction",),
+    )
+    assert load_config(root)["encoder_config"]["hidden_size"] == 64
+
+
+@pytest.mark.parametrize(
+    "model_type,architectures,architecture,expected",
+    [
+        ("extractor", ["BoundaryExtractor"], "boundary", "gliner2_5"),
+        ("gliner2", ["Gliner2ForSchemaExtraction"], "boundary", "gliner2_5"),
+        ("gliner2", ["Gliner2ForSchemaExtraction"], "span", "gliner2"),
+    ],
+    ids=["boundary_extractor", "schema_extraction", "non_boundary_variant"],
+)
+def test_boundary_architecture_selects_the_gliner_module(
+    model_type, architectures, architecture, expected
+):
+    resolved = get_model_type(
         {
-            "model_type": "extractor",
-            "architecture": "boundary",
-            "architectures": ["BoundaryExtractor"],
+            "model_type": model_type,
+            "architecture": architecture,
+            "architectures": architectures,
         }
     )
 
-    assert model_type == "gliner2_5"
+    assert resolved == expected
 
 
 def _privacy_config(**overrides):

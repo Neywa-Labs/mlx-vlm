@@ -208,6 +208,22 @@ def _language_model_quantization_config(model):
     return getattr(module, "make_quantization_config", None)
 
 
+def _is_gliner2_5_boundary_config(config: dict) -> bool:
+    """Whether a checkpoint selects the GLiNER2.5 boundary-extraction model.
+
+    Original checkpoints name ``BoundaryExtractor`` in ``architectures``;
+    current checkpoints declare ``Gliner2ForSchemaExtraction`` and mark the
+    variant with ``architecture: "boundary"`` (the same class name backs the
+    span/decision variants, so the variant field is what selects it)."""
+    architectures = config.get("architectures") or ()
+    if "BoundaryExtractor" in architectures:
+        return True
+    return (
+        "Gliner2ForSchemaExtraction" in architectures
+        and config.get("architecture") == "boundary"
+    )
+
+
 def get_model_type(config: dict) -> Optional[str]:
     """Normalize the architecture declared by a checkpoint without importing it."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
@@ -230,7 +246,7 @@ def get_model_type(config: dict) -> Optional[str]:
         model_type = "lfm2_encoder"
     elif "RadioMBartPrefixForCausalLM" in architectures:
         model_type = "nemotron_parse_v3_5"
-    elif "BoundaryExtractor" in architectures:
+    elif _is_gliner2_5_boundary_config(config):
         model_type = "gliner2_5"
     elif model_type == "qwen3_5" and (
         "Qwen3_5ForSequenceClassification" in architectures
@@ -1075,7 +1091,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     # GLiNER2.5 ships its encoder config in a sidecar directory instead of
     # inline, so fold it in alongside the other config files. Raised outside the
     # block above so the missing file is not reported as a missing config.json.
-    if "BoundaryExtractor" in (config.get("architectures") or ()):
+    if _is_gliner2_5_boundary_config(config):
         if "encoder_config" not in config:
             encoder_config_path = model_path / "encoder_config" / "config.json"
             if not encoder_config_path.is_file():
