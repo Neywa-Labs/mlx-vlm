@@ -8028,6 +8028,128 @@ def test_inkling2_cached_chunks_and_speculative_rollback(
     )
 
 
+def _count_relative_attention(monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+
+    calls = []
+    original = kernels.relative_attention
+
+    def counted(*args, **kwargs):
+        out = original(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(kernels, "relative_attention", counted)
+    return calls
+
+
+def _disable_relative_attention(monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(kernels, "relative_attention", lambda *args, **kwargs: None)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("layer_index", [0, 1], ids=["sliding", "global"])
+@pytest.mark.parametrize("kind", ["plain", "sink", "batch"])
+def test_inkling2_relative_attention_kernel_matches_masked_path(
+    monkeypatch, layer_index, kind
+):
+    # BF16 prefill chunks and verify blocks run the relative-attention kernel;
+    # the masked SDPA path is the reference. Two chunks cover a chunk after a
+    # cached prefix past the 24-key window and the global 40-key relative
+    # extent, more than one 32-query tile, and two batch rows with different
+    # left padding. The final decode step keeps the masked path.
+    from mlx_vlm.models import cache as C
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    mx.random.seed(31)
+    cfg = TextConfig(
+        hidden_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        sliding_window_size=24,
+        local_layer_ids=[0],
+        rel_extent=40,
+        log_scaling_n_floor=32,
+    )
+    attention = Attention(cfg, layer_index)
+    attention.rel_proj = mx.random.normal(attention.rel_proj.shape)
+    attention.set_dtype(mx.bfloat16)
+    attention.eval()
+    window = cfg.sliding_window_size if attention.is_sliding else None
+    padding = [0, 5] if kind == "batch" else None
+
+    def make_cache():
+        if kind == "sink":
+            return C.AttentionSinkKVCache(window)
+        if kind == "batch":
+            if window:
+                return C.BatchRotatingKVCache(window, padding)
+            return C.BatchKVCache(padding)
+        return C.RotatingKVCache(max_size=window, keep=0) if window else C.KVCache()
+
+    x = mx.random.normal((1 if padding is None else 2, 67, 256)).astype(mx.bfloat16)
+
+    def run():
+        cache = (make_cache(), C.ArraysCache(4))
+        chunks = [(0, 37), (37, 66), (66, 67)]
+        return mx.concatenate([attention(x[:, s:e], cache=cache) for s, e in chunks], 1)
+
+    calls = _count_relative_attention(monkeypatch)
+    actual = run()
+    assert calls == [True, True]
+    _disable_relative_attention(monkeypatch)
+    expected = run()
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("padding", [0, 3])
+@pytest.mark.parametrize("inkling2_model", ["small", "mini"], indirect=True)
+def test_inkling2_bf16_prefill_kernel_on_batch_caches(
+    monkeypatch, inkling2_model, padding
+):
+    # A server prefills a turn on batch caches, in chunks on top of what is
+    # already cached. Kernel chunks on a left-padded batch row must match the
+    # same chunks on the model's own caches through the masked path.
+    lm = inkling2_model.language_model
+    for layer in lm.model.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    lm.set_dtype(mx.bfloat16)
+    ids = (mx.arange(45)[None] * 7) % 59 + 1
+    _disable_relative_attention(monkeypatch)
+    plain = lm.make_cache()
+    expected = [
+        lm(ids[:, :26], cache=plain).logits,
+        lm(ids[:, 26:], cache=plain).logits,
+    ]
+    monkeypatch.undo()
+    calls = _count_relative_attention(monkeypatch)
+    cache = _make_cache(lm, [padding])
+    prompt = mx.concatenate([mx.zeros((1, padding), mx.int32), ids[:, :26]], axis=1)
+    actual = [
+        lm(prompt, cache=cache).logits[:, padding:],
+        lm(ids[:, 26:], cache=cache).logits,
+    ]
+    assert calls and all(calls)
+    for a, e in zip(actual, expected):
+        np.testing.assert_allclose(
+            np.array(a.astype(mx.float32)),
+            np.array(e.astype(mx.float32)),
+            atol=8e-2,
+            rtol=8e-2,
+        )
+
+
 @pytest.mark.parametrize("inkling2_model", ["mini"], indirect=True)
 def test_inkling2_loop_restarts_and_captures(inkling2_model):
     lm = inkling2_model.language_model

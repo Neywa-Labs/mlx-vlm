@@ -176,6 +176,35 @@ def test_inkling2_attention_head_kernel_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    "device,metal,dim,dtype",
+    [
+        (mx.cpu, True, 128, mx.bfloat16),
+        (mx.gpu, False, 128, mx.bfloat16),
+        (mx.gpu, True, 132, mx.bfloat16),
+        (mx.gpu, True, 512, mx.bfloat16),
+        (mx.gpu, True, 128, mx.float16),
+        (mx.gpu, True, 128, mx.float32),
+    ],
+)
+def test_inkling2_relative_attention_kernel_fallback(
+    monkeypatch, device, metal, dim, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(
+        kernels, "_relative_attention_kernel", _forbid("relative attention")
+    )
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((1, 2, 4, dim), dtype)
+    r = mx.zeros((1, 4, 2, 16), dtype)
+    sinks = mx.zeros((1, 4, 2), dtype)
+    assert (
+        kernels.relative_attention(q, q, q, r, mx.zeros((16, 8)), sinks, 0.1, 0) is None
+    )
+
+
 def test_inkling2_mini_attention_uses_head_kernel_only_in_inference(monkeypatch):
     from mlx_vlm.models.inkling2 import kernels
     from mlx_vlm.models.inkling2.config import LoopConfig
