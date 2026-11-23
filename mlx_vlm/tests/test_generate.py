@@ -3079,6 +3079,98 @@ def test_stopping_criteria_reset():
     assert stopping_criteria(7) is True
 
 
+def test_generate_eos_tokens_do_not_leak_into_shared_criteria(
+    mock_model, mock_processor
+):
+    # ``generate(eos_tokens=...)`` is scoped to the call: the shared
+    # ``tokenizer.stopping_criteria`` must not keep the extra ids for
+    # later generate or stream_generate calls (the server reuses one
+    # tokenizer across requests and never resets the criteria there).
+    tokenizer = mock_processor.tokenizer
+    tokenizer.stopping_criteria = StoppingCriteria([2], tokenizer)
+    observed = []
+
+    def fake_stream(*args, **kwargs):
+        observed.append(list(tokenizer.stopping_criteria.eos_token_ids))
+        yield from ()
+
+    with patch("mlx_vlm.generate.dispatch.stream_generate", fake_stream):
+        dispatch_module.generate(
+            mock_model, mock_processor, "first", eos_tokens=[32010]
+        )
+        dispatch_module.generate(
+            mock_model, mock_processor, "second", eos_tokens=[32011]
+        )
+        dispatch_module.generate(mock_model, mock_processor, "third")
+
+    assert observed == [[2, 32010], [2, 32011], [2]]
+    assert tokenizer.stopping_criteria.eos_token_ids == [2]
+
+
+def test_generate_custom_criteria_do_not_leak_into_shared_tokenizer(
+    mock_model, mock_processor
+):
+    tokenizer = mock_processor.tokenizer
+    original = StoppingCriteria([2], tokenizer)
+    tokenizer.stopping_criteria = original
+    custom = StoppingCriteria([9], tokenizer)
+    observed = []
+
+    def fake_stream(*args, **kwargs):
+        observed.append(tokenizer.stopping_criteria)
+        yield from ()
+
+    with patch("mlx_vlm.generate.dispatch.stream_generate", fake_stream):
+        dispatch_module.generate(
+            mock_model, mock_processor, "first", stopping_criteria=custom
+        )
+        dispatch_module.generate(mock_model, mock_processor, "second")
+
+    assert observed == [custom, original]
+    assert tokenizer.stopping_criteria is original
+
+
+def test_generate_after_callable_criteria_still_resets_shared_criteria(
+    mock_model, mock_processor
+):
+    # A plain callable is an accepted ``stopping_criteria``; it has no
+    # ``reset`` method, so leaving it on the tokenizer broke every later
+    # ``generate()`` call with an AttributeError.
+    tokenizer = mock_processor.tokenizer
+    tokenizer.stopping_criteria = StoppingCriteria([2], tokenizer)
+
+    def fake_stream(*args, **kwargs):
+        yield from ()
+
+    with patch("mlx_vlm.generate.dispatch.stream_generate", fake_stream):
+        dispatch_module.generate(
+            mock_model, mock_processor, "first", stopping_criteria=lambda t: False
+        )
+        dispatch_module.generate(mock_model, mock_processor, "second")
+
+    assert isinstance(tokenizer.stopping_criteria, StoppingCriteria)
+
+
+def test_generate_custom_criteria_on_tokenizer_without_shared_criteria(
+    mock_model, mock_processor
+):
+    tokenizer = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    custom = StoppingCriteria([9], mock_processor.tokenizer)
+    observed = []
+
+    def fake_stream(*args, **kwargs):
+        observed.append(tokenizer.stopping_criteria)
+        yield from ()
+
+    with patch("mlx_vlm.generate.dispatch.stream_generate", fake_stream):
+        dispatch_module.generate(
+            mock_model, processor, "first", stopping_criteria=custom
+        )
+
+    assert observed == [custom]
+
+
 def test_load_processor_preserves_additional_eos_tokens_on_reset():
     processor = SimpleNamespace(
         tokenizer=SimpleNamespace(eos_token_ids=[2]), additional_eos_token_ids=[3]

@@ -1293,9 +1293,13 @@ def generate(
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     diffusion_output = DiffusionOutputHandler(model, kwargs, verbose)
 
+    criteria = getattr(tokenizer, "stopping_criteria", None)
+    prior_eos_token_ids = None
+
     # Add custom EOS tokens to the stopping criteria
     if eos_tokens is not None:
-        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+        prior_eos_token_ids = list(criteria.eos_token_ids)
+        criteria.add_eos_token_ids(eos_tokens)
 
     # Use custom stopping criteria
     elif stopping_criteria is not None:
@@ -1308,24 +1312,32 @@ def generate(
                 "stopping_criteria must be an instance of StoppingCriteria or a callable"
             )
     else:
-        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+        criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(
-        model, processor, prompt, image, audio, video, verbose=verbose, **kwargs
-    ):
-        if response.is_draft:
-            diffusion_output.handle_draft(response)
-            last_response = response
-            continue
-
-        if (
-            verbose
-            and not response.text_already_printed
-            and not diffusion_output.handle_text(response.text)
+    try:
+        for response in stream_generate(
+            model, processor, prompt, image, audio, video, verbose=verbose, **kwargs
         ):
-            print(response.text, end="", flush=True)
-        text += response.text
-        last_response = response
+            if response.is_draft:
+                diffusion_output.handle_draft(response)
+                last_response = response
+                continue
+
+            if (
+                verbose
+                and not response.text_already_printed
+                and not diffusion_output.handle_text(response.text)
+            ):
+                print(response.text, end="", flush=True)
+            text += response.text
+            last_response = response
+    finally:
+        # Call-scoped overrides must not leak into later generate or
+        # stream_generate calls on the same tokenizer.
+        if prior_eos_token_ids is not None:
+            criteria.eos_token_ids = prior_eos_token_ids
+        if criteria is not None:
+            tokenizer.stopping_criteria = criteria
 
     clean_output = getattr(processor, "clean_output", None)
     if callable(clean_output):
