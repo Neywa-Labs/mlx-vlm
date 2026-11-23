@@ -23,6 +23,7 @@ from ..base import LanguageModelOutput
 from ..cache import (
     ArraysCache,
     AttentionSinkKVCache,
+    BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -37,6 +38,12 @@ from ..inkling.language import (
 )
 from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
+
+# Global-cache length from which single-query decode uses the split-K kernel.
+_DECODE_KERNEL_MIN_KEYS = 4096
+# Chronological caches without a window. The server's batch cache holds one
+# row (with left padding) when it serves one sequence.
+_DECODE_KERNEL_CACHES = (KVCache, AttentionSinkKVCache, BatchKVCache)
 
 
 @mx.compile
@@ -496,6 +503,27 @@ class Attention(nn.Module):
                 self.sliding,
                 None if padding is None else mx.maximum(padding, 0),
             )
+        elif (
+            not self.sliding
+            and size >= _DECODE_KERNEL_MIN_KEYS
+            and type(kv) in _DECODE_KERNEL_CACHES
+        ):
+            # Long global caches: SDPA reads the keys once per query head and
+            # needs the sink as a zero K/V row; the split-K kernel reads each
+            # KV head's keys once for its query heads and folds in the sink.
+            from .kernels import decode_attention
+
+            out = decode_attention(
+                q,
+                k,
+                v,
+                r[0, 0] @ self.rel_proj.astype(x.dtype),
+                sinks[0, 0],
+                self.head_dim**-0.5,
+                key_start=padding,
+            )
+            if out is not None:
+                out = out.transpose(0, 2, 1, 3)
         if out is None:
             mask = banded_additive_mask(
                 r,

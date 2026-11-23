@@ -2,6 +2,7 @@
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import mlx_vlm.models.inkling.language as lang
@@ -384,3 +385,68 @@ def test_grouped_experts_only_run_for_multitoken_inference(
     model.train(train)
     x = mx.zeros((1, length, 64))
     mx.eval(model(x, speculative_verify=verify))
+
+
+@pytest.mark.parametrize(
+    "keys,start", [(700, 0), (5000, 0), (5000, 700), (5000, 1100), (5000, -3)]
+)
+def test_inkling2_split_k_decode_attention_matches_sdpa(keys, start):
+    from mlx_vlm.models.inkling2.kernels import decode_attention
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+
+    # Equal to SDPA with the relative bias of the newest R keys as an additive
+    # mask and the query-dependent sink, including a partial last block and a
+    # batch row's left padding (whole 512-key blocks of it, too). K/V are
+    # views of a larger cache buffer, as returned by the KV caches.
+    mx.random.seed(11)
+    hq, hkv, d, r = 24, 8, 128, 1024
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    k = mx.random.normal((1, hkv, keys + 256, d)).astype(mx.bfloat16)[:, :, :keys]
+    v = mx.random.normal((1, hkv, keys + 256, d)).astype(mx.bfloat16)[:, :, :keys]
+    rel = mx.random.normal((hq, r)).astype(mx.bfloat16)
+    # Sinks large enough to carry weight against 5,000 keys.
+    sinks = (8 + 2 * mx.random.normal((hq,))).astype(mx.bfloat16)
+    distance = (keys - 1) - mx.arange(keys)
+    bias = mx.take(rel, mx.minimum(distance, r - 1), axis=-1)
+    bias = mx.where(distance < r, bias, mx.array(0, bias.dtype))
+    bias = mx.where(mx.arange(keys) >= start, bias, mx.array(-mx.inf, bias.dtype))
+    expected = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=d**-0.5, mask=bias[None, :, None, :], sinks=sinks
+    )
+    actual = decode_attention(q, k, v, rel, sinks, d**-0.5, key_start=mx.array([start]))
+    assert actual.shape == expected.shape and actual.dtype == mx.bfloat16
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=2e-3,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "device,metal,batch,dim,heads,dtype",
+    [
+        (mx.cpu, True, 1, 128, 6, mx.bfloat16),
+        (mx.gpu, False, 1, 128, 6, mx.bfloat16),
+        (mx.gpu, True, 2, 128, 6, mx.bfloat16),
+        (mx.gpu, True, 1, 80, 6, mx.bfloat16),
+        (mx.gpu, True, 1, 128, 6, mx.float16),
+        (mx.gpu, True, 1, 128, 16, mx.bfloat16),
+    ],
+)
+def test_inkling2_split_k_decode_attention_fallback(
+    monkeypatch, device, metal, batch, dim, heads, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(kernels, "_decode_partials", _forbid("split-K decode"))
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((batch, heads, 1, dim), dtype)
+    k = mx.zeros((batch, 1, 8, dim), dtype)
+    rel = mx.zeros((heads, 4), dtype)
+    assert (
+        kernels.decode_attention(q, k, k, rel, mx.zeros((heads,), dtype), 1.0) is None
+    )

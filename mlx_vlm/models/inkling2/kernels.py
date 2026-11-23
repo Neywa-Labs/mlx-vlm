@@ -407,3 +407,194 @@ def relative_attention(q, k, v, r, rel_proj, sinks, scale, window, key_start=Non
         output_shapes=[(B, L, Hq, D)],
         output_dtypes=[q.dtype],
     )[0]
+
+
+# Single-query decode attention over a long chronological K/V cache, split over
+# key blocks (flash-decoding). One threadgroup reads one key block of one KV
+# head once for all of that head's query heads, instead of once per query head.
+_DECODE_BLOCK = 512
+_DECODE_SIMDGROUPS = 8
+
+
+@lru_cache(maxsize=1)
+def _decode_partials():
+    return mx.fast.metal_kernel(
+        name="inkling2_decode_attention_partials",
+        input_names=["q", "k", "v", "rel", "key_start", "sizes", "scale"],
+        output_names=["part_max", "part_sum", "part_acc"],
+        ensure_row_contiguous=False,
+        source=r"""
+        constexpr int G = HQ / HKV;
+        constexpr int E = D / 32;
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int block = threadgroup_position_in_grid.x;
+        const int g = threadgroup_position_in_grid.y;
+        const int S = sizes[0];
+        const int start = block * BS;
+        const int end = min(start + BS, S);
+        // Keys before key_start are a batch row's left padding.
+        const int first = max(start, key_start[0]);
+        const float sc = scale;
+
+        float qv[G][E];
+        for (int h = 0; h < G; ++h)
+            for (int e = 0; e < E; ++e)
+                qv[h][e] = float(q[(g * G + h) * D + lane * E + e]) * sc;
+        // A finite floor instead of -inf: an empty block or simdgroup then
+        // carries zero weight without relying on infinities.
+        float m[G], l[G], acc[G][E];
+        for (int h = 0; h < G; ++h) {
+            m[h] = -1e30f;
+            l[h] = 0.0f;
+            for (int e = 0; e < E; ++e) acc[h][e] = 0.0f;
+        }
+        const device T* k_head = k + g * k_strides[1];
+        const device T* v_head = v + g * v_strides[1];
+        for (int j = first + int(sg); j < end; j += SG) {
+            const device T* kp = k_head + size_t(j) * k_strides[2] + lane * E;
+            const device T* vp = v_head + size_t(j) * v_strides[2] + lane * E;
+            float kv[E], vv[E];
+            for (int e = 0; e < E; ++e) {
+                kv[e] = float(kp[e]);
+                vv[e] = float(vp[e]);
+            }
+            // The relative bias covers the newest REL keys only.
+            const int dist = S - 1 - j;
+            for (int h = 0; h < G; ++h) {
+                float s = 0.0f;
+                for (int e = 0; e < E; ++e) s += qv[h][e] * kv[e];
+                s = simd_sum(s);
+                if (dist < REL) s += float(rel[(g * G + h) * REL + dist]);
+                const float mn = max(m[h], s);
+                const float f = metal::exp(m[h] - mn);
+                const float p = metal::exp(s - mn);
+                l[h] = l[h] * f + p;
+                for (int e = 0; e < E; ++e) acc[h][e] = acc[h][e] * f + p * vv[e];
+                m[h] = mn;
+            }
+        }
+
+        threadgroup float tm[SG][G];
+        threadgroup float tl[SG][G];
+        threadgroup float ta[SG][G][D];
+        for (int h = 0; h < G; ++h) {
+            if (lane == 0) {
+                tm[sg][h] = m[h];
+                tl[sg][h] = l[h];
+            }
+            for (int e = 0; e < E; ++e) ta[sg][h][lane * E + e] = acc[h][e];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Thread t combines head t / D, dimension t % D across the simdgroups.
+        for (uint t = thread_position_in_threadgroup.x; t < uint(G * D); t += SG * 32) {
+            const int h = t / D, d = t % D;
+            float M = -1e30f;
+            for (int s = 0; s < SG; ++s) M = max(M, tm[s][h]);
+            float L = 0.0f, A = 0.0f;
+            for (int s = 0; s < SG; ++s) {
+                const float w = metal::exp(tm[s][h] - M);
+                L += tl[s][h] * w;
+                A += ta[s][h][d] * w;
+            }
+            const int row = block * HQ + g * G + h;
+            part_acc[size_t(row) * D + d] = A;
+            if (d == 0) {
+                part_max[row] = M;
+                part_sum[row] = L;
+            }
+        }
+        """,
+    )
+
+
+@lru_cache(maxsize=1)
+def _decode_combine():
+    return mx.fast.metal_kernel(
+        name="inkling2_decode_attention_combine",
+        input_names=["part_max", "part_sum", "part_acc", "sinks", "sizes"],
+        output_names=["out"],
+        source=r"""
+        const int h = threadgroup_position_in_grid.x;
+        const int d = thread_position_in_threadgroup.x;
+        const int nblocks = sizes[1];
+        // The softmax starts from the sink logit, whose value row is zero.
+        float M = float(sinks[h]);
+        for (int b = 0; b < nblocks; ++b) M = max(M, part_max[b * HQ + h]);
+        float L = metal::exp(float(sinks[h]) - M), A = 0.0f;
+        for (int b = 0; b < nblocks; ++b) {
+            const float w = metal::exp(part_max[b * HQ + h] - M);
+            L += part_sum[b * HQ + h] * w;
+            A += part_acc[size_t(b * HQ + h) * D + d] * w;
+        }
+        out[h * D + d] = T(A / L);
+        """,
+    )
+
+
+def decode_attention(q, k, v, rel, sinks, scale, key_start=None):
+    """One query of one sequence over a chronological cache, or None for SDPA.
+
+    q: (1, HQ, 1, D); k, v: (1, HKV, S, D) with the query at the last key;
+    rel: (HQ, R), the bias at backward distances below R; sinks: (HQ,);
+    key_start: optional (1,) int array, the first valid key (left padding).
+    Returns (1, HQ, 1, D) in q's dtype.
+    """
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        return None
+    _, hq, _, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    if (
+        q.shape != (1, hq, 1, d)
+        or k.shape != (1, hkv, s, d)
+        or v.shape != k.shape
+        or rel.shape[0] != hq
+        or sinks.shape != (hq,)
+        or any(a.dtype != mx.bfloat16 for a in (q, k, v))
+        or d % 32
+        or hq % hkv
+        # Per-simdgroup partials for every query head of a KV head must fit
+        # in 32 KB of threadgroup memory.
+        or _DECODE_SIMDGROUPS * (hq // hkv) * (d + 2) * 4 > 32768
+    ):
+        return None
+    nblocks = (s + _DECODE_BLOCK - 1) // _DECODE_BLOCK
+    if key_start is None:
+        key_start = mx.zeros((1,), mx.int32)
+    common = [("T", q.dtype), ("D", d), ("HQ", hq), ("HKV", hkv)]
+    part_max, part_sum, part_acc = _decode_partials()(
+        inputs=[
+            mx.contiguous(q.reshape(hq, d)),
+            k,
+            v,
+            mx.contiguous(rel),
+            key_start.astype(mx.int32),
+            mx.array([s], dtype=mx.int32),
+            mx.array(scale, dtype=mx.float32),
+        ],
+        template=[
+            *common,
+            ("REL", rel.shape[-1]),
+            ("BS", _DECODE_BLOCK),
+            ("SG", _DECODE_SIMDGROUPS),
+        ],
+        grid=(nblocks * 32 * _DECODE_SIMDGROUPS, hkv, 1),
+        threadgroup=(32 * _DECODE_SIMDGROUPS, 1, 1),
+        output_shapes=[(nblocks * hq,), (nblocks * hq,), (nblocks * hq, d)],
+        output_dtypes=[mx.float32] * 3,
+    )
+    out = _decode_combine()(
+        inputs=[
+            part_max,
+            part_sum,
+            part_acc,
+            sinks.astype(mx.float32),
+            mx.array([s, nblocks], dtype=mx.int32),
+        ],
+        template=common,
+        grid=(hq * d, 1, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[(hq, d)],
+        output_dtypes=[q.dtype],
+    )[0]
+    return out.reshape(1, hq, 1, d)
