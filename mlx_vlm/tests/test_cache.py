@@ -67,6 +67,7 @@ from mlx_vlm.models.cache import (
     ChunkedKVCache,
     KVCache,
     PoolingCache,
+    QuantizedKVCache,
     RotatingKVCache,
     create_causal_mask,
 )
@@ -3952,6 +3953,115 @@ def test_maybe_quantize_kv_cache_policy(mixed):
             )
         else:
             assert (entry.key_bits, entry.value_bits) == (3.0, 4.0)
+
+
+def test_maybe_quantize_kv_cache_uniform_skips_rotating_in_hybrid_cache():
+    rot = RotatingKVCache(max_size=16)
+    kv = KVCache()
+    k = mx.zeros((1, 2, 4, 64), dtype=mx.bfloat16)
+    v = mx.zeros((1, 2, 4, 64), dtype=mx.bfloat16)
+    rot.update_and_fetch(k, v)
+    kv.update_and_fetch(k, v)
+    prompt_cache = [rot, kv]
+
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=8,
+        kv_group_size=64,
+        kv_bits=8,
+        kv_quant_scheme="uniform",
+    )
+    assert isinstance(prompt_cache[0], RotatingKVCache)
+    assert isinstance(prompt_cache[1], KVCache)
+
+    rot.update_and_fetch(k, v)
+    kv.update_and_fetch(k, v)
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=8,
+        kv_group_size=64,
+        kv_bits=8,
+        kv_quant_scheme="uniform",
+    )
+    assert isinstance(prompt_cache[0], RotatingKVCache)
+    assert isinstance(prompt_cache[1], QuantizedKVCache)
+    assert prompt_cache[1].bits == 8
+    assert prompt_cache[1].group_size == 64
+
+    step = mx.zeros((1, 2, 1, 64), dtype=mx.bfloat16)
+    prompt_cache[0].update_and_fetch(step, step)
+    prompt_cache[1].update_and_fetch(step, step)
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=8,
+        kv_group_size=64,
+        kv_bits=8,
+        kv_quant_scheme="uniform",
+    )
+    assert isinstance(prompt_cache[0], RotatingKVCache)
+    assert isinstance(prompt_cache[1], QuantizedKVCache)
+
+
+def test_maybe_quantize_kv_cache_uniform_raises_for_all_rotating_cache():
+    prompt_cache = [RotatingKVCache(max_size=16), RotatingKVCache(max_size=16)]
+    k = mx.zeros((1, 2, 8, 64), dtype=mx.bfloat16)
+    for c in prompt_cache:
+        c.update_and_fetch(k, k)
+    with pytest.raises(NotImplementedError):
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=8,
+            kv_group_size=64,
+            kv_bits=8,
+            kv_quant_scheme="uniform",
+        )
+
+
+def test_gemma4_shared_kv_with_uniform_quantized_cache():
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import LanguageModel
+
+    config = TextConfig(
+        hidden_size=64,
+        num_hidden_layers=4,
+        intermediate_size=128,
+        num_attention_heads=2,
+        head_dim=64,
+        global_head_dim=64,
+        vocab_size=128,
+        num_key_value_heads=2,
+        num_kv_shared_layers=2,
+        hidden_size_per_layer_input=0,
+        sliding_window=16,
+        use_double_wide_mlp=False,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+    )
+    model = LanguageModel(config)
+    cache = model.make_cache()
+    assert len(cache) == 2
+    assert isinstance(cache[0], RotatingKVCache)
+    assert isinstance(cache[1], KVCache)
+
+    model(mx.array([[1, 2, 3, 4]]), cache=cache)
+    maybe_quantize_kv_cache(
+        cache,
+        quantized_kv_start=0,
+        kv_group_size=64,
+        kv_bits=8,
+        kv_quant_scheme="uniform",
+    )
+    assert isinstance(cache[0], RotatingKVCache)
+    assert isinstance(cache[1], QuantizedKVCache)
+
+    out = model(mx.array([[5]]), cache=cache)
+    mx.eval(out.logits)
+    assert out.logits.shape == (1, 1, 128)
+    assert bool(mx.all(mx.isfinite(out.logits)).item())
 
 
 def _turbo_quant_config(**overrides):
