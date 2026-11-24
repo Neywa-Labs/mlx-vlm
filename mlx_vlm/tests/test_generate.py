@@ -3560,3 +3560,116 @@ class TestApplyMinPZeroThreshold:
         filtered = sampling.apply_min_p(logprobs, 0.5)
         assert filtered[0, 0] == logprobs[0, 0]
         assert mx.isinf(filtered[0, 1:]).all().item()
+
+
+class TestBatchPenaltyContextCopy:
+    """Batched decode hands penalty processors only their context window."""
+
+    def test_penalty_factories_expose_context_window(self):
+        for factory in (
+            sampling.make_repetition_penalty,
+            sampling.make_presence_penalty,
+            sampling.make_frequency_penalty,
+        ):
+            processor = factory(1.2, context_size=7)
+            assert getattr(processor, sampling.CONTEXT_WINDOW_ATTR) == 7
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            sampling.make_repetition_penalty,
+            sampling.make_presence_penalty,
+            sampling.make_frequency_penalty,
+        ],
+    )
+    def test_tail_history_matches_full_history(self, factory):
+        processor = factory(1.3, context_size=20)
+        history = np.random.default_rng(3).integers(0, 64, size=300).tolist()
+        mx.random.seed(5)
+        logits = mx.random.normal((1, 64))
+        full = processor(mx.array(history), mx.array(logits))
+        tail = processor(mx.array(history[-20:]), mx.array(logits))
+        mx.eval(full, tail)
+        assert mx.array_equal(full, tail).item()
+
+    class _RecordingPenalty:
+        def __init__(self, inner):
+            self.inner = inner
+            self.lengths = []
+            setattr(
+                self,
+                sampling.CONTEXT_WINDOW_ATTR,
+                getattr(inner, sampling.CONTEXT_WINDOW_ATTR),
+            )
+
+        def __call__(self, tokens, logits):
+            self.lengths.append(tokens.shape[0])
+            return self.inner(tokens, logits)
+
+    def _decode_tokens(self, processors, steps):
+        class CloseLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                scores = mx.array([0.0, 10.0, 9.0, 0.0])
+                return SimpleNamespace(
+                    logits=mx.broadcast_to(scores, (*input_ids.shape, 4))
+                )
+
+        batch = GenerationBatch(
+            model=CloseLogitModel(),
+            uids=[0],
+            inputs=mx.array([1], mx.int32),
+            prompt_cache=[],
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[steps],
+            logits_processors=[processors],
+            token_context=[[1]],
+        )
+        tokens = []
+        for _ in range(steps):
+            responses = batch.next()
+            if not responses:
+                break
+            tokens.extend(r.token for r in responses)
+        return tokens
+
+    def test_batch_decode_penalty_copies_bounded_context(self):
+        steps = 12
+        plain = sampling.make_repetition_penalty(1.5, context_size=3)
+        recorded = self._RecordingPenalty(
+            sampling.make_repetition_penalty(1.5, context_size=3)
+        )
+        expected = self._decode_tokens([plain], steps)
+        actual = self._decode_tokens([recorded], steps)
+        assert actual == expected
+        assert len(recorded.lengths) == steps
+        assert max(recorded.lengths) <= 3
+        # Without the bound the copy would grow with the history each step.
+        assert recorded.lengths[-1] < steps
+
+    def test_batch_decode_zero_context_keeps_full_history(self):
+        steps = 8
+        recorded = self._RecordingPenalty(
+            sampling.make_repetition_penalty(1.5, context_size=0)
+        )
+        self._decode_tokens([recorded], steps)
+        assert recorded.lengths == list(range(2, steps + 2))
+
+    def test_prefill_penalty_copies_bounded_context(self):
+        model = FixedLogitModel()
+        model.make_cache = lambda: []
+        recorded = self._RecordingPenalty(
+            sampling.make_repetition_penalty(1.5, context_size=3)
+        )
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[0],
+            input_ids=[[1] * 100],
+            max_tokens=[2],
+            inputs_embeds=None,
+            prompt_kwargs={},
+            logits_processors=[[recorded]],
+            greedy_sampling=True,
+        )
+        batch.generate(lambda logits: mx.argmax(logits, axis=-1), lambda _: False)
+        assert recorded.lengths[0] == 3
