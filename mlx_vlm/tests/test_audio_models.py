@@ -988,6 +988,73 @@ def test_mog_top_p_keeps_most_likely_component(top_p):
     assert (filtered > -mx.inf).tolist() == [[False, False, True, top_p == 0.7]]
 
 
+def test_voicechat_perception_runs_in_its_weights_dtype():
+    config = voicechat_config.AudioConfig(
+        encoder=voicechat_config.ConformerArgs(
+            n_layers=1,
+            d_model=16,
+            n_heads=2,
+            subsampling_conv_channels=8,
+            att_context_size=[[4, 0]],
+        ),
+        output_dim=8,
+    )
+    perception = _model_module("nemotron_voicechat.model").Perception(config)
+    perception.set_dtype(mx.bfloat16)
+    # The log-mel featurizer returns float32.
+    mel = mx.random.normal((1, 32, 128))
+    projected, _, encoded = perception(mel, mx.array([32], dtype=mx.int32))
+
+    assert perception.compute_dtype == mx.bfloat16
+    assert projected.dtype == mx.bfloat16
+    assert encoded.dtype == mx.bfloat16
+
+
+def test_voicechat_streaming_casts_log_mel_to_the_encoder_dtype():
+    seen = []
+
+    class ConformerStream:
+        def push(self, mel, emit_partial):
+            seen.append(mel.dtype)
+            return [mx.zeros((1, 1, 4), dtype=mel.dtype)]
+
+        def materialize(self, *arrays):
+            mx.eval(*arrays)
+
+    perception = SimpleNamespace(compute_dtype=mx.bfloat16, proj=lambda x: x)
+    session = SimpleNamespace(
+        _mel_stream=SimpleNamespace(push=lambda frame: mx.zeros((1, 8, 128))),
+        _conformer_stream=ConformerStream(),
+        model=SimpleNamespace(stt_model=SimpleNamespace(perception=perception)),
+    )
+    projected, _ = voicechat.VoiceChatStreamingSession._perception_step(
+        session, mx.zeros((1280,))
+    )
+
+    assert seen == [mx.bfloat16]
+    assert projected.dtype == mx.bfloat16
+
+
+def test_voicechat_depthsum_embedding_returns_the_weights_dtype():
+    # Code 5 is the padding index (codebook_size), which embeds to zero.
+    stored = mx.random.normal((3, 5, 4)).astype(mx.bfloat16)
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_quantizers=3, latent_size=4), rvq_embs=stored
+    )
+    code = mx.array([[[0, 4, 5], [2, 1, 3]]], dtype=mx.int32)
+    embedded = voicechat_tts.RVQEARTTSModel.depthsum_embedding(model, code)
+
+    reference = stored.astype(mx.float32)
+    expected = mx.stack(
+        [
+            reference[0, 0] + reference[1, 4],
+            reference[0, 2] + reference[1, 1] + reference[2, 3],
+        ]
+    )[None]
+    assert embedded.dtype == mx.bfloat16
+    assert mx.allclose(embedded.astype(mx.float32), expected, rtol=1e-2, atol=1e-2)
+
+
 def test_model_creates_session_from_wrapped_tokenizer():
     vocabulary = {"hello": 0}
 

@@ -319,6 +319,7 @@ class VoiceChatStreamingSession:
     def _perception_step(self, frame: mx.array) -> tuple[mx.array, mx.array]:
         if self._mel_stream is not None and self._conformer_stream is not None:
             mel = self._mel_stream.push(frame)
+            mel = mel.astype(self.model.stt_model.perception.compute_dtype)
             chunks = self._conformer_stream.push(mel, emit_partial=True)
             if len(chunks) != 1 or chunks[0].shape[1] != 1:
                 shapes = [tuple(chunk.shape) for chunk in chunks]
