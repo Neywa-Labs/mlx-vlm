@@ -5022,6 +5022,42 @@ def test_qwen3_omni_rope_delta_ignores_batch_padding():
     assert rope_deltas.tolist() == [[0], [0]]
 
 
+def test_qwen3_omni_explicit_mask_is_trimmed_to_cached_keys():
+    # Regression for #2731: the mask was cut to ``offset + L + 1`` columns,
+    # one more than the cached keys, so a wider explicit mask failed to
+    # broadcast, and a forward without cache or position ids crashed.
+    case = next(c for c in DATA["rotating_cache"] if c["module"] == "qwen3_omni_moe")
+    mx.random.seed(31)
+    model, config = rotating_language_model(case)
+    model.eval()
+    text = model.model
+    ids = (mx.arange(12)[None] * 7 + 3) % config.vocab_size
+
+    def prefill():
+        cache = [KVCache() for _ in text.layers]
+        mx.eval(text(ids[:, :8], cache=cache))
+        return cache
+
+    cache = prefill()
+    expected = mx.concatenate(
+        [text(ids[:, t : t + 1], cache=cache) for t in range(8, 12)], axis=1
+    )
+    # Verify the last 4 tokens in one forward with explicit causal masks, one
+    # as wide as the cached keys and one built over a longer key range.
+    for width in (12, 16):
+        mask = mx.arange(8, 12)[:, None] >= mx.arange(width)[None]
+        out = text(ids[:, 8:], cache=prefill(), mask=mask)
+        np.testing.assert_allclose(
+            np.array(out), np.array(expected), atol=1e-4, rtol=1e-4
+        )
+
+    uncached = text(ids[:, :8])
+    cached = text(ids[:, :8], cache=[KVCache() for _ in text.layers])
+    np.testing.assert_allclose(
+        np.array(uncached), np.array(cached), atol=1e-4, rtol=1e-4
+    )
+
+
 # Patch embedding layouts
 
 
