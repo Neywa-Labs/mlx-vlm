@@ -15,6 +15,7 @@
 
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -23,6 +24,7 @@ from ..base import LanguageModelOutput
 from ..cache import (
     ArraysCache,
     AttentionSinkKVCache,
+    BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -37,6 +39,12 @@ from ..inkling.language import (
 )
 from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
+
+# Global-cache length from which single-query decode uses the split-K kernel.
+_DECODE_KERNEL_MIN_KEYS = 4096
+# Chronological caches without a window. The server's batch cache holds one
+# row (with left padding) when it serves one sequence.
+_DECODE_KERNEL_CACHES = (KVCache, AttentionSinkKVCache, BatchKVCache)
 
 
 @mx.compile
@@ -278,6 +286,10 @@ class Attention(nn.Module):
         self.sliding = config.sliding_window_size if self.is_sliding else 0
         self.rel_extent = self.sliding or config.rel_extent
         self.sharding_group = None
+        # MLX_VLM_INKLING_KV8=1: global layers cache keys and values as int8 rows
+        # with one FP32 scale each (kernels.kv8_pack), about half the bytes of
+        # BF16. Sliding layers keep their small windows in BF16.
+        self.kv8 = not self.is_sliding and os.environ.get("MLX_VLM_INKLING_KV8") == "1"
         self.head_start = 0
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
@@ -461,6 +473,10 @@ class Attention(nn.Module):
             r = (r.astype(mx.float32) * tau[..., None, None]).astype(x.dtype)
         q, k, v = (a.transpose(0, 2, 1, 3) for a in (q, k, v))
         if kv is not None:
+            if self.kv8:
+                from .kernels import kv8_pack
+
+                k, v = kv8_pack(k), kv8_pack(v)
             k, v = kv.update_and_fetch(k, v)
             # Relative logits index backward distance, so ring buffers must be
             # read in chronological order (ordinary RoPE attention does not care).
@@ -470,37 +486,88 @@ class Attention(nn.Module):
                 k, v = mx.roll(k, -kv._idx, axis=2), mx.roll(v, -kv._idx, axis=2)
         size = k.shape[2]
         padding = getattr(kv, "left_padding", None)
-        mask = banded_additive_mask(
-            r,
-            self.rel_proj.astype(x.dtype),
-            size - length,
-            size,
-            self.sliding,
-            self.rel_extent,
-            left_padding=padding,
-            shape_ref=k,
-        )
-        # A query-dependent sink is represented by a zero K/V and its own logit.
         # Keep this tiny projection's original width: splitting its 48 output
         # rows changes the prefill GEMM reduction and hence BF16 rounding.
         sinks = self.sink_proj(x)
         if self.sharding_group is not None:
             sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
-        sinks = sinks.transpose(0, 2, 1)[..., None]
-        mask = mx.concatenate([mask, sinks], axis=-1)
-        if isinstance(kv, AttentionSinkKVCache):
-            k, v = kv.with_sink(size)
-        else:
-            k = mx.concatenate(
-                [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
+        out = None
+        if length > 1 and not self.training:
+            from .kernels import relative_attention
+
+            # Prefill chunks and verify blocks: the kernel adds the relative
+            # bias and the sink inside its online softmax, so it needs neither
+            # the heads x queries x keys mask below (4 GB per 2,048-token chunk
+            # at 41K keys) nor a K/V copy with a sink row. A batch row's left
+            # padding is its first valid key. Inference only: the kernel has
+            # no gradient, so training keeps the differentiable masked path.
+            out = relative_attention(
+                q,
+                k,
+                v,
+                r,
+                self.rel_proj,
+                sinks,
+                self.head_dim**-0.5,
+                self.sliding,
+                None if padding is None else mx.maximum(padding, 0),
             )
-            v = mx.concatenate(
-                [v, mx.zeros((b, self.n_kv, 1, self.head_dim), v.dtype)], axis=2
+        elif (
+            not self.sliding
+            and size >= _DECODE_KERNEL_MIN_KEYS
+            and type(kv) in _DECODE_KERNEL_CACHES
+        ):
+            # Long global caches: SDPA reads the keys once per query head and
+            # needs the sink as a zero K/V row; the split-K kernel reads each
+            # KV head's keys once for its query heads and folds in the sink.
+            from .kernels import decode_attention
+
+            out = decode_attention(
+                q,
+                k,
+                v,
+                r[0, 0] @ self.rel_proj.astype(x.dtype),
+                sinks[0, 0],
+                self.head_dim**-0.5,
+                key_start=padding,
             )
-        out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.head_dim**-0.5, mask=mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
+            if out is not None:
+                out = out.transpose(0, 2, 1, 3)
+        if out is None:
+            mask = banded_additive_mask(
+                r,
+                self.rel_proj.astype(x.dtype),
+                size - length,
+                size,
+                self.sliding,
+                self.rel_extent,
+                left_padding=padding,
+                shape_ref=k,
+            )
+            # A query-dependent sink is represented by a zero K/V and its own
+            # logit.
+            sinks = sinks.transpose(0, 2, 1)[..., None]
+            mask = mx.concatenate([mask, sinks], axis=-1)
+            if isinstance(kv, AttentionSinkKVCache):
+                k, v = kv.with_sink(size)
+            else:
+                # kv8 rows are head_dim + 4 wide; their zero row unpacks to zero.
+                k = mx.concatenate(
+                    [k, mx.zeros((b, self.n_kv, 1, k.shape[-1]), k.dtype)], axis=2
+                )
+                v = mx.concatenate(
+                    [v, mx.zeros((b, self.n_kv, 1, v.shape[-1]), v.dtype)], axis=2
+                )
+            if k.dtype == mx.int8:
+                # MLX_VLM_INKLING_KV8 rows, including AttentionSinkKVCache's
+                # zero sink row (zero values and scale).
+                from .kernels import kv8_unpack
+
+                k, v = kv8_unpack(k, q.dtype), kv8_unpack(v, q.dtype)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.head_dim**-0.5, mask=mask
+            ).transpose(0, 2, 1, 3)
+        out = out.reshape(b, length, -1)
         out = (
             out.astype(mx.float32)
             * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
@@ -794,6 +861,16 @@ class LanguageModel(InklingLanguageModel):
         # Captures are per-token partial blocks; the shared prefill collector
         # retains them across chunks. Preserve the caller's target chunk size.
         return True
+
+    def apc_key_dependencies(self):
+        # Prefix-cache checkpoints hold the global layers' K/V in the layout they
+        # were built in, so a checkpoint of an int8 cache (MLX_VLM_INKLING_KV8)
+        # must never restore into a BF16 cache or the other way round, including
+        # from the disk tier after a restart. A BF16 cache adds nothing, so its
+        # keys are unchanged.
+        if any(layer.self_attn.kv8 for layer in self.model.layers):
+            return ("inkling2-kv8-v1",)
+        return ()
 
     def __call__(
         self,

@@ -2,6 +2,7 @@
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import mlx_vlm.models.inkling.language as lang
@@ -176,6 +177,76 @@ def test_inkling2_attention_head_kernel_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    "device,metal,dim,dtype",
+    [
+        (mx.cpu, True, 128, mx.bfloat16),
+        (mx.gpu, False, 128, mx.bfloat16),
+        (mx.gpu, True, 132, mx.bfloat16),
+        (mx.gpu, True, 512, mx.bfloat16),
+        (mx.gpu, True, 128, mx.float16),
+        (mx.gpu, True, 128, mx.float32),
+    ],
+)
+def test_inkling2_relative_attention_kernel_fallback(
+    monkeypatch, device, metal, dim, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(
+        kernels, "_relative_attention_kernel", _forbid("relative attention")
+    )
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((1, 2, 4, dim), dtype)
+    r = mx.zeros((1, 4, 2, 16), dtype)
+    sinks = mx.zeros((1, 4, 2), dtype)
+    assert (
+        kernels.relative_attention(q, q, q, r, mx.zeros((16, 8)), sinks, 0.1, 0) is None
+    )
+
+
+def test_inkling2_relative_attention_kernel_only_in_inference(monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.language import Attention
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+    # The kernel has no gradient, so training keeps the differentiable masked
+    # path: gradients reach the query projection of a multi-token block (the
+    # relative-bias inputs go through the mask kernel, so only q_proj trains).
+    cfg = Inkling2TextConfig(
+        hidden_size=32,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=1,
+        local_layer_ids=[0],
+        n_layers_per_attn_res_block=1,
+    )
+    attn = Attention(cfg, 1)
+    attn.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, 16, 32), key=mx.random.key(0)).astype(mx.bfloat16)
+    calls = []
+    original = kernels.relative_attention
+
+    def counted(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernels, "relative_attention", counted)
+    attn.eval()
+    mx.eval(attn(x))
+    assert calls
+    monkeypatch.setattr(
+        kernels, "relative_attention", _forbid("inference-only relative attention")
+    )
+    attn.train()
+    attn.freeze()
+    attn.q_proj.unfreeze()
+    _, grads = nn.value_and_grad(attn, lambda x: attn(x).astype(mx.float32).sum())(x)
+    grad = grads["q_proj"]["weight"].astype(mx.float32)
+    assert mx.all(mx.isfinite(grad)).item() and mx.any(grad != 0).item()
+
+
 def test_inkling2_mini_attention_uses_head_kernel_only_in_inference(monkeypatch):
     from mlx_vlm.models.inkling2 import kernels
     from mlx_vlm.models.inkling2.config import LoopConfig
@@ -314,3 +385,127 @@ def test_grouped_experts_only_run_for_multitoken_inference(
     model.train(train)
     x = mx.zeros((1, length, 64))
     mx.eval(model(x, speculative_verify=verify))
+
+
+@pytest.mark.parametrize(
+    "keys,start", [(700, 0), (5000, 0), (5000, 700), (5000, 1100), (5000, -3)]
+)
+def test_inkling2_split_k_decode_attention_matches_sdpa(keys, start):
+    from mlx_vlm.models.inkling2.kernels import decode_attention
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+
+    # Equal to SDPA with the relative bias of the newest R keys as an additive
+    # mask and the query-dependent sink, including a partial last block and a
+    # batch row's left padding (whole 512-key blocks of it, too). K/V are
+    # views of a larger cache buffer, as returned by the KV caches.
+    mx.random.seed(11)
+    hq, hkv, d, r = 24, 8, 128, 1024
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    k = mx.random.normal((1, hkv, keys + 256, d)).astype(mx.bfloat16)[:, :, :keys]
+    v = mx.random.normal((1, hkv, keys + 256, d)).astype(mx.bfloat16)[:, :, :keys]
+    rel = mx.random.normal((hq, r)).astype(mx.bfloat16)
+    # Sinks large enough to carry weight against 5,000 keys.
+    sinks = (8 + 2 * mx.random.normal((hq,))).astype(mx.bfloat16)
+    distance = (keys - 1) - mx.arange(keys)
+    bias = mx.take(rel, mx.minimum(distance, r - 1), axis=-1)
+    bias = mx.where(distance < r, bias, mx.array(0, bias.dtype))
+    bias = mx.where(mx.arange(keys) >= start, bias, mx.array(-mx.inf, bias.dtype))
+    expected = mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=d**-0.5, mask=bias[None, :, None, :], sinks=sinks
+    )
+    actual = decode_attention(q, k, v, rel, sinks, d**-0.5, key_start=mx.array([start]))
+    assert actual.shape == expected.shape and actual.dtype == mx.bfloat16
+    np.testing.assert_allclose(
+        np.array(actual.astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=2e-3,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "device,metal,batch,dim,heads,dtype",
+    [
+        (mx.cpu, True, 1, 128, 6, mx.bfloat16),
+        (mx.gpu, False, 1, 128, 6, mx.bfloat16),
+        (mx.gpu, True, 2, 128, 6, mx.bfloat16),
+        (mx.gpu, True, 1, 80, 6, mx.bfloat16),
+        (mx.gpu, True, 1, 128, 6, mx.float16),
+        (mx.gpu, True, 1, 128, 16, mx.bfloat16),
+    ],
+)
+def test_inkling2_split_k_decode_attention_fallback(
+    monkeypatch, device, metal, batch, dim, heads, dtype
+):
+    from mlx_vlm.models.inkling2 import kernels
+
+    monkeypatch.setattr(kernels, "_decode_partials", _forbid("split-K decode"))
+    monkeypatch.setattr(mx.metal, "is_available", lambda: metal)
+    monkeypatch.setattr(mx, "default_device", lambda: device)
+    q = mx.zeros((batch, heads, 1, dim), dtype)
+    k = mx.zeros((batch, 1, 8, dim), dtype)
+    rel = mx.zeros((heads, 4), dtype)
+    assert (
+        kernels.decode_attention(q, k, k, rel, mx.zeros((heads,), dtype), 1.0) is None
+    )
+
+
+@pytest.mark.parametrize("start", [0, 700])
+def test_inkling2_kernels_read_kv8_packed_rows(start):
+    from mlx_vlm.models.inkling2.kernels import (
+        decode_attention,
+        kv8_pack,
+        kv8_unpack,
+        relative_attention,
+    )
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+
+    # MLX_VLM_INKLING_KV8 caches the global layers' rows as int8 plus one FP32
+    # scale each. The split-K decode kernel and the flash kernel read those
+    # rows directly: they must match the same rows dequantized and stay close
+    # to the unquantized cache, with a batch row's left padding. K/V are views
+    # of a larger cache buffer, as returned by the KV caches.
+    mx.random.seed(5)
+    keys, hq, hkv, d, d_rel, extent = 5000, 24, 8, 128, 16, 64
+    k = (mx.random.normal((2, hkv, keys + 256, d)) * 0.5).astype(mx.bfloat16)
+    v = mx.random.normal((2, hkv, keys + 256, d)).astype(mx.bfloat16)
+    kp, vp = kv8_pack(k)[:, :, :keys], kv8_pack(v)[:, :, :keys]
+    assert kp.dtype == mx.int8 and kp.shape == (2, hkv, keys, d + 4)
+    kd, vd = kv8_unpack(kp), kv8_unpack(vp)
+    k, v = k[:, :, :keys], v[:, :, :keys]
+
+    def as_np(a):
+        return np.array(a.astype(mx.float32))
+
+    q = mx.random.normal((1, hq, 1, d)).astype(mx.bfloat16)
+    rel = mx.random.normal((hq, extent)).astype(mx.bfloat16)
+    sinks = mx.random.normal((hq,)).astype(mx.bfloat16)
+    packed, dense, full = (
+        decode_attention(
+            q, a[:1], b[:1], rel, sinks, d**-0.5, key_start=mx.array([start])
+        )
+        for a, b in ((kp, vp), (kd, vd), (k, v))
+    )
+    assert packed is not None and packed.dtype == mx.bfloat16
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=2e-2)
+
+    n = 64
+    q = mx.random.normal((2, hq, n, d)).astype(mx.bfloat16)
+    r = mx.random.normal((2, n, hq, d_rel)).astype(mx.bfloat16)
+    rel_proj = mx.random.normal((d_rel, extent))
+    sinks = mx.random.normal((2, n, hq))
+    key_start = mx.array([0, start])
+    packed, dense, full = (
+        relative_attention(q, a, b, r, rel_proj, sinks, d**-0.5, 0, key_start)
+        for a, b in ((kp, vp), (kd, vd), (k, v))
+    )
+    assert packed is not None and packed.dtype == mx.bfloat16
+    # The kernel rounds dequantized rows to half, the dense path to BF16 first:
+    # outputs near 2.5 can differ by one BF16 step.
+    np.testing.assert_allclose(as_np(packed), as_np(dense), atol=1e-2, rtol=1e-2)
+    np.testing.assert_allclose(as_np(packed), as_np(full), atol=3e-2, rtol=1e-2)

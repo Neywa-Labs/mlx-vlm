@@ -37,6 +37,9 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def apc_key_dependencies(self):
+        return self.language_model.apc_key_dependencies()
+
     def shard(self, group=None):
         self.language_model.shard(group)
 
