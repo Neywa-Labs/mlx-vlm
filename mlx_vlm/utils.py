@@ -530,6 +530,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         if quantization_config is not None:
             config["quantization_config"] = quantization_config
 
+    layerwise_eval = False
     report("converting_weights")
     weights, transformed_quantization = transform_quantized_weights(
         weights, quantization_config
@@ -616,6 +617,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     weights, quantization = prepare_preview_weights(weights, config)
                     if quantization is not None:
                         model_config.quantization = quantization
+                        # Bound the GPU work when materializing the stacked experts.
+                        layerwise_eval = True
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
                     from .models.deepseek_v4.language import make_quantization_config
@@ -689,6 +692,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         progress_callback=report.update if progress_callback is not None else None,
         declared_keys=declared_keys,
         is_offload_dir=(model_path / "offload_index.json").exists(),
+        layerwise_eval=layerwise_eval,
         **kwargs,
     )
 
@@ -704,6 +708,7 @@ def load_model_weights(
     strict: bool = True,
     declared_keys: Optional[set] = None,
     is_offload_dir: bool = False,
+    layerwise_eval: bool = False,
     **kwargs,
 ) -> nn.Module:
     """Install prepared weights, applying module quantization but no sanitization.
@@ -817,7 +822,11 @@ def load_model_weights(
         )
 
     if not lazy:
-        evaluate_model(model, report.update if progress_callback is not None else None)
+        evaluate_model(
+            model,
+            report.update if progress_callback is not None else None,
+            layerwise=layerwise_eval,
+        )
 
     model.model_path = model_path
     model.eval()

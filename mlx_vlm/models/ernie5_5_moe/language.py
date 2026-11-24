@@ -24,7 +24,13 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import CacheList, KVCache, PoolingCache, RotatingKVCache
-from ..deepseek_v4.hyper_connection import HyperHead, _hc_split_sinkhorn_ops, hc_expand
+from ..deepseek_v4.hyper_connection import (
+    HyperHead,
+    _hc_kernel,
+    _hc_ops,
+    _hc_sinkhorn_collapse_kernel,
+    hc_expand,
+)
 from ..deepseek_v4.language import (
     CompressedAttention,
     Compressor,
@@ -44,6 +50,15 @@ def _parallel_output(projection, x, group):
     return mx.distributed.all_sum(out, group=group).astype(x.dtype)
 
 
+@mx.compile
+def _situ(up, gate, beta, linear_beta):
+    dtype = gate.dtype
+    gate, up = gate.astype(mx.float32), up.astype(mx.float32)
+    gate = beta * mx.tanh(gate / beta) * mx.sigmoid(gate)
+    up = linear_beta * mx.tanh(up / linear_beta)
+    return (gate * up).astype(dtype)
+
+
 class SiTU(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -52,11 +67,9 @@ class SiTU(nn.Module):
         self.output_dtype = None
 
     def __call__(self, up, gate):
-        dtype = gate.dtype
-        gate, up = gate.astype(mx.float32), up.astype(mx.float32)
-        gate = self.beta * mx.tanh(gate / self.beta) * mx.sigmoid(gate)
-        up = self.linear_beta * mx.tanh(up / self.linear_beta)
-        return (gate * up).astype(dtype).astype(self.output_dtype or dtype)
+        return _situ(up, gate, self.beta, self.linear_beta).astype(
+            self.output_dtype or gate.dtype
+        )
 
 
 class MLP(nn.Module):
@@ -159,11 +172,24 @@ class HyperConnection(nn.Module):
         mixes = (flat @ self.fn.astype(mx.float32).T) / (
             mx.sqrt(mx.mean(flat * flat, axis=-1, keepdims=True)) + self.norm_eps
         )
-        pre, post, comb = _hc_split_sinkhorn_ops(
-            mixes, self.scale, self.base, self.mult, self.iters, self.eps
+        use_kernel = (
+            not self.training
+            and self.mult == 4
+            and self.eps == 1e-6
+            and _hc_sinkhorn_collapse_kernel is not None
+            and mx.default_device() == mx.gpu
         )
-        collapsed = (pre[..., None] * x.astype(mx.float32)).sum(axis=-2).astype(x.dtype)
-        return collapsed, post, comb
+        collapse = _hc_kernel if use_kernel else _hc_ops
+        return collapse(
+            x,
+            flat.reshape(x.shape),
+            mixes,
+            self.scale,
+            self.base,
+            self.mult,
+            self.iters,
+            self.eps,
+        )
 
 
 class VirtualHeads(nn.Module):

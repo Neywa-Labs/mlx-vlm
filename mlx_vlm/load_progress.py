@@ -48,35 +48,41 @@ class LoadingProgress:
             self.callback(self.snapshot.copy())
 
 
-def evaluate_model(model, progress_callback=None, *, clear_cache=False):
+def evaluate_model(
+    model, progress_callback=None, *, clear_cache=False, layerwise=False
+):
     """Materialize parameters, counting layers only after their evaluation ends.
 
-    Without an observer, preserve the ordinary whole-model evaluation path.
+    Use one evaluation by default. Observers and loaders that need to
+    bound GPU work can evaluate one decoder layer at a time.
     Remaining parameters include any vision/audio/projector modules.
     """
-    if progress_callback is None:
+    if progress_callback is None and not layerwise:
         mx.eval(model.parameters())
         return
 
     language_model = getattr(model, "language_model", model)
     layers = getattr(language_model, "layers", [])
-    progress_callback(
-        {
-            "stage": "evaluating_layers",
-            "completed_layers": 0,
-            "total_layers": len(layers),
-        }
-    )
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "evaluating_layers",
+                "completed_layers": 0,
+                "total_layers": len(layers),
+            }
+        )
     for index, layer in enumerate(layers):
         mx.eval(layer.parameters())
         if clear_cache:
             mx.clear_cache()
-        progress_callback(
-            {
-                "stage": "evaluating_layers",
-                "completed_layers": index + 1,
-                "total_layers": len(layers),
-            }
-        )
-    progress_callback({"stage": "evaluating_remaining_parameters"})
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "evaluating_layers",
+                    "completed_layers": index + 1,
+                    "total_layers": len(layers),
+                }
+            )
+    if progress_callback is not None:
+        progress_callback({"stage": "evaluating_remaining_parameters"})
     mx.eval(model.parameters())
