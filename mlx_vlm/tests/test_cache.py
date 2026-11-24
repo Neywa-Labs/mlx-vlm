@@ -1080,6 +1080,40 @@ def test_qwen3_5_padding_mask_follows_in_place_updates(factory, trigger):
     assert qwen3_5._qwen3_5_left_padding_info(cache) == ((0, 3), 3)
 
 
+def test_batch_rotating_wrapped_multi_token_matches_single_row():
+    # A left-padded row whose window wrapped in place must attend to the same
+    # keys as the row alone when it then takes multi-token updates.
+    window, pad = 8, 6
+    mx.random.seed(0)
+    chunks = [7, 1, 1, 1, 3, 1, 3]
+    total = sum(chunks)
+    k, v, q = (mx.random.normal((2, 1, total, 4)) for _ in range(3))
+    batch = BatchRotatingKVCache(max_size=window, left_padding=[pad, 0])
+    alone = RotatingKVCache(max_size=window)
+    start = 0
+    for n in chunks:
+        mask = batch.make_mask(n, return_array=True)
+        bk, bv = batch.update_and_fetch(
+            k[:, :, start : start + n], v[:, :, start : start + n]
+        )
+        out = mx.fast.scaled_dot_product_attention(
+            q[:, :, start : start + n], bk, bv, scale=1.0, mask=mask
+        )
+        lo = max(start, pad)
+        if start + n > lo:
+            amask = alone.make_mask(
+                start + n - lo, return_array=True, window_size=window
+            )
+            ak, av = alone.update_and_fetch(
+                k[:1, :, lo : start + n], v[:1, :, lo : start + n]
+            )
+            ref = mx.fast.scaled_dot_product_attention(
+                q[:1, :, lo : start + n], ak, av, scale=1.0, mask=amask
+            )
+            assert mx.allclose(out[:1, :, lo - start :], ref, atol=1e-3).item(), start
+        start += n
+
+
 @pytest.mark.parametrize("window", [4, 8, 16])
 @pytest.mark.parametrize("prefix_length", [0, 3, 8, 20])
 @pytest.mark.parametrize("parts", [(3, 1), (1, 1, 1, 1)])
