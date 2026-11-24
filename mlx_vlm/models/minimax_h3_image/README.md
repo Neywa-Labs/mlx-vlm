@@ -106,6 +106,29 @@ The standalone class also accepts `max_tokens` (4096 by default, including
 thinking) and `reasoning_effort` (`xhigh`, `medium`, or `low`). Truncated or
 invalid answers raise an error before image generation starts.
 
+## Progress
+
+Pass `progress_callback` to follow a generation, for example to show progress
+in a server or UI. It is called as `callback(stage, completed, total)` after
+each unit of work has finished evaluating:
+
+| Stage | Units |
+| --- | --- |
+| `cache_adaln` | AdaLN projections for the fixed schedule. They are built on the first request after loading; later requests report the stage as already complete. |
+| `denoise` | The six denoising steps, starting with `0` before the first step. |
+| `decode` | VAE decoding: `0` before, `1` after. |
+
+```python
+def progress(stage, completed, total):
+    print(f"{stage}: {completed}/{total}")
+
+result = generate_image(model, "A red ceramic teapot", progress_callback=progress)
+```
+
+`ImageGenerationRequest` and `ImageEditRequest` carry the same field. The
+callback runs on the thread that runs the model, so keep it short; hand work
+to another thread or event loop instead of blocking it.
+
 ## Settings
 
 - Sampling is fixed at **6 steps, guidance 1**. Other values and negative

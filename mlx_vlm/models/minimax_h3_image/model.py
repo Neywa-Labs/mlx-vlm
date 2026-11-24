@@ -107,6 +107,7 @@ class MiniMaxH3ImageGenerationModel(ImageGenerationModel):
             guidance=guidance,
             width=width,
             height=height,
+            progress_callback=request.progress_callback,
             **request.extra,
         )
         return ImageGenerationResult(

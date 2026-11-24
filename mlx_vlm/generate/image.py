@@ -5,7 +5,7 @@ import importlib
 import json
 import random
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from io import BytesIO
@@ -54,6 +54,9 @@ ImageTask = Literal["generate", "edit"]
 ImageArrayLayout = Literal["HWC"]
 ImageArrayRange = Literal["uint8_0_255"]
 ImageColorSpace = Literal["RGB", "RGBA"]
+# ``(stage, completed, total)``. Stage names are model specific; each stage
+# counts its own units of work (for example denoising steps).
+ImageProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass(slots=True)
@@ -66,6 +69,7 @@ class ImageGenerationRequest:
     guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+    progress_callback: ImageProgressCallback | None = None
 
     def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
         return default if self.steps is None else self.steps
@@ -609,6 +613,7 @@ def _request_from_prompt(prompt: str, **kwargs: Any) -> ImageGenerationRequest:
         "guidance",
         "output_format",
         "extra",
+        "progress_callback",
     }
     request_kwargs = {key: value for key, value in kwargs.items() if key in supported}
     extra = dict(request_kwargs.pop("extra", {}) or {})
@@ -617,6 +622,17 @@ def _request_from_prompt(prompt: str, **kwargs: Any) -> ImageGenerationRequest:
             extra[key] = value
     request_kwargs["extra"] = extra
     return ImageGenerationRequest(prompt=prompt, **request_kwargs)
+
+
+def _merge_request_kwargs(request: Any, kwargs: dict[str, Any]) -> Any:
+    """Fold call-site keyword options into an existing request object."""
+    kwargs = dict(kwargs)
+    callback = kwargs.pop("progress_callback", None)
+    extra = dict(request.extra)
+    extra.update({key: value for key, value in kwargs.items() if value is not None})
+    if callback is None:
+        return replace(request, extra=extra)
+    return replace(request, extra=extra, progress_callback=callback)
 
 
 def generate_image(
@@ -647,6 +663,7 @@ def generate_image(
                 guidance=request.guidance,
                 output_format=request.output_format,
                 extra=dict(request.extra),
+                progress_callback=request.progress_callback,
             )
         return edit_image(
             model,
@@ -659,9 +676,7 @@ def generate_image(
     if isinstance(request, str):
         request = _request_from_prompt(request, **kwargs)
     elif kwargs:
-        extra = dict(request.extra)
-        extra.update({key: value for key, value in kwargs.items() if value is not None})
-        request = replace(request, extra=extra)
+        request = _merge_request_kwargs(request, kwargs)
 
     if request.seed is None:
         request = replace(request, seed=random.randrange(2**32))

@@ -510,6 +510,102 @@ def test_native_edit_presentation_and_frozen_reference_rows(monkeypatch):
         assert_array_equal(np.array(indices), [0] * 11 + [1] * 8 + [0] * 4)
 
 
+def test_progress_callback_reports_evaluated_stages():
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return [12]
+
+    pipeline = MiniMaxH3ImagePipeline(
+        "/synthetic", evict_text_encoder=False, upsample_prompt=False
+    )
+    pipeline._conditioner = SimpleNamespace(
+        tokenizer=Tokenizer(),
+        _encode=lambda ids, tags, **kwargs: SimpleNamespace(
+            hidden_states=mx.ones((1, len(ids), 32)) * 0.01
+        ),
+    )
+    transformer = MiniMaxH3ImageTransformer(_transformer_config())
+    forwards = []
+
+    class CountingTransformer:
+        def __getattr__(self, name):
+            return getattr(transformer, name)
+
+        def __call__(self, *args):
+            forwards.append(args[8])
+            return transformer(*args)
+
+    pipeline._transformer = CountingTransformer()
+    pipeline._vae = MiniMaxH3ImageVAE(_vae_config())
+    events = []
+
+    def progress(stage, completed, total):
+        events.append((stage, completed, total, len(forwards)))
+
+    options = dict(width=64, height=64, min_generation_area=1024)
+    first = pipeline.generate_array("a teapot", progress_callback=progress, **options)
+    cache_work = 6 * (len(transformer.transformer_blocks) + 1)
+    cache = [event for event in events if event[0] == "cache_adaln"]
+    assert [event[1] for event in cache] == list(range(cache_work + 1))
+    assert {event[2] for event in cache} == {cache_work}
+    # Each denoising step is reported after that step's forward pass.
+    assert [event for event in events if event[0] == "denoise"] == [
+        ("denoise", step, 6, step) for step in range(7)
+    ]
+    assert events[-2:] == [("decode", 0, 1, 6), ("decode", 1, 1, 6)]
+    assert [event[0] for event in events] == (
+        ["cache_adaln"] * (cache_work + 1) + ["denoise"] * 7 + ["decode"] * 2
+    )
+
+    events.clear()
+    second = pipeline.generate_array("a teapot", progress_callback=progress, **options)
+    assert events[0] == ("cache_adaln", cache_work, cache_work, 6)
+    assert [event[0] for event in events[1:]] == ["denoise"] * 7 + ["decode"] * 2
+    assert_array_equal(np.array(first), np.array(second))
+    assert_array_equal(
+        np.array(first), np.array(pipeline.generate_array("a teapot", **options))
+    )
+
+
+def test_requests_forward_the_progress_callback(tmp_path):
+    pipeline = SimpleNamespace(
+        model_path=tmp_path,
+        prompt_tokens=1,
+        generate_array=Mock(return_value=mx.zeros((32, 32, 3), mx.uint8)),
+    )
+    model = MiniMaxH3ImageGenerationModel(pipeline, "synthetic")
+
+    def callback(stage, completed, total):
+        pass
+
+    def forwarded():
+        kwargs = pipeline.generate_array.call_args.kwargs
+        return kwargs["progress_callback"]
+
+    model.generate(ImageGenerationRequest("a teapot", progress_callback=callback))
+    assert forwarded() is callback
+    model.generate(ImageGenerationRequest("a teapot"))
+    assert forwarded() is None
+    generate_image(model, "a teapot", seed=1, progress_callback=callback)
+    assert forwarded() is callback
+    generate_image(
+        model, ImageGenerationRequest("a teapot", seed=1), progress_callback=callback
+    )
+    assert forwarded() is callback
+    assert "progress_callback" not in pipeline.generate_array.call_args.kwargs.get(
+        "extra", {}
+    )
+    generate_image(
+        model,
+        ImageGenerationRequest("a teapot", seed=1, progress_callback=callback),
+        task="edit",
+        image_paths=["one.png"],
+    )
+    assert forwarded() is callback
+    model.edit(ImageEditRequest("blue", ("one.png",), progress_callback=callback))
+    assert forwarded() is callback
+
+
 @pytest.mark.parametrize("quantize", [False, True])
 def test_conversion_strict_reload_and_generation(tmp_path, quantize):
     source, converted = tmp_path / "source", tmp_path / "mlx"

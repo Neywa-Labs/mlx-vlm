@@ -13,7 +13,9 @@ from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_STEPS,
     ImageGenerationResult,
+    ImageProgressCallback,
     _local_image_model_types,
+    _merge_request_kwargs,
     _model_type_from_id,
     _normalize_model_type,
     _resolve_image_model_path,
@@ -32,6 +34,7 @@ class ImageEditRequest:
     guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+    progress_callback: ImageProgressCallback | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.image_paths, (str, Path)):
@@ -204,6 +207,7 @@ def _request_from_prompt(
         "guidance",
         "output_format",
         "extra",
+        "progress_callback",
     }
     request_kwargs = {key: value for key, value in kwargs.items() if key in supported}
     extra = dict(request_kwargs.pop("extra", {}) or {})
@@ -229,9 +233,7 @@ def edit_image(
             raise ValueError("image_paths are required when request is a prompt string")
         request = _request_from_prompt(request, image_paths=image_paths, **kwargs)
     elif kwargs:
-        extra = dict(request.extra)
-        extra.update({key: value for key, value in kwargs.items() if value is not None})
-        request = replace(request, extra=extra)
+        request = _merge_request_kwargs(request, kwargs)
 
     if not request.image_paths:
         raise ValueError("At least one reference image path is required")
