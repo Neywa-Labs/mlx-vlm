@@ -7706,11 +7706,12 @@ class TestGemma4PerLayerConfig:
         assert (sliding.head_dim, sliding.n_kv_heads) == (8, 4)
 
 
-def make_inkling2_model(family):
+def make_inkling2_model(family, **text_config):
     from mlx_vlm.models.inkling2 import Model, ModelConfig
 
     mx.random.seed(194)
     config = model_case("inkling2")["config"]
+    config["text_config"].update(text_config)
     if family == "mini":
         config.update(
             model_type="inkling2_loop",
@@ -8037,6 +8038,53 @@ def test_inkling2_cached_chunks_and_speculative_rollback(
     np.testing.assert_allclose(
         np.array(actual), np.array(reference[:, 5:6]), atol=tolerance, rtol=tolerance
     )
+
+
+@pytest.mark.parametrize("padding", [None, 0, 3])
+def test_inkling2_split_k_decode_matches_masked_attention(monkeypatch, padding):
+    from mlx_vlm.models.inkling2 import kernels, language
+
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        pytest.skip("Requires Metal")
+    # The kernel needs a head_dim multiple of 32. With 600 tokens the global
+    # caches span two 512-key blocks and pass the 4-key relative extent.
+    model = make_inkling2_model("mini", head_dim=32)
+    for layer in model.layers:
+        layer.mlp.e_score_correction_bias = mx.arange(4, dtype=mx.float32)
+    model.update(tree_map(lambda a: a.astype(mx.bfloat16), model.parameters()))
+    lm = model.language_model
+    ids = (mx.arange(600) * 7 % 61 + 1)[None]
+    calls = []
+    decode_attention = kernels.decode_attention
+
+    def counted(*args, **kwargs):
+        out = decode_attention(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(kernels, "decode_attention", counted)
+
+    def decode(min_keys):
+        monkeypatch.setattr(language, "_DECODE_KERNEL_MIN_KEYS", min_keys)
+        prompt = ids[:, :-4]
+        if padding is None:
+            cache = lm.make_cache()
+        else:
+            # The server's one-row batch caches, with the row's left padding.
+            cache = _make_cache(lm, [padding])
+            prompt = mx.concatenate([mx.zeros((1, padding), mx.int32), prompt], 1)
+        lm(prompt, cache=cache)
+        steps = [lm(ids[:, i : i + 1], cache=cache).logits for i in range(596, 600)]
+        return mx.concatenate(steps, axis=1)
+
+    expected = decode(1 << 30)
+    assert not calls
+    actual = decode(512)
+    # Layer 1 (three core passes) and layer 3 are global: four visits a step.
+    assert calls == [True] * 16
+    # The paths round BF16 differently (up to ~0.02 here); attending the
+    # padding would move the logits by ~0.06.
+    np.testing.assert_allclose(np.array(actual), np.array(expected), atol=3e-2, rtol=0)
 
 
 @pytest.mark.parametrize("inkling2_model", ["mini"], indirect=True)
