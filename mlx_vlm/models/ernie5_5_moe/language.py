@@ -20,6 +20,7 @@ from ...speculative.cache_state import (
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import CacheList, KVCache, PoolingCache, RotatingKVCache
@@ -501,22 +502,36 @@ class LanguageModel(nn.Module):
 
     def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
         hidden_sink = [] if kwargs.get("return_hidden", False) else None
-        h = self.model(inputs, cache, inputs_embeds, hidden_sink=hidden_sink)
+        skip_logits = kwargs.get("skip_logits", False)
+        h = self.model(
+            inputs,
+            cache,
+            inputs_embeds,
+            hidden_sink=hidden_sink,
+            skip_final_norm=skip_logits,
+        )
         # The upstream model computes the vocabulary projection and MultiMax
         # in fp32, independently of the backbone dtype.
-        logits = self.lm_head(h.astype(mx.float32))
+        logits = (
+            None
+            if skip_logits
+            else project_logits(h, self._project_logits, kwargs.get("logits_to_keep"))
+        )
         return LanguageModelOutput(
-            logits=self.multimax(logits),
+            logits=logits,
             hidden_states=hidden_sink,
             shared_kv_states={} if kwargs.get("return_shared_kv", False) else None,
         )
+
+    def _project_logits(self, hidden):
+        return self.multimax(self.lm_head(hidden.astype(mx.float32)))
 
     def speculative_logits_from_hidden(self, hidden):
         h = hidden.reshape(
             *hidden.shape[:2], self.config.hc_mult, self.config.hidden_size
         )
         h = self.model.norm(self.model.hc_head(h))
-        return self.multimax(self.lm_head(h.astype(mx.float32)))
+        return self._project_logits(h)
 
     def speculative_verify_hidden(self, inputs, cache):
         transaction = start_speculative_cache(cache, inputs.shape[1])
@@ -680,8 +695,10 @@ class LanguageModel(nn.Module):
             }
             for src, dst in remap.items():
                 key = key.replace(src, dst)
-            if key.endswith(".attn.linear_o_group_proj"):
-                key = key.replace(".linear_o_group_proj", ".wo_a.weight")
+            if ".attn.linear_o_group_proj" in key:
+                if key.endswith(".linear_o_group_proj"):
+                    key += ".weight"
+                key = key.replace(".linear_o_group_proj.", ".wo_a.")
                 value = value.reshape(self.config.o_groups, self.config.o_lora_rank, -1)
             for src, dst in (
                 ("w1", "gate_proj"),

@@ -926,7 +926,11 @@ def get_chat_template(
 
     try:
         template_processor = None
-        if (
+        if callable(getattr(processor, "render_chat", None)) and callable(
+            getattr(processor, "encode_segments", None)
+        ):
+            template_processor = processor
+        elif (
             processor is not None
             and hasattr(processor, "apply_chat_template")
             and (

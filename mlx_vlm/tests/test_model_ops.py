@@ -1676,6 +1676,79 @@ def test_block_fp8_checkpoint_sanitization(family):
     assert mx.array_equal(model.sanitize(dict(sanitized))[output_key], expected).item()
 
 
+def test_ernie55_preview_keeps_native_mxfp4_and_block_fp8_values():
+    from mlx_vlm.models.ernie5_5_moe.ernie5_5_moe import prepare_preview_weights
+
+    expert = "model.layers.1.block_sparse_moe.experts.0.w1"
+    output = "model.layers.0.self_attn.linear_o_group_proj"
+    expert_weight = mx.arange(64, dtype=mx.uint8).reshape(2, 32)
+    expert_scales = mx.full((2, 2), 127, dtype=mx.uint8)
+    output_weight = mx.full((130, 160), 56, dtype=mx.uint8)
+    output_scales = mx.array([[1.0, 0.5], [2.0, 4.0]])
+    raw = {
+        expert + ".weight": expert_weight.view(mx.int8),
+        expert + ".weight_scale_inv": expert_scales,
+        output: output_weight,
+        output + "_scale_inv": output_scales,
+        "model.mtp.feature_projection.weight": mx.zeros((1,)),
+    }
+    weights, quantization = prepare_preview_weights(
+        raw, {"quantization_config": {"expert_dtype": "mxfp4"}}
+    )
+    assert mx.array_equal(weights[expert + ".weight"].view(mx.uint8), expert_weight)
+    assert mx.array_equal(weights[expert + ".scales"], expert_scales)
+    assert mx.array_equal(weights[output + ".weight"].view(mx.uint8), output_weight)
+    scales = weights[output + ".scales"]
+    assert scales.shape == (130, 5)
+    assert scales[0].tolist() == [127, 127, 127, 127, 126]
+    assert scales[-1].tolist() == [128, 128, 128, 128, 129]
+    assert quantization["mode"] == "mxfp8"
+    path = "language_model.model.layers.1.ffn.switch_mlp.gate_proj"
+    assert quantization[path] == {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    assert not any(key.startswith("model.mtp.") for key in weights)
+
+
+def test_ernie55_preview_loads_mixed_weights_strictly(tmp_path):
+    from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+    from mlx_vlm.tests.test_models import model_case
+    from mlx_vlm.utils import load_model
+
+    config = dict(model_case("ernie5_5_moe")["config"])
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "expert_dtype": "mxfp4",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    model = Model(ModelConfig.from_dict(config))
+    weights = dict(tree_flatten(model.language_model.parameters()))
+    prefix = "model.layers.1.ffn"
+    for projection, name in (
+        ("gate_proj", "w1"),
+        ("down_proj", "w2"),
+        ("up_proj", "w3"),
+    ):
+        original = weights.pop(f"{prefix}.switch_mlp.{projection}.weight")
+        packed, scales = mx.quantize(original, mode="mxfp4")
+        for i in range(config["n_routed_experts"]):
+            expert = f"{prefix}.experts.{i}.{name}.weight"
+            weights[expert] = packed[i].view(mx.int8)
+            weights[expert + "_scale_inv"] = scales[i]
+    weights["model.layers.0.mlp.up_proj.weight"] = mx.full(
+        (config["intermediate_size"], config["hidden_size"]), 56, dtype=mx.uint8
+    )
+    weights["model.layers.0.mlp.up_proj.weight_scale_inv"] = mx.ones((1, 1))
+    weights.pop("model.layers.0.ffn.up_proj.weight")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded = load_model(tmp_path)
+    layers = loaded.language_model.layers
+    assert layers[0].ffn.up_proj.mode == "mxfp8"
+    assert layers[1].ffn.switch_mlp.gate_proj.mode == "mxfp4"
+    result = loaded(mx.array([[3, 4]]), cache=loaded.make_cache())
+    assert mx.all(mx.isfinite(result.logits)).item()
+
+
 def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     weight, scale_inv = _source_fp8_pair()
     restored = _dequantize_fp8_weight(weight, scale_inv)

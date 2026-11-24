@@ -59,6 +59,7 @@ class ModelConfig(BaseModelConfig):
     bos_token_id: Optional[int] = 1
     eos_token_id: Optional[Union[int, List[int]]] = 2
     pad_token_id: Optional[int] = 0
+    quantization: Optional[Dict] = None
 
     def __post_init__(self):
         if not self.compress_ratios:

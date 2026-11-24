@@ -608,6 +608,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .fp8 import transform_fp8_weights
 
                 weights, quantization = transform_fp8_weights(weights, config)
+                if quantization is None and config.get("model_type") == "ernie5_5_moe":
+                    from .models.ernie5_5_moe.ernie5_5_moe import (
+                        prepare_preview_weights,
+                    )
+
+                    weights, quantization = prepare_preview_weights(weights, config)
+                    if quantization is not None:
+                        model_config.quantization = quantization
                 # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
                 if quantization is None and config.get("model_type") == "deepseek_v4":
                     from .models.deepseek_v4.language import make_quantization_config
@@ -1121,7 +1129,13 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    config = load_config(model_path)
+    if config.get("model_type") == "ernie5_5_moe":
+        from .models.ernie5_5_moe.processing_ernie5_5_moe import Ernie55Processor
+
+        processor = Ernie55Processor.from_pretrained(model_path, **kwargs)
+    else:
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -1155,6 +1169,12 @@ def fetch_from_hub(
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
     model = load_model(model_path, lazy, **kwargs)
     config = load_config(model_path, **kwargs)
+    if (
+        config.get("model_type") == "ernie5_5_moe"
+        and "quantization" not in config
+        and (native_quantization := getattr(model.config, "quantization", None))
+    ):
+        config["quantization"] = config["quantization_config"] = native_quantization
     if (
         "quantization" not in config
         and hasattr(model, "quantization_from_metadata")

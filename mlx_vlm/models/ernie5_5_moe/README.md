@@ -1,4 +1,25 @@
-# ERNIE 5.5 Flash Base
+# ERNIE 5.5 Flash
+
+[ERNIE 5.5 Flash Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview)
+loads with its native MXFP4 routed expert weights and MXFP8 dense projections.
+Use the checkpoint's Python chat tokenizer with an explicit
+`trust_remote_code=True`. The released Preview draft weights use DSpark.
+The ordinary AR path works independently of the draft weights.
+
+```python
+import mlx.core as mx
+from mlx_vlm import generate, load
+
+model, tokenizer = load(
+    "baidu/ERNIE-5.5-Flash-Preview", trust_remote_code=True
+)
+chat = [{"role": "user", "content": "What is 2 + 2?"}]
+prompt = tokenizer.render_chat(chat, add_generation_prompt=True, enable_thinking=False)
+ids = tokenizer.encode_segments(prompt.segments)
+generate(model, tokenizer, "", input_ids=mx.array([ids]), max_tokens=128)
+```
+
+## ERNIE 5.5 Flash Base
 
 MLX support for [baidu/ERNIE-5.5-Flash-Base](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base). This is a text completion model; use plain prompts rather than chat messages.
 
