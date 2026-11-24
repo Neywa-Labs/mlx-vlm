@@ -7836,6 +7836,29 @@ def _inkling2_native_weights(model):
     return weights
 
 
+def test_inkling2_legacy_mlx_loop_weights():
+    model = make_inkling2_model("mini")
+    expected = dict(tree_flatten(model.parameters()))
+    legacy = expected.copy()
+    legacy["language_model.model.message_input.query"] = legacy.pop(
+        "language_model.model.message_queries"
+    )
+    layer = "language_model.model.layers.1"
+    for gate, controller in (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp")):
+        for projection, weight in (
+            ("down_proj", "down_weight"),
+            ("forget_gate_proj", "forget_weight"),
+            ("message_gate_proj", "gain_weight"),
+        ):
+            legacy[f"{layer}.{gate}_message_gate.{projection}.weight"] = legacy.pop(
+                f"{layer}.controllers.{controller}.{weight}"
+            )
+
+    sanitized = model.sanitize(legacy)
+    assert sanitized.keys() == expected.keys()
+    assert all(sanitized[key] is value for key, value in expected.items())
+
+
 @pytest.mark.parametrize("inkling2_model", ["small", "mini"], indirect=True)
 def test_inkling2_native_checkpoint_and_mixed_quantization(inkling2_model, tmp_path):
     from mlx_vlm.convert import convert

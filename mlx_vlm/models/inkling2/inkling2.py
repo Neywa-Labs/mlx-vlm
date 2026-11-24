@@ -1,3 +1,5 @@
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -180,6 +182,22 @@ class Model(nn.Module):
                 out["vision_tower." + sub] = value
             elif key.startswith("model.mtp.") or key.startswith("mtp."):
                 continue
+            elif key == "language_model.model.message_input.query":
+                out["language_model.model.message_queries"] = value
+            elif match := re.fullmatch(
+                r"(language_model\.model\.layers\.\d+)\.(q|k|v|mlp)_message_gate\."
+                r"(down_proj|forget_gate_proj|message_gate_proj)\.weight",
+                key,
+            ):
+                # Early MLX exports used a Linear module for each controller weight.
+                layer, gate, projection = match.groups()
+                controller = "attn" if gate == "q" else gate
+                weight = {
+                    "down_proj": "down_weight",
+                    "forget_gate_proj": "forget_weight",
+                    "message_gate_proj": "gain_weight",
+                }[projection]
+                out[f"{layer}.controllers.{controller}.{weight}"] = value
             else:
                 out[key] = value
         for layer, tensors in experts.items():
