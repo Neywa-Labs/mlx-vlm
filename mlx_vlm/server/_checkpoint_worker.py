@@ -71,7 +71,7 @@ def physical_id():
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def copy_chunks(group, command, report):
+def copy_chunks(group, command, report, *, reused_signatures=None):
     import mlx.core as mx
     import numpy as np
 
@@ -168,6 +168,16 @@ def copy_chunks(group, command, report):
 
                 for name, record in manifest["files"].items():
                     path = store.safe_path(root, name)
+                    if name in (reused_signatures or {}):
+                        if (
+                            command["missing"][name]
+                            or store.signature(path) != reused_signatures[name]
+                        ):
+                            raise ValueError(
+                                "Reused checkpoint changed before transfer"
+                            )
+                        signatures[name] = reused_signatures[name]
+                        continue
                     path.parent.mkdir(parents=True, exist_ok=True)
                     with path.open(
                         "r+b" if path.exists() else "xb", buffering=0
@@ -664,6 +674,7 @@ def main():
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     if pipeline is not None:
                         partial = current.writable_partial(None)
+                        current.seed_partial(layout["files"], layout["chunk_bytes"])
                         emit(
                             "result",
                             id=request,
@@ -706,7 +717,14 @@ def main():
                         or str(current.partial(command["manifest"])) != command["path"]
                     ):
                         raise ValueError("No matching checkpoint transaction")
-                    signatures = copy_chunks(group, command, report)
+                    signatures = copy_chunks(
+                        group,
+                        command,
+                        report,
+                        reused_signatures=(
+                            current.reused_signatures if op == "receive" else None
+                        ),
+                    )
                 elif op == "commit":
                     if lock is None or signatures is None:
                         raise ValueError("No verified transfer to commit")

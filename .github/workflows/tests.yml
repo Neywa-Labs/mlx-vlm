@@ -86,6 +86,7 @@ jobs:
             os: ubuntu-24.04
             extras: 'test,cpu'
             tests: >-
+              tests/test_checkpoint_metadata_reuse.py
               tests/test_checkpoint_transfer.py
               tests/test_evals.py
               tests/test_cli.py

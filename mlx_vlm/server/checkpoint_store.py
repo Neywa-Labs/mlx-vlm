@@ -225,6 +225,74 @@ class SnapshotStore:
         if partial_id is not None and not re.fullmatch(r"[a-f0-9]{64}", partial_id):
             raise ValueError("Invalid checkpoint transaction ID")
         self.partial_id = partial_id
+        self.reused_signatures = {}
+
+    def reusable_files(self, files, chunk):
+        """Locate content in unchanged sealed snapshots, never by filename alone."""
+        wanted = {
+            (r.get("sha256") or r.get("expected_sha256"), r["size"])
+            for r in files.values()
+        }
+        found = {}
+        for receipt in sorted(self.receipts.glob("*.json")):
+            if not re.fullmatch(r"[a-f0-9]{64}", receipt.stem):
+                continue
+            try:
+                saved = json.loads(receipt.read_text())
+                manifest = validate(saved["manifest"])
+                if (
+                    snapshot_id(manifest) != receipt.stem
+                    or manifest["chunk_bytes"] != chunk
+                ):
+                    continue
+                matches = {
+                    n: r
+                    for n, r in manifest["files"].items()
+                    if (r["sha256"], r["size"]) in wanted
+                }
+                final = self.root / receipt.stem
+                if not matches or saved["signature"] != tree_signature(final):
+                    continue
+                for name, record in matches.items():
+                    found[(record["sha256"], record["size"])] = (
+                        safe_path(final, name),
+                        record,
+                        saved["signature"][name],
+                    )
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return found
+
+    def seed_partial(self, files, chunk, manifest=None, *, stop=None):
+        """Copy verified files into an independent transaction, using APFS COW."""
+        partial = self.partial(manifest)
+        # A terminated helper may leave its private copy unfinished. It is never
+        # evidence of verified bytes and must not obstruct the next publication.
+        for scratch in partial.rglob(".reuse-*"):
+            if re.fullmatch(r"\.reuse-[a-f0-9]{32}", scratch.name):
+                if not stat.S_ISREG(signature(scratch)[-1]):
+                    raise ValueError("Non-file checkpoint reuse scratch")
+                scratch.unlink()
+        donors = self.reusable_files(files, chunk)
+        self.reused_signatures = {}
+        for name, record in files.items():
+            cancelled(stop)
+            donor = donors.get(
+                (record.get("sha256") or record.get("expected_sha256"), record["size"])
+            )
+            if not donor or ("chunks" in record and record != donor[1]):
+                continue
+            target = safe_path(partial, name)
+            if target.exists() and not target.is_file():
+                raise ValueError("Non-file checkpoint target")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            scratch = target.with_name(".reuse-" + uuid.uuid4().hex)
+            try:
+                copy_verified_file(*donor, scratch, chunk, stop=stop)
+                os.replace(scratch, target)
+                self.reused_signatures[name] = signature(target)
+            finally:
+                scratch.unlink(missing_ok=True)
 
     def existing(self, manifest, *, stop=None, progress=None):
         digest = snapshot_id(manifest)
@@ -296,9 +364,18 @@ class SnapshotStore:
         """Resume checks actual partial bytes; a persisted bitmap alone is unsafe."""
         partial = self.partial(manifest)
         chunk = manifest["chunk_bytes"]
+        self.seed_partial(manifest["files"], chunk, manifest, stop=stop)
         missing, reused = {}, 0
         for name, record in manifest["files"].items():
             path = safe_path(partial, name)
+            if name in self.reused_signatures:
+                if signature(path) != self.reused_signatures[name]:
+                    raise ValueError("Reused checkpoint changed during verification")
+                missing[name] = []
+                reused += record["size"]
+                if progress:
+                    progress(record["size"])
+                continue
             indexes = []
             if path.exists() and not path.is_file():
                 raise ValueError("Non-file checkpoint target")
@@ -381,6 +458,35 @@ def _hub_sha256(path):
     return None
 
 
+def copy_verified_file(source, record, expected_signature, target, chunk, *, stop=None):
+    """Preserve the receipt's proof across an independent copy; never hard-link."""
+    if signature(source) != expected_signature:
+        raise ValueError("Verified checkpoint changed before reuse")
+    if not _clone(source, target):
+        with (
+            source.open("rb", buffering=0) as src,
+            target.open("xb", buffering=0) as dst,
+        ):
+            for expected in record["chunks"]:
+                cancelled(stop)
+                data = src.read(chunk)
+                if hashlib.sha256(data).hexdigest() != expected:
+                    raise ValueError("Checkpoint chunk checksum mismatch")
+                view = memoryview(data)
+                while view:
+                    count = dst.write(view)
+                    if not count:
+                        raise OSError("Short checkpoint write")
+                    view = view[count:]
+            flush_file(dst)
+    if (
+        signature(source) != expected_signature
+        or target.stat().st_size != record["size"]
+    ):
+        raise ValueError("Verified checkpoint changed during reuse")
+    target.chmod(0o600)
+
+
 def prepare_snapshot(
     source,
     names,
@@ -399,6 +505,7 @@ def prepare_snapshot(
     expected = {n: _hub_sha256((source / n).resolve()) for n in names}
     key = hashlib.sha256(str(source).encode()).hexdigest()
     index = store.receipts / ("source-" + key + ".json")
+    reusable = {}
     try:
         cached = json.loads(index.read_text())
         if (
@@ -412,20 +519,46 @@ def prepare_snapshot(
             final = store.existing(cached["manifest"], stop=stop)
             if final:
                 return final, cached["manifest"]
+        if cached["manifest"]["chunk_bytes"] == chunk:
+            unchanged = {
+                n: cached["manifest"]["files"][n]
+                for n in names
+                if cached["inputs"].get(n) == inputs[n]
+                and n in cached["manifest"]["files"]
+                and (
+                    not expected[n]
+                    or cached["manifest"]["files"][n]["sha256"] == expected[n]
+                )
+            }
+            donors = store.reusable_files(unchanged, chunk)
+            reusable = {
+                n: donors[(r["sha256"], r["size"])]
+                for n, r in unchanged.items()
+                if (r["sha256"], r["size"]) in donors
+                and donors[(r["sha256"], r["size"])][1] == r
+            }
     except (FileNotFoundError, KeyError, json.JSONDecodeError):
         pass
     temporary = private_directory(store.root / (".building-" + uuid.uuid4().hex))
-    read = 0
+    read = verified = 0
     verified_signatures = {}
     progress_lock, failed = threading.Lock(), threading.Event()
 
     def prepare_file(name):
-        nonlocal read
+        nonlocal read, verified
         cancelled(stop)
         cancelled(failed)
         src = (source / name).resolve()
         target = safe_path(temporary, name)
         target.parent.mkdir(parents=True, exist_ok=True)
+        if name in reusable:
+            copy_verified_file(*reusable[name], target, chunk, stop=stop)
+            verified_signatures[name] = signature(target)
+            with progress_lock:
+                verified += reusable[name][1]["size"]
+                if progress:
+                    progress(bytes_read=read, bytes_verified=verified)
+            return reusable[name][1]
         cloned = _clone(src, target)
         digest, chunks, pending = hashlib.sha256(), [], deque()
         output = None if cloned else target.open("xb", buffering=0)
@@ -449,8 +582,9 @@ def prepare_snapshot(
                     # totals even when several files complete chunks simultaneously.
                     with progress_lock:
                         read += len(data)
+                        verified += len(data)
                         if progress:
-                            progress(bytes_read=read, bytes_verified=read)
+                            progress(bytes_read=read, bytes_verified=verified)
             chunks.extend(f.result().hexdigest() for f in pending)
             if expected[name] and digest.hexdigest() != expected[name]:
                 raise ValueError(f"Hugging Face checksum mismatch: {name}")
@@ -472,7 +606,7 @@ def prepare_snapshot(
         }
 
     try:
-        if stream:
+        if stream and not reusable:
             # Clone privately before sending. On APFS this does not read the bytes;
             # other filesystems retain a bounded copy to isolate mutable sources.
             for name in names:
