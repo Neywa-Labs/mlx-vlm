@@ -2204,15 +2204,19 @@ def prepare_inputs(
             for prompt in prompts
         ]
 
-        # Find the maximum length for padding
+        # Find the maximum length for padding. Every split adds one image
+        # placeholder token, so keep all text chunks and count them all.
         max_length = max(
-            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+            sum(len(chunk) for chunk in chunks) + len(chunks) - 1
+            for chunks in text_chunks
         )
 
         # Pad and create input_ids
         input_ids = []
         for chunks in text_chunks:
-            ids = chunks[0] + [image_token_index] + chunks[1]
+            ids = list(chunks[0])
+            for chunk in chunks[1:]:
+                ids += [image_token_index] + list(chunk)
             padding = [processor.pad_token_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
