@@ -351,6 +351,7 @@ def _typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
     # Sum in float32: a float16/bfloat16 running sum stops growing once the
     # remaining probabilities are below its precision.
     f = logprobs.astype(mx.float32)
+    f = f - mx.logsumexp(f, axis=-1, keepdims=True)
     p = mx.exp(f)
     # Avoid 0 * -inf for masked tokens.
     ent = -mx.sum(mx.where(p > 0, p * f, 0.0), axis=-1, keepdims=True)

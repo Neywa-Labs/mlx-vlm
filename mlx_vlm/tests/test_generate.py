@@ -2530,6 +2530,15 @@ def typical_p_categorical_inputs(monkeypatch):
     return captured
 
 
+def test_sampler_typical_p_uses_remaining_mass(typical_p_categorical_inputs):
+    logprobs = mx.log(mx.array([[0.50, 0.30, 0.20]]))
+    sampler = sampling.make_sampler(temp=1.0, top_n_sigma=1.6, typical_p=0.6)
+
+    sampler(logprobs)
+    kept = mx.isfinite(typical_p_categorical_inputs[0])
+    assert kept.tolist() == [[True, False, False]]
+
+
 @pytest.mark.parametrize(
     "scores,masked_token,expected",
     [
