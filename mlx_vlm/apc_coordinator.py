@@ -45,17 +45,56 @@ class PrefillMemoryPlan:
         self.chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
         return self.reserve_bytes()
 
+    def _capacity(self) -> int:
+        # Prefixes and suffixes are padded separately; cold prefixes are zero.
+        return max(self.prefix_lengths) + max(
+            n - p for n, p in zip(self.lengths, self.prefix_lengths)
+        )
+
     def reserve_bytes(self, live_bytes: int = 0) -> int:
         if not self.lengths or not max(self.lengths):
             return 0
-        # Prefixes and suffixes are padded separately; cold prefixes are zero.
-        capacity = max(self.prefix_lengths) + max(
-            n - p for n, p in zip(self.lengths, self.prefix_lengths)
-        )
+        capacity = self._capacity()
         row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
         return self.extra_reserve_bytes + max(
             0, 2 * len(self.lengths) * row_bytes - live_bytes
         )
+
+    def remaining_reserve_bytes(self, prompt_cache, token_count) -> Optional[int]:
+        """What the planned prefill still allocates once a snapshot of
+        ``prompt_cache`` at ``token_count`` tokens is stored, or None for the
+        whole reserve (``reserve_bytes``).
+
+        With no update left (a finished prefill) only the merge reserve
+        remains. Otherwise dense K/V whose buffers already hold every planned
+        token (a restored prefix is allocated at prompt capacity) is written in
+        place; dense K/V that must still grow, and layouts without a known
+        profile, keep the whole reserve; sliding windows and recurrent state
+        allocate replacement buffers on each update, so those are kept."""
+        if not self.lengths or not max(self.lengths):
+            return 0
+        capacity = self._capacity()
+        if capacity <= token_count:
+            return self.extra_reserve_bytes
+        replacements = 0
+        for c in cache_memory_components(prompt_cache, token_count):
+            if c.fallback:
+                return None
+            if c.window_size is not None or not c.bytes_per_token:
+                # A replacement is allocated at the buffers' rounded capacity,
+                # or at what they hold already (a compaction keeps it).
+                replacements += max(
+                    c.source_bytes, c.footprint(capacity, self.chunk_size)
+                )
+            elif (
+                # Dense buffers grow by steps from wherever they were, so they
+                # need not be step-aligned: compare the tokens they hold,
+                # unrounded (half a token absorbs the per-row rounding).
+                replace(c, step=1).footprint(capacity, self.chunk_size) - c.source_bytes
+                > c.bytes_per_token / 2
+            ):
+                return None
+        return self.extra_reserve_bytes + replacements
 
     def observe(self, components, *, live_bytes: int) -> int:
         previous = self.components
@@ -385,12 +424,19 @@ class APCCoordinator:
             snapshot_prompt_cache_row,
         )
 
+        # Decide before making room evicts the checkpoint this one continues,
+        # and from the live buffers: a row snapshot loses their capacity.
+        prefill_reserve = self.manager.store_prefill_reserve(
+            token_ids, prompt_cache, extra_hash
+        )
         # Batch extraction can itself allocate a full row before store_exact_cache
         # decides whether it can afford another retained snapshot.
         if _prompt_cache_is_batch_shaped(prompt_cache):
             if self.manager.disk is not None:
                 self.manager.disk.flush()
-            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
+            if not self.manager._make_room(
+                _cache_nbytes(prompt_cache), prefill_reserve=prefill_reserve
+            ):
                 with self.manager.lock:
                     self.manager.stats.memory_skips += 1
                 return False
@@ -398,7 +444,7 @@ class APCCoordinator:
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids, snapshot, extra_hash=extra_hash, prefill_reserve=prefill_reserve
         )
 
     def commit(
