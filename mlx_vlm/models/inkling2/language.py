@@ -900,6 +900,7 @@ class LanguageModel(InklingLanguageModel):
         # fwd_output_dtype=float32. Promote the product before multiplication;
         # casting BF16 scores afterwards loses the accumulator's low bits.
         h = h.astype(self.model.embed_norm.weight.dtype).astype(mx.float32)
+        logits = None
         if (
             not self.training
             and type(self.lm_head) is nn.Linear
@@ -909,10 +910,13 @@ class LanguageModel(InklingLanguageModel):
             and mx.metal.is_available()
             and mx.default_device() == mx.gpu
         ):
-            # Retain the exact conversion instead of reading and promoting the
-            # entire vocabulary matrix again on every decode step. Whole output
-            # rows can be shared across the two expert ranks without splitting
-            # any dot product or changing its FP32 accumulation.
+            # FP32 products and sums read straight from the stored head in one
+            # kernel, instead of promoting the entire vocabulary matrix on every
+            # decode step or retaining an FP32 copy of it. Whole output rows can
+            # be shared across the two expert ranks without splitting any dot
+            # product or changing its FP32 accumulation.
+            from .kernels import head_logits
+
             weight = self.lm_head.weight
             group = self.sharding_group
             partition = (
@@ -921,21 +925,19 @@ class LanguageModel(InklingLanguageModel):
                 and weight.shape[0] % group.size() == 0
             )
             size, rank = (group.size(), group.rank()) if partition else (1, 0)
-            cached = self.get("_head_projection_cache")
-            if cached is None or cached[0] is not weight or cached[1:3] != (size, rank):
-                width = weight.shape[0] // size
-                projected = weight[rank * width : (rank + 1) * width].astype(mx.float32)
-                self._head_projection_cache = (weight, size, rank, projected)
-            projected = self._head_projection_cache[-1]
-            logits = h @ projected.T
-            if partition:
-                width = projected.shape[0]
+            width = weight.shape[0] // size
+            logits = head_logits(
+                h.reshape(-1, h.shape[-1]), weight[rank * width : (rank + 1) * width]
+            )
+            if logits is not None and partition:
                 logits = (
                     mx.distributed.all_gather(logits.reshape(1, -1, width), group=group)
                     .transpose(1, 0, 2)
                     .reshape(*h.shape[:-1], weight.shape[0])
                 )
-        else:
+            elif logits is not None:
+                logits = logits.reshape(*h.shape[:-1], width)
+        if logits is None:
             logits = self.lm_head(h)
         cap = self.config.final_logit_softcapping
         if cap:

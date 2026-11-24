@@ -186,3 +186,90 @@ def prepare_attention_heads(q, k, v, r, q_scale, r_scale, clip, rel_clip, eps):
         output_shapes=[q.shape, k.shape, v.shape, r.shape],
         output_dtypes=[mx.bfloat16] * 4,
     )
+
+
+# Rows of the head per simdgroup, and simdgroups per threadgroup.
+_HEAD_ROWS = 4
+_HEAD_SIMDGROUPS = 8
+
+
+@lru_cache(maxsize=1)
+def _head_logits_kernel():
+    return mx.fast.metal_kernel(
+        name="inkling2_head_fp32_logits",
+        input_names=["h", "w"],
+        output_names=["out"],
+        source=r"""
+        // Each simdgroup produces R logits for all M rows; lanes split K into
+        // 8-wide chunks. Products and sums are FP32.
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const int row0 = (int(threadgroup_position_in_grid.x) * SG + int(sg)) * R;
+        if (row0 >= N) return;
+        float acc[R][M];
+        for (int r = 0; r < R; ++r)
+            for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+        for (int c = lane; c < K / 8; c += 32) {
+            const int k = c * 8;
+            float wv[R][8];
+            for (int r = 0; r < R; ++r) {
+                const int row = min(row0 + r, N - 1);
+                auto wp = (const device vec<T, 4>*)(w + size_t(row) * K + k);
+                const vec<T, 4> a = wp[0], b = wp[1];
+                for (int j = 0; j < 4; ++j) {
+                    wv[r][j] = float(a[j]);
+                    wv[r][j + 4] = float(b[j]);
+                }
+            }
+            for (int m = 0; m < M; ++m) {
+                auto hp = (const device float4*)(h + m * K + k);
+                const float4 x0 = hp[0], x1 = hp[1];
+                for (int r = 0; r < R; ++r) {
+                    acc[r][m] += wv[r][0] * x0.x + wv[r][1] * x0.y + wv[r][2] * x0.z
+                        + wv[r][3] * x0.w + wv[r][4] * x1.x + wv[r][5] * x1.y
+                        + wv[r][6] * x1.z + wv[r][7] * x1.w;
+                }
+            }
+        }
+        for (int r = 0; r < R; ++r) {
+            for (int m = 0; m < M; ++m) {
+                const float total = simd_sum(acc[r][m]);
+                if (lane == 0 && row0 + r < N) out[size_t(m) * N + row0 + r] = total;
+            }
+        }
+        """,
+    )
+
+
+def head_logits(h, weight):
+    """FP32 logits (M, N) of rows h (M, K) against a head (N, K), or None.
+
+    Reads the head in its own dtype instead of an FP32 copy of it.
+    """
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        return None
+    m, k = h.shape
+    n = weight.shape[0]
+    if (
+        weight.ndim != 2
+        or weight.shape[1] != k
+        or k % 8
+        or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+    ):
+        return None
+    rows = _HEAD_ROWS * _HEAD_SIMDGROUPS
+    return _head_logits_kernel()(
+        inputs=[mx.contiguous(h.astype(mx.float32)), weight],
+        template=[
+            ("T", weight.dtype),
+            ("M", m),
+            ("K", k),
+            ("N", n),
+            ("R", _HEAD_ROWS),
+            ("SG", _HEAD_SIMDGROUPS),
+        ],
+        grid=((n + rows - 1) // rows * 32 * _HEAD_SIMDGROUPS, 1, 1),
+        threadgroup=(32 * _HEAD_SIMDGROUPS, 1, 1),
+        output_shapes=[(m, n)],
+        output_dtypes=[mx.float32],
+    )[0]

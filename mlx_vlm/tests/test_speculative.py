@@ -302,7 +302,10 @@ def test_inkling2_sconv_fuses_residual_and_preserves_rollback(
 
 
 @parametrize("rank", [None, 0, 1])
-def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch):
+@parametrize("rows", [(1, 1), (1, 9), (4, 3)])
+def test_inkling2_bf16_head_fp32_logits_and_reload(rank, rows, monkeypatch):
+    from mlx_vlm.models.inkling2 import kernels
+
     target, _ = inkling2_dspark_case(mx.bfloat16)
     lm = target.language_model
     lm.lm_head = nn.Linear(32, 16384, bias=False)
@@ -310,34 +313,46 @@ def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch)
     lm.config.unpadded_vocab_size = 16370
     if rank is not None:
         lm.sharding_group = NS(size=lambda: 2, rank=lambda: rank)
-    h = mx.random.normal((4, 3, 32)).astype(mx.bfloat16)
+    calls = []
+    head_logits = kernels.head_logits
+
+    def counted(h, weight):
+        calls.append(weight.shape)
+        return head_logits(h, weight)
+
+    monkeypatch.setattr(kernels, "head_logits", counted)
+    h = mx.random.normal((*rows, 32)).astype(mx.bfloat16)
     for _ in range(2):
-        # Replacing checkpoint weights must invalidate the retained conversion.
+        # Replacing checkpoint weights must not leave stale logits behind.
         lm.lm_head.weight = mx.random.normal((16384, 32)).astype(mx.bfloat16)
-        expected = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
+        # FP32 products and sums of the BF16 head, not a BF16 product.
+        expected = (
+            np.asarray(h.astype(mx.float32), np.float64)
+            @ np.asarray(lm.lm_head.weight.astype(mx.float32), np.float64).T
+        )
 
         def gather(local, group):
-            parts = [
-                part.reshape(1, -1, 8192) for part in mx.split(expected, 2, axis=-1)
-            ]
-            equal(local, parts[rank], atol=0, rtol=0)
-            return mx.concatenate(parts)
+            parts = np.split(expected.reshape(1, -1, 16384), 2, axis=-1)
+            np.testing.assert_allclose(np.array(local), parts[rank], 1e-5, 1e-6)
+            return mx.array(np.concatenate(parts).astype(np.float32))
 
         if rank is not None:
             monkeypatch.setattr(mx.distributed, "all_gather", gather)
         actual = lm._logits_from_norm(h)
         cap = lm.config.final_logit_softcapping
         if cap:
-            expected = mx.tanh(expected / cap) * cap
-        equal(actual, expected[..., : lm.config.unpadded_vocab_size], atol=0, rtol=0)
+            expected = np.tanh(expected / cap) * cap
+        np.testing.assert_allclose(
+            np.array(actual),
+            expected[..., : lm.config.unpadded_vocab_size],
+            rtol=1e-5,
+            atol=1e-6,
+        )
         assert actual.dtype == mx.float32
         assert lm.lm_head.weight.dtype == mx.bfloat16
-        if mx.metal.is_available() and mx.default_device() == mx.gpu:
-            assert lm._head_projection_cache[0] is lm.lm_head.weight
-        assert not any(
-            "_head_projection_cache" in name
-            for name, _ in tree_flatten(lm.parameters())
-        )
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
+        # Each rank reads only its own BF16 rows of the head.
+        assert calls == [(16384 if rank is None else 8192, 32)] * 2
 
 
 def test_inkling2_dspark_draft_context_window_and_budget():
