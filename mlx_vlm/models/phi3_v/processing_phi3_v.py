@@ -116,26 +116,52 @@ def _calc_hd_transform_size(width: int, height: int, hd_num: int = 16):
 def _hd_transform(img: Image.Image, hd_num: int = 16) -> Image.Image:
     """
     Apply HD transform to resize image for dynamic resolution.
+
+    Mirrors the reference Phi-3.5-Vision HD_transform: resize to the
+    unpadded HD size, then pad the height to a multiple of 336 with white,
+    vertically centered. Resizing straight to the padded size would stretch
+    the image. Portrait images are transposed so the padding lands on the
+    short side, then transposed back.
     """
     width, height = img.size
-    target_width, target_height = _calc_hd_transform_size(width, height, hd_num)
-    return img.resize((target_width, target_height), Image.Resampling.BICUBIC)
+    transposed = False
+    if width < height:
+        img = img.transpose(Image.Transpose.TRANSPOSE)
+        transposed = True
+        width, height = img.size
+
+    ratio = width / height
+    scale = 1
+    while scale * math.ceil(scale / ratio) <= hd_num:
+        scale += 1
+    scale -= 1
+
+    new_width = int(scale * 336)
+    new_height = int(new_width / ratio)
+
+    img = img.resize((new_width, new_height), Image.Resampling.BILINEAR)
+    img = _pad_to_336(img)
+
+    if transposed:
+        img = img.transpose(Image.Transpose.TRANSPOSE)
+    return img
 
 
 def _pad_to_336(img: Image.Image) -> Image.Image:
     """
-    Pad image dimensions to be divisible by 336.
+    Pad the image height to a multiple of 336 with white, vertically
+    centered, matching the reference padding_336. The width is already a
+    multiple of 336 at this point and is left unchanged.
     """
     width, height = img.size
-    target_width = math.ceil(width / 336) * 336
     target_height = math.ceil(height / 336) * 336
 
-    if target_width == width and target_height == height:
+    if target_height == height:
         return img
 
-    # Create new image with black background
-    new_img = Image.new("RGB", (target_width, target_height), (0, 0, 0))
-    new_img.paste(img, (0, 0))
+    top_padding = (target_height - height) // 2
+    new_img = Image.new("RGB", (width, target_height), (255, 255, 255))
+    new_img.paste(img, (0, top_padding))
     return new_img
 
 
@@ -194,9 +220,8 @@ class Phi3VImageProcessor(BaseImageProcessor):
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Apply HD transform
+        # Apply HD transform (already padded to multiples of 336)
         hd_image = _hd_transform(image, self.num_crops)
-        hd_image = _pad_to_336(hd_image)
         hd_width, hd_height = hd_image.size
 
         # Create global image (resized to 336x336)
@@ -398,8 +423,10 @@ class Phi3VProcessor(ProcessorMixin):
             input_ids = []
             img_idx = 0
             for i, chunk in enumerate(prompt_chunks):
-                # Add text tokens (skip BOS if not first chunk)
-                offset = 0 if i == 0 else 1  # Skip BOS token for subsequent chunks
+                # Chunks after the first are encoded without special tokens,
+                # so their first token is real text and must be kept. Only
+                # skip a leading BOS when one is actually present.
+                offset = 0
                 if i > 0 and len(chunk) > 0 and chunk[0] == self.tokenizer.bos_token_id:
                     offset = 1
                 input_ids.extend(chunk[offset:])
