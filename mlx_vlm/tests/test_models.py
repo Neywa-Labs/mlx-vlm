@@ -3220,6 +3220,56 @@ def test_dense_model(name):
     ModelChecks().forward_cache(model, config["vocab_size"])
 
 
+def test_omoikane_training_checkpoint_layout():
+    from mlx_vlm.models import omoikane
+
+    config = omoikane.ModelConfig.from_dict(copy.deepcopy(DATA["dense"]["omoikane"]))
+    mx.random.seed(3)
+    model = omoikane.Model(config)
+    model.eval()
+    params = {
+        k.removeprefix("language_model."): mx.random.normal(v.shape) * 0.1
+        for k, v in tree_flatten(model.parameters())
+    }
+    model.load_weights([(f"language_model.{k}", v) for k, v in params.items()])
+    mla = config.mla_config
+
+    # The training checkpoint stacks gate|up per expert, keeps kv_b_proj whole,
+    # stores convolutions as [channels, 1, kernel], and the MTP module as the
+    # layer after the last.
+    hub = {}
+    for k, v in params.items():
+        if "conv1d.weight" in k:
+            hub[k] = v.moveaxis(1, 2)
+        elif ".switch_mlp.gate_proj." in k:
+            prefix = k.split(".switch_mlp.")[0]
+            up = params[k.replace(".gate_proj.", ".up_proj.")]
+            hub[f"{prefix}.experts.gate_up_proj"] = mx.concatenate([v, up], axis=1)
+        elif ".switch_mlp.down_proj." in k:
+            hub[f"{k.split('.switch_mlp.')[0]}.experts.down_proj"] = v
+        elif k.endswith(".self_attn.embed_q.weight"):
+            prefix = k.removesuffix("embed_q.weight")
+            kv_b = mx.concatenate(
+                [v.swapaxes(-1, -2), params[f"{prefix}unembed_out.weight"]], axis=1
+            )
+            hub[f"{prefix}kv_b_proj.weight"] = kv_b.reshape(-1, mla["kv_lora_rank"])
+        elif ".switch_mlp.up_proj." not in k and "unembed_out" not in k:
+            hub[k] = v
+    mtp = f"model.layers.{config.num_hidden_layers}"
+    hub[f"{mtp}.eh_proj.weight"] = mx.zeros((64, 128))
+    hub["lm_head.weight"] = mx.zeros((128, 64))
+
+    once = model.sanitize(dict(hub))
+    assert set(once) == {f"language_model.{k}" for k in params}
+    twice = model.sanitize(dict(once))
+    assert all(mx.array_equal(once[k], twice[k]).item() for k in once)
+
+    ids = mx.array([[1, 5, 9, 13, 2]])
+    loaded = omoikane.Model(config)
+    loaded.load_weights(list(once.items()), strict=True)
+    assert mx.allclose(loaded(ids).logits, model(ids).logits).item()
+
+
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
