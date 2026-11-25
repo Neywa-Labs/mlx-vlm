@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -13,6 +14,17 @@ from PIL import Image
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 from ..turboquant import _state_length as _turboquant_state_length
 from .cache import create_causal_mask
+
+# Opt in to the fused decode attention kernels (mlx_vlm/kernels/
+# quantized_decode_attention.py) for one-token decode over a 6-bit cache.
+# Metal only; imported on first use so other backends never build them.
+QUANT_DECODE_KERNEL = (
+    os.environ.get("MLX_VLM_QUANT_DECODE_KERNEL") == "1" and mx.metal.is_available()
+)
+# Opt in to multi-token (prefill) attention over a quantized cache as
+# dequantize + mx.fast.scaled_dot_product_attention, which never materialises
+# the heads x queries x keys scores that quantized_matmul attention does.
+QUANT_PREFILL_SDPA = os.environ.get("MLX_VLM_QUANT_PREFILL_SDPA") == "1"
 
 
 def load_chat_template(tokenizer, model_path):
@@ -452,6 +464,39 @@ def scaled_dot_product_attention(
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
+        if QUANT_DECODE_KERNEL and queries.shape[-2] == 1:
+            from ..kernels.quantized_decode_attention import (
+                quantized_decode_attention,
+                quantized_decode_attention_supported,
+            )
+
+            if quantized_decode_attention_supported(
+                queries, keys, values, mask, cache.group_size, cache.bits
+            ):
+                return quantized_decode_attention(
+                    queries, keys, values, scale, mask, group_size=cache.group_size
+                )
+        # An additive mask of another dtype promotes the unfused path's output;
+        # SDPA rejects it, so leave that case to the unfused path.
+        if (
+            QUANT_PREFILL_SDPA
+            and queries.shape[-2] > 1
+            and (
+                not isinstance(mask, mx.array)
+                or mask.dtype in (mx.bool_, queries.dtype)
+            )
+        ):
+            return mx.fast.scaled_dot_product_attention(
+                queries,
+                mx.dequantize(
+                    *keys, group_size=cache.group_size, bits=cache.bits
+                ).astype(queries.dtype),
+                mx.dequantize(
+                    *values, group_size=cache.group_size, bits=cache.bits
+                ).astype(queries.dtype),
+                scale=scale,
+                mask=mask,
+            )
         return quantized_scaled_dot_product_attention(
             queries,
             keys,
