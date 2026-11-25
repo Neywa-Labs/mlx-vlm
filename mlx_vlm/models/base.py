@@ -644,68 +644,79 @@ def ensure_fused_sdpa(q, k, v, scale, mask=None):
     ]
 
 
-def install_auto_processor_patch(target_model_types, processor_cls):
+_NATIVE_PROCESSORS = {}
+
+
+def _auto_processor_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    import importlib
+    import json
+    from pathlib import Path
+
+    from transformers.utils.hub import cached_file
+
+    from ..utils import get_model_type
+
+    try:
+        config_path = cached_file(
+            pretrained_model_name_or_path,
+            "config.json",
+            **{
+                key: kwargs[key]
+                for key in (
+                    "revision",
+                    "cache_dir",
+                    "token",
+                    "local_files_only",
+                    "force_download",
+                    "subfolder",
+                )
+                if key in kwargs
+            },
+            _raise_exceptions_for_missing_entries=False,
+        )
+        config = json.loads(Path(config_path).read_text()) if config_path else {}
+    except (OSError, ValueError):
+        config = {}
+
+    model_type = get_model_type(config)
+    if model_type and model_type not in _NATIVE_PROCESSORS:
+        try:
+            # Importing the model package installs its native processor. This
+            # also supports processor-only loading in a fresh Python process.
+            importlib.import_module(f"mlx_vlm.models.{model_type}")
+        except ImportError:
+            pass
+    raw_type = str(config.get("model_type", "")).lower()
+    registration = _NATIVE_PROCESSORS.get(model_type) or _NATIVE_PROCESSORS.get(
+        raw_type
+    )
+    if registration is not None:
+        processor_cls, trust_remote_code = registration
+        kwargs.setdefault("trust_remote_code", trust_remote_code)
+        return processor_cls.from_pretrained(pretrained_model_name_or_path, **kwargs)
+    return _ORIGINAL_AUTO_PROCESSOR.__func__(
+        cls, pretrained_model_name_or_path, **kwargs
+    )
+
+
+def install_auto_processor_patch(
+    target_model_types, processor_cls, *, trust_remote_code=True
+):
+    """Register a native processor, matched using the model architecture resolver.
+
+    Existing model-type aliases remain valid. Each processor can choose its
+    default remote-code policy; an explicit caller option takes precedence.
     """
-    Install a composable patch on transformers.AutoProcessor.from_pretrained
-
-    Args:
-        target_model_types (Union[str, List[str]]): Model types to intercept.
-        processor_cls (type): Processor class exposing `from_pretrained`.
-
-    Returns:
-        The previous `AutoProcessor.from_pretrained` for reference.
-    """
-    from transformers import AutoProcessor as _HF_AutoProcessor
-
     if isinstance(target_model_types, str):
         target_model_types = [target_model_types]
-    target_model_types = {t.lower() for t in target_model_types}
+    for model_type in target_model_types:
+        _NATIVE_PROCESSORS[model_type.lower()] = (processor_cls, trust_remote_code)
+    return _AutoProcessor.from_pretrained
 
-    previous_from_pretrained = _HF_AutoProcessor.from_pretrained
 
-    @classmethod
-    def _patched_auto_processor_from_pretrained(
-        cls, pretrained_model_name_or_path, **kwargs
-    ):
-        import json as _json
-        from pathlib import Path
+# Install one dispatcher rather than stacking one config-reading wrapper per
+# model import. Registrations remain local to each model package.
+from transformers import AutoProcessor as _AutoProcessor
 
-        try:
-            model_path = Path(pretrained_model_name_or_path)
-            is_local = model_path.exists() and model_path.is_dir()
-
-            cfg = {}
-            if is_local:
-                config_path = model_path / "config.json"
-                if config_path.exists():
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        cfg = _json.load(f)
-            else:
-                try:
-                    from huggingface_hub import hf_hub_download
-
-                    cfg_path = hf_hub_download(
-                        pretrained_model_name_or_path, "config.json"
-                    )
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg = _json.load(f)
-                except Exception:
-                    cfg = {}
-
-            model_type = str(cfg.get("model_type", "")).lower()
-            if model_type in target_model_types:
-                kwargs.setdefault("trust_remote_code", True)
-                return processor_cls.from_pretrained(
-                    pretrained_model_name_or_path, **kwargs
-                )
-        except Exception:
-            # On any failure, fall back to previous behavior
-            pass
-
-        # Chain to the prior from_pretrained
-        return previous_from_pretrained.__func__(
-            cls, pretrained_model_name_or_path, **kwargs
-        )
-
-    _HF_AutoProcessor.from_pretrained = _patched_auto_processor_from_pretrained
-    return previous_from_pretrained
+_ORIGINAL_AUTO_PROCESSOR = _AutoProcessor.from_pretrained
+_AutoProcessor.from_pretrained = classmethod(_auto_processor_from_pretrained)

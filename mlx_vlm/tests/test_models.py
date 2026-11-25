@@ -48,6 +48,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    sanitize_weights,
     sharded_load,
 )
 
@@ -1304,7 +1305,13 @@ class ModelChecks:
         assert mx.all(mx.isfinite(features)).item()
 
     def audio(self, model, config, model_name, *, frames=32, lengths=None):
-        if model_name not in {"inkling", "gemma3n", "gemma4", "gemma4_unified"}:
+        if model_name not in {
+            "inkling",
+            "gemma3n",
+            "gemma4",
+            "gemma4_unified",
+            "wemm_video",
+        }:
             raise ValueError(f"Unsupported audio model: {model_name}")
         audio_config = config.audio_config
         text_width = config.text_config.hidden_size
@@ -1323,7 +1330,19 @@ class ModelChecks:
                         tree_map(lambda p: p.astype(dtype), component.parameters())
                     )
 
-            if model_name == "inkling":
+            if model_name == "wemm_video":
+                inputs = mx.random.normal(
+                    (batch, audio_config.num_mel_bins, frames)
+                ).astype(dtype)
+                features = model.audio_tower(inputs)
+                shape = (batch, audio_config.tokens_per_segment, text_width)
+                output_dtype = dtype
+                # Segment batching must preserve window/query order and independence.
+                separate = mx.concatenate(
+                    [model.audio_tower(row[None]) for row in inputs]
+                )
+                self.assert_close(features, separate)
+            elif model_name == "inkling":
                 bins = audio_config.n_mel_bins
                 inputs = mx.arange(batch * frames * bins, dtype=mx.int32)
                 inputs = (
@@ -1437,7 +1456,11 @@ def build_config(module, values, config_type="ModelConfig"):
     fields = copy.deepcopy(values)
     if (
         module.__name__
-        in ("mlx_vlm.models.minicpmv4_7", "mlx_vlm.models.nemotron_h_nano_omni")
+        in (
+            "mlx_vlm.models.minicpmv4_7",
+            "mlx_vlm.models.nemotron_h_nano_omni",
+            "mlx_vlm.models.wemm_video",
+        )
         and config_type == "ModelConfig"
     ):
         # Preserve checkpoint aliases and per-layer text-config dispatch.
@@ -1721,7 +1744,9 @@ def test_hybrid_backbone_sanitize_is_idempotent(case):
     preserved = {
         key: value
         for key, value in parameters.items()
-        if any(fnmatchcase(key, p) for p in case["regression"]["fp32_parameters"])
+        if any(
+            fnmatchcase(key, p) for p in case["regression"].get("fp32_parameters", ())
+        )
     }
     weights.update(
         {
@@ -1729,28 +1754,87 @@ def test_hybrid_backbone_sanitize_is_idempotent(case):
             for key, value in preserved.items()
         }
     )
-    discarded = case["regression"]["discarded_weights"]
-    weights.update({key: mx.zeros(1) for key in discarded})
-    once = model.sanitize(weights)
-    assert set(once) == preserved.keys() | {
-        "language_model.model.layers.1.input_layernorm.weight",
-        "language_model.model.layers.0.linear_attn.conv1d.weight",
-        "vision_tower.patch_embed.proj.weight",
-    }
-    twice = model.sanitize(once)
-    assert once.keys() == twice.keys()
-    for key in once:
-        assert mx.array_equal(once[key], twice[key]).item(), key
-    np.testing.assert_allclose(
-        np.array(once["language_model.model.layers.1.input_layernorm.weight"]),
-        expected_norm,
-    )
-    for key, expected in {
+    expected = {
         **preserved,
+        "language_model.model.layers.1.input_layernorm.weight": mx.array(expected_norm),
         "language_model.model.layers.0.linear_attn.conv1d.weight": conv,
         "vision_tower.patch_embed.proj.weight": patch,
-    }.items():
-        assert mx.array_equal(once[key], expected).item(), key
+    }
+    discarded = list(case["regression"].get("discarded_weights", ()))
+    if case["module"] == "wemm_video":
+        audio = model.audio_tower
+        weights.update(
+            {
+                "model.audio.conv1.weight": audio.conv1.weight.transpose(0, 2, 1),
+                "model.audio.qformer.bert.embeddings.LayerNorm.gamma": audio.qformer.norm.weight,
+                "model.audio.qformer.bert.embeddings.LayerNorm.beta": audio.qformer.norm.bias,
+            }
+        )
+        expected.update(
+            {
+                "audio_tower.conv1.weight": audio.conv1.weight,
+                "audio_tower.qformer.norm.weight": audio.qformer.norm.weight,
+                "audio_tower.qformer.norm.bias": audio.qformer.norm.bias,
+            }
+        )
+        discarded.append("model.audio.qformer.bert.embeddings.position_ids")
+    weights.update({key: mx.zeros(1) for key in discarded})
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+
+    def sanitize(weights):
+        weights = sanitize_weights(model, weights)
+        return sanitize_weights(module.VisionModel, weights, model.config.vision_config)
+
+    once = sanitize(weights)
+    twice = sanitize(once)
+    assert once.keys() == twice.keys() == expected.keys()
+    for key, value in expected.items():
+        np.testing.assert_array_equal(np.asarray(once[key]), np.asarray(value))
+        np.testing.assert_array_equal(np.asarray(twice[key]), np.asarray(value))
+
+
+@pytest.mark.parametrize(
+    "case", regression_cases("media_embeddings"), ids=lambda c: c["id"]
+)
+@pytest.mark.parametrize(
+    "layout", [("image", "video", "audio"), ("audio", "video", "image")]
+)
+def test_media_features_follow_placeholder_order(case, layout):
+    model = regression_model(case)
+    config, width = model.config, model.config.text_config.hidden_size
+
+    model.vision_tower = MagicMock(
+        side_effect=lambda pixels, grid: (mx.full((1, width), pixels.item()), None)
+    )
+    model.vision_tower.patch_embed.proj.weight = mx.zeros(1)
+    model.audio_tower = MagicMock(return_value=mx.full((1, 2, width), 7))
+    model.audio_tower.conv1.weight = mx.zeros(1)
+    tokens = {kind: getattr(config, kind + "_token_id") for kind in layout}
+    ids = [1]
+    for kind in layout:
+        ids += (
+            [config.vision_start_token_id, tokens[kind], config.vision_end_token_id]
+            if kind != "audio"
+            else [tokens[kind]] * 2
+        )
+    ids = mx.array([ids])
+    inputs = dict(
+        pixel_values=mx.array([3]),
+        image_grid_thw=mx.array([[1, 2, 2]]),
+        pixel_values_videos=mx.array([5]),
+        video_grid_thw=mx.array([[1, 2, 2]]),
+        audio_feature=mx.zeros((1, config.audio_config.num_mel_bins, 20)),
+    )
+    result = model.get_input_embeddings(ids, **inputs).inputs_embeds
+    for kind, value in zip(("image", "video", "audio"), (3, 5, 7)):
+        mask = np.asarray(ids) == tokens[kind]
+        np.testing.assert_array_equal(
+            np.asarray(result)[mask], np.full((int(mask.sum()), width), value)
+        )
+    for kind, token in tokens.items():
+        bad_ids = mx.where(ids == token, mx.array(1), ids)
+        with pytest.raises(ValueError, match="features and tokens"):
+            model.get_input_embeddings(bad_ids, **inputs)
 
 
 @pytest.fixture
@@ -6928,9 +7012,20 @@ def test_lfm3_quantized_checkpoint_roundtrip(tmp_path, lfm3_case):
         ),
         ({"model_type": "lfm3_omni", "architectures": ["D1Model"]}, "d1_lfm3_omni"),
         ({"model_type": "lfm3_vl"}, "lfm3_vl"),
+        ({"model_type": "qwen3_5"}, "qwen3_5"),
+        *[
+            (
+                {
+                    "model_type": raw,
+                    "architectures": ["WeMMVideoForConditionalGeneration"],
+                },
+                "wemm_video",
+            )
+            for raw in ("qwen3_5", "wemm_qwen3_5_moe", "wemm_video")
+        ],
     ],
 )
-def test_get_model_and_args_routes_d1_checkpoints(config, expected):
+def test_get_model_and_args_routes_checkpoint_architectures(config, expected):
     model_class, model_type = get_model_and_args(config)
 
     assert model_type == expected
