@@ -43,8 +43,10 @@ FlashInfer/FA3), not a different cache design.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
+import itertools
 import json
 import logging
 import os
@@ -625,6 +627,17 @@ class APCExactCacheEntry:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    # APC_SINGLE_COPY: a request took this entry's cache (lookup_exact_cache).
+    taken: bool = False
+
+
+class _TakenCache(list):
+    """A checkpoint's prompt cache taken out of the store (APC_SINGLE_COPY);
+    ``lease`` identifies this take for ``return_taken``/``forget_taken``."""
+
+    def __init__(self, caches: Iterable[Any], lease: int):
+        super().__init__(caches)
+        self.lease = lease
 
 
 @dataclass(frozen=True)
@@ -2666,6 +2679,12 @@ class DiskBlockStore:
         with self._pending_lock:
             return self._pending_bytes
 
+    def writing(self, cache_hash: int) -> bool:
+        """True while a scheduled write of this snapshot has not finished: it
+        still reads the cache objects it was given."""
+        with self._in_flight_lock:
+            return int(cache_hash) in self._in_flight
+
     def flush(self) -> None:
         """Finish queued writes and release their tensors before admission."""
         self._q.join()
@@ -3127,6 +3146,26 @@ class APCManager:
         self.exact_cache_min_tokens = max(
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
+        # Opt-in: a checkpoint that extends resident ones (the same conversation's
+        # earlier turns) evicts them. With several entries the default keeps them
+        # for an edited or regenerated last message; an agent's conversation only
+        # grows, and they cost a whole cache each.
+        self.evict_superseded = os.environ.get("APC_EVICT_SUPERSEDED", "0") == "1"
+        # Opt-in single copy of a conversation's cache (APC_SINGLE_COPY=1): a
+        # request restores a whole resident checkpoint by taking it (no clone),
+        # and the batch generator stores its prefill checkpoints from the
+        # request's own cache when the row leaves (APCCoordinator.
+        # defer_checkpoint) instead of copying at the prefill boundary. A
+        # request that stores nothing longer hands the taken one back. A turn
+        # then holds one copy of the context instead of two or three.
+        self.single_copy = os.environ.get("APC_SINGLE_COPY", "0") == "1"
+        # Checkpoints taken by a request: (token_ids, extra_hash, lease) by
+        # key, so a snapshot that extends one still counts as a continuation.
+        # The lease (``_TakenCache.lease``) identifies one take.
+        self._moved: "OrderedDict[int, Tuple[Tuple[int, ...], int, int]]" = (
+            OrderedDict()
+        )
+        self._leases = itertools.count(1)
         self.checkpoint_interval_tokens = max(
             0,
             int(
@@ -3296,12 +3335,25 @@ class APCManager:
             min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
         )
 
-    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
-        """Evict idle APC state before allocating; never alter leased blocks."""
+    def _make_room(
+        self,
+        allocation_bytes: int = 0,
+        *,
+        retain_bytes: int = 0,
+        prefill_reserve: Optional[int] = None,
+    ) -> bool:
+        """Evict idle APC state before allocating; never alter leased blocks.
+
+        ``prefill_reserve`` replaces the prefill reserve when given (see
+        ``store_prefill_reserve``).
+        """
+        prefill = (
+            self._prefill_reserve_bytes if prefill_reserve is None else prefill_reserve
+        )
         required = self.memory_reserve_bytes + (
-            self._prefill_reserve_bytes + allocation_bytes
+            prefill + allocation_bytes
             if retain_bytes
-            else max(self._prefill_reserve_bytes, allocation_bytes)
+            else max(prefill, allocation_bytes)
         )
         with self.lock:
             resident = self._resident_bytes_locked()
@@ -3342,6 +3394,124 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
+    def extends_resident_checkpoint(
+        self, token_ids: Sequence[int], extra_hash: int = 0
+    ) -> bool:
+        """True if a resident exact checkpoint is a strict prefix of
+        ``token_ids``: a snapshot of them continues and replaces it. So is one
+        a request took (APC_SINGLE_COPY), or the same tokens handed back."""
+        tokens = tuple(int(t) for t in token_ids)
+        with self.lock:
+            return any(
+                entry.extra_hash == extra_hash
+                and len(entry.token_ids) < len(tokens)
+                and tokens[: len(entry.token_ids)] == entry.token_ids
+                for entry in self._exact_cache.values()
+            ) or any(
+                extra == extra_hash
+                and len(moved) <= len(tokens)
+                and tokens[: len(moved)] == moved
+                for moved, extra, _ in self._moved.values()
+            )
+
+    def store_prefill_reserve(
+        self, token_ids: Sequence[int], prompt_cache: Sequence[Any], extra_hash: int = 0
+    ) -> Optional[int]:
+        """The prefill reserve a snapshot of ``prompt_cache`` must leave free,
+        or None for the whole of it.
+
+        A continuation (``extends_resident_checkpoint``) replaces the checkpoint
+        it extends, and the next request makes room for its own prefill before
+        allocating. It holds only what the active prefill still allocates
+        (``PrefillMemoryPlan.remaining_reserve_bytes``). Decide before making
+        room, which can evict the checkpoint being extended, and from the live
+        cache.
+        """
+        if not self.extends_resident_checkpoint(token_ids, extra_hash):
+            return None
+        return self.memory_plan.remaining_reserve_bytes(prompt_cache, len(token_ids))
+
+    def is_taken(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        lease: Optional[int] = None,
+    ) -> bool:
+        """True if a request took the checkpoint of exactly these tokens
+        (APC_SINGLE_COPY), under ``lease`` when given, and has not stored or
+        handed it back yet."""
+        tokens = tuple(int(t) for t in token_ids)
+        key = _sequence_hash(tokens, extra_hash, self.block_size)
+        with self.lock:
+            record = self._moved.get(key)
+            return (
+                record is not None
+                and record[:2] == (tokens, extra_hash)
+                and (lease is None or record[2] == lease)
+            )
+
+    def return_taken(
+        self,
+        token_ids: Sequence[int],
+        prompt_cache: Any,
+        extra_hash: int = 0,
+        *,
+        lease: Optional[int] = None,
+    ) -> None:
+        """Put back a checkpoint a request took (APC_SINGLE_COPY) but did not
+        use, under its lease (by default the taken cache's). Anything else (a
+        clone, a partly merged cache, a lease already ended) is left to be
+        freed."""
+        if lease is None:
+            lease = getattr(prompt_cache, "lease", None)
+        if prompt_cache is None or not self.forget_taken(token_ids, extra_hash, lease):
+            return
+        # The lease ended first: another request may take the entry once stored.
+        if all(c is not None for c in prompt_cache):  # else merged and released
+            self.store_exact_cache(
+                token_ids,
+                list(prompt_cache),
+                extra_hash=extra_hash,
+                owned=True,
+                allocated=True,
+            )
+
+    def forget_taken(
+        self, token_ids: Sequence[int], extra_hash: int, lease: Optional[int]
+    ) -> bool:
+        """End a take's lease: the request no longer holds the checkpoint, so
+        later snapshots are no longer continuations of it. False if the lease
+        had ended already (stored back, replaced or superseded)."""
+        if lease is None:
+            return False
+        tokens = tuple(int(t) for t in token_ids)
+        key = _sequence_hash(tokens, extra_hash, self.block_size)
+        with self.lock:
+            if self._moved.get(key) != (tokens, extra_hash, lease):
+                return False
+            del self._moved[key]
+            return True
+
+    def admits_retained(
+        self,
+        size: int,
+        *,
+        allocation: Optional[int] = None,
+        prefill_reserve: Optional[int] = None,
+    ) -> bool:
+        """Make room for an exact snapshot of ``size`` bytes to stay resident,
+        with ``allocation`` new bytes (default ``size``) on top of the prefill
+        reserve (None: the whole active reserve)."""
+        return (
+            self._exact_cache_max > 0
+            and size <= self.memory_max_bytes
+            and self._make_room(
+                size if allocation is None else allocation,
+                retain_bytes=size,
+                prefill_reserve=prefill_reserve,
+            )
+        )
+
     def prepare_prefill(self, reserve_bytes: int) -> bool:
         """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
@@ -3379,6 +3549,7 @@ class APCManager:
         min_prefix_tokens: int = 0,
         *,
         defer_on_pressure: bool = False,
+        take: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return the longest restorable prefix from prompt-cache snapshots.
 
@@ -3386,6 +3557,8 @@ class APCManager:
         addition to attention KV. That state is not block-concatenable, so the
         safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
         Plain dense K/V snapshots can also be sliced to the last matching block.
+        ``take``: the caller stores or hands back a checkpoint it takes
+        (APC_SINGLE_COPY); other callers always get a clone.
         """
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
@@ -3545,21 +3718,109 @@ class APCManager:
                     "APC prefix restore deferred by memory admission"
                 )
             return None, 0
+        # APC_SINGLE_COPY: a whole resident checkpoint is handed to the request
+        # instead of cloned; it comes back when the request stores its own.
+        moving = (
+            self.single_copy
+            and take
+            and best_entry is not None
+            and prefix_len == len(best_entry.token_ids)
+        )
         restore_bytes = self.memory_plan.restore_bytes(
             source_cache, prefix_len, prompt_capacity_tokens
         )
+        if moving:
+            # Claim it atomically, before room-making: concurrent lookups can
+            # select the same entry. Room-making for a longer disk checkpoint
+            # may have evicted it; it stays usable unless a request took it. A
+            # pending disk write still reads it, so that one is cloned instead.
+            with self.lock:
+                lost = best_entry.taken
+                stored = self._exact_cache.get(best_key) is best_entry
+                moving = not lost and not (
+                    self.disk is not None and self.disk.writing(best_key)
+                )
+                if moving:
+                    best_entry.taken = True
+                    lease = next(self._leases)
+                    if stored:
+                        del self._exact_cache[best_key]
+                    self._moved[best_key] = (
+                        best_entry.token_ids,
+                        best_entry.extra_hash,
+                        lease,
+                    )
+                    self._moved.move_to_end(best_key)
+                    while len(self._moved) > max(1, self._exact_cache_max):
+                        self._moved.popitem(last=False)
+            if lost:
+                # Another request took it first: look again.
+                return self.lookup_exact_cache(
+                    token_ids,
+                    extra_hash,
+                    max_prefix_tokens,
+                    min_prefix_tokens,
+                    defer_on_pressure=defer_on_pressure,
+                    take=take,
+                )
+            if moving:
+                # Its buffers are already allocated: only the growth is new.
+                restore_bytes = max(0, restore_bytes - _cache_nbytes(source_cache))
         if not self._make_room(restore_bytes):
             with self.lock:
+                if moving and self._moved.get(best_key, (None,) * 3)[2] == lease:
+                    # Put it back as it was.
+                    del self._moved[best_key]
+                    best_entry.taken = False
+                    if stored and best_key not in self._exact_cache:
+                        self._exact_cache[best_key] = best_entry
+                        while len(self._exact_cache) > self._exact_cache_max:
+                            self._exact_cache.popitem(last=False)
                 self.stats.memory_skips += 1
             if defer_on_pressure:
                 raise APCAdmissionError(
                     "APC prefix restore deferred by memory admission"
                 )
             return None, 0
-        prompt_cache = _clone_prompt_cache_for_apc(
-            source_cache,
-            min_capacity_tokens=prompt_capacity_tokens,
-        )
+        if moving:
+            with self.lock:
+                self.stats.exact_hits += 1
+                self.stats.hits += 1
+                self.stats.matched_tokens += prefix_len
+            # Entry by entry, so growing the capacity holds one layer twice at most.
+            for entry in source_cache:
+                eval_targets: List[mx.array] = []
+                reserve_checkpoint_capacity(
+                    entry,
+                    min_capacity_tokens=prompt_capacity_tokens,
+                    eval_targets=eval_targets,
+                )
+                if eval_targets:
+                    mx.eval(eval_targets)
+            apc_trace("restore", mode="move", token_len=prefix_len)
+            return _TakenCache(source_cache, lease), prefix_len
+        # With APC_SINGLE_COPY a taking lookup can claim the entry and change
+        # it: copy it under the lock, and only if no request took it.
+        with self.lock if self.single_copy else contextlib.nullcontext():
+            lost = self.single_copy and best_entry.taken
+            prompt_cache = (
+                None
+                if lost
+                else _clone_prompt_cache_for_apc(
+                    source_cache,
+                    min_capacity_tokens=prompt_capacity_tokens,
+                )
+            )
+        if lost:
+            # Another request took it first: look again.
+            return self.lookup_exact_cache(
+                token_ids,
+                extra_hash,
+                max_prefix_tokens,
+                min_prefix_tokens,
+                defer_on_pressure=defer_on_pressure,
+                take=take,
+            )
         if prompt_cache is None:
             return None, 0
         with self.lock:
@@ -3574,8 +3835,20 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        owned: bool = False,
+        prefill_reserve: Optional[int] = None,
+        allocated: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``owned`` marks a snapshot that is already a private copy (or a cache
+        handed over by its request): it is retained as is instead of being
+        copied a second time. ``prefill_reserve``: as decided by
+        ``store_prefill_reserve`` before any room-making; decided here when
+        None. ``allocated``: an owned snapshot whose memory was already
+        admitted (or that took the live cache's place), so retaining it needs
+        no further headroom.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3585,12 +3858,21 @@ class APCManager:
         self._prefill_reserve_bytes = self.memory_plan.observe_cache(
             prompt_cache, len(token_tuple), live_bytes=size
         )
+        if prefill_reserve is None and not allocated:
+            prefill_reserve = self.store_prefill_reserve(
+                token_tuple, prompt_cache, extra_hash
+            )
         if self.disk is not None:
             self.disk.flush()
-        retain = (
-            self._exact_cache_max > 0
-            and size <= self.memory_max_bytes
-            and self._make_room(size, retain_bytes=size)
+        # A continuation whose live buffers already hold the rest of its prefill
+        # leaves out the reserve that prefill no longer needs. Otherwise
+        # room-making evicts the checkpoint being extended and the store then
+        # refuses itself for lack of that reserve, so every second turn
+        # re-reads the conversation.
+        retain = self.admits_retained(
+            size,
+            allocation=0 if allocated else size,
+            prefill_reserve=0 if allocated else prefill_reserve,
         )
         if not retain:
             self._make_room()
@@ -3611,7 +3893,9 @@ class APCManager:
                 with self.lock:
                     self.stats.exact_stores += 1
             return stored
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = (
+            list(prompt_cache) if owned else _clone_prompt_cache_for_apc(prompt_cache)
+        )
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(
@@ -3628,9 +3912,39 @@ class APCManager:
                 )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        # Schedule the disk write before publishing the entry: until the writer
+        # has read these caches, the entry must not be taken (APC_SINGLE_COPY).
+        saved = False
+        if self.disk is not None:
+            try:
+                self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
+                saved = True
+            except Exception as e:
+                logger.warning("APC exact disk save scheduling failed: %s", e)
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
+                if self.evict_superseded:
+                    # The checkpoints this one extends are the same conversation's
+                    # earlier turns. Kept beside it, a whole cache each, they push
+                    # out what the other entries are for (an agent's side request).
+                    for old in [
+                        k
+                        for k, e in self._exact_cache.items()
+                        if e.extra_hash == int(extra_hash)
+                        and len(e.token_ids) < len(token_tuple)
+                        and token_tuple[: len(e.token_ids)] == e.token_ids
+                    ]:
+                        del self._exact_cache[old]
+                # A checkpoint a request took is back, or superseded by this one.
+                for old in [
+                    k
+                    for k, (moved, extra, _) in self._moved.items()
+                    if extra == int(extra_hash)
+                    and len(moved) <= len(token_tuple)
+                    and token_tuple[: len(moved)] == moved
+                ]:
+                    del self._moved[old]
                 self._exact_cache[key] = APCExactCacheEntry(
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
@@ -3648,13 +3962,7 @@ class APCManager:
                 token_len=len(token_tuple),
                 layers=len(copied),
             )
-        if self.disk is not None:
-            try:
-                self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
-                stored = True
-            except Exception as e:
-                logger.warning("APC exact disk save scheduling failed: %s", e)
-        if stored:
+        if stored or saved:
             with self.lock:
                 self.stats.exact_stores += 1
             return True
@@ -4006,6 +4314,7 @@ class APCManager:
             for b in self.pool:
                 self._free_push(b)
             self._exact_cache.clear()
+            self._moved.clear()
             self.stats = APCStats()
 
     def close(self) -> None:
@@ -4747,8 +5056,11 @@ def apc_lookup_plan(
     suffix_is_text_only,
     prefix_has_media,
     defer_on_pressure: bool = False,
+    take: bool = False,
 ) -> Optional[dict]:
-    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply.
+
+    ``take``: see ``APCManager.lookup_exact_cache``."""
     n = len(ids_list)
     if not ids_list or n < 2:
         return None
@@ -4759,9 +5071,13 @@ def apc_lookup_plan(
             extra_hash=extra_hash,
             min_prefix_tokens=safe_lookup_min,
             defer_on_pressure=defer_on_pressure,
+            take=take,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
+                manager.return_taken(
+                    ids_list[:exact_prefix_len], exact_cache, extra_hash
+                )
                 return None
             return {
                 "matched_blocks": [],
@@ -4785,6 +5101,7 @@ def apc_lookup_plan(
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
             defer_on_pressure=defer_on_pressure and not matched,
+            take=take,
         )
     warm_cache = None
     disk_prefix_len = 0
@@ -4797,6 +5114,8 @@ def apc_lookup_plan(
             defer_on_pressure=defer_on_pressure and not (matched or exact_cache),
         )
     if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
+        if exact_cache is not None:
+            manager.return_taken(ids_list[:exact_prefix_len], exact_cache, extra_hash)
         if matched:
             manager.release(matched)
         if not suffix_is_text_only(disk_prefix_len):
@@ -4812,6 +5131,7 @@ def apc_lookup_plan(
         if matched:
             manager.release(matched)
         if not suffix_is_text_only(exact_prefix_len):
+            manager.return_taken(ids_list[:exact_prefix_len], exact_cache, extra_hash)
             return None
         return {
             "matched_blocks": [],
@@ -4820,6 +5140,8 @@ def apc_lookup_plan(
             "extra_hash": extra_hash,
             "full_input_ids": list(ids_list),
         }
+    if exact_cache is not None:
+        manager.return_taken(ids_list[:exact_prefix_len], exact_cache, extra_hash)
     if 0 < prefix_len < n:
         if not suffix_is_text_only(prefix_len):
             manager.release(matched)

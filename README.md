@@ -1199,6 +1199,8 @@ Common APC environment variables:
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
 | `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; observed prompt divergence takes priority within the entry budget; `0` keeps only the final checkpoint |
+| `APC_EVICT_SUPERSEDED` | `0` | Set to `1` so a checkpoint that extends resident ones (the same conversation's earlier turns) evicts them, leaving the other entries for side requests; the default keeps them for an edited or regenerated last message |
+| `APC_SINGLE_COPY` | `0` | Set to `1` to hold one copy of a hybrid conversation's cache per turn in the batch generator: a follow-up takes the resident checkpoint instead of cloning it, and prefill checkpoints of append-only K/V are cut from the request's own cache when it leaves the batch (windows and recurrent state are still copied at the boundary) |
 | `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
 | `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
 | `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |

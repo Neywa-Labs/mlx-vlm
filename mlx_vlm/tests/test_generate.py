@@ -3328,6 +3328,179 @@ def test_apc_native_checkpoint_reuses_repeated_request(
         manager.close()
 
 
+@pytest.mark.parametrize("family", ["small", "mini"])
+def test_apc_single_copy_takes_and_returns_the_checkpoint(
+    family, mock_processor, monkeypatch
+):
+    """APC_SINGLE_COPY=1: a follow-up takes the conversation's checkpoint
+    instead of cloning it, nothing is copied out of the live cache at the
+    prefill boundary, and the row's own cache becomes the next checkpoint when
+    it leaves; a row removed mid-prefill hands the taken one back. Same tokens
+    and the same reuse as the copying path (Inkling 2: global K/V, a sliding
+    window and convolution state per layer)."""
+    from mlx_vlm.tests.test_models import make_inkling2_model
+
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1")
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    model = make_inkling2_model(family).language_model
+
+    def copying(*args, **kwargs):
+        pytest.fail("single copy cloned or extracted a whole cache")
+
+    def insert(engine, ids):
+        # The server's text prompts carry a semantic hash instead of the embeddings'.
+        kwargs = {
+            "inputs_embeds": model.model.embed(mx.array([ids])),
+            "_apc_semantic_hash": 7,
+        }
+        return engine.insert([ids], prompt_kwargs=[kwargs])
+
+    def conversation(single_copy):
+        monkeypatch.setenv("APC_SINGLE_COPY", "1" if single_copy else "0")
+        with monkeypatch.context() as m:
+            if single_copy:
+                m.setattr(apc_module, "_clone_prompt_cache_for_apc", copying)
+                m.setattr(apc_module, "snapshot_prompt_cache_row", copying)
+            manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+            engine = BatchGenerator(
+                model,
+                mock_processor,
+                max_tokens=6,
+                completion_batch_size=1,
+                prefill_batch_size=1,
+                prefill_step_size=8,
+                apc_manager=manager,
+                manage_wired_limit=False,
+            )
+            outputs, prompt = [], list(range(1, 41))
+            try:
+                for turn in range(3):
+                    insert(engine, prompt)
+                    out = []
+                    for _ in range(40):
+                        out.extend(r.token for r in engine.next()[1])
+                        if len(out) == 6:
+                            break
+                    outputs.append(out)
+                    # The finished row's cache is the conversation's one checkpoint.
+                    stored = [e.token_ids for e in manager._exact_cache.values()]
+                    assert stored == [tuple(prompt[:-1])]
+                    assert not (single_copy and manager._moved)
+                    prompt = prompt + out + list(range(41 + turn, 51 + turn))
+                # Removed during its prefill: the checkpoint it restored is back.
+                restored = stored[0]
+                (uid,) = insert(engine, prompt + list(range(20, 50)))
+                engine.next()
+                assert engine.remove(uid)
+                stored = [e.token_ids for e in manager._exact_cache.values()]
+                assert stored == [restored]
+                assert not (single_copy and manager._moved)
+                return outputs, manager.stats.exact_hits
+            finally:
+                engine.close()
+                manager.close()
+
+    copied, single = conversation(False), conversation(True)
+    assert single == copied
+    assert single[1] == 3
+
+
+def _single_copy_engine(mock_processor, monkeypatch, **kwargs):
+    from mlx_vlm.tests.test_models import make_inkling2_model
+
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1")
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    mock_processor.tokenizer.stopping_criteria.eos_token_ids = []
+    model = make_inkling2_model("small").language_model
+    manager = apc_module.APCManager(num_blocks=16, block_size=8, disk=None)
+    engine = BatchGenerator(
+        model,
+        mock_processor,
+        max_tokens=6,
+        prefill_step_size=8,
+        apc_manager=manager,
+        manage_wired_limit=False,
+        **kwargs,
+    )
+
+    def insert(prompts):
+        return engine.insert(
+            prompts,
+            prompt_kwargs=[
+                {
+                    "inputs_embeds": model.model.embed(mx.array([ids])),
+                    "_apc_semantic_hash": 7,
+                }
+                for ids in prompts
+            ],
+        )
+
+    def run(uids):
+        done = set()
+        for _ in range(80):
+            done.update(r.uid for r in engine.next()[1] if r.finish_reason)
+            if done >= set(uids):
+                return
+        pytest.fail("requests did not finish")
+
+    def resident():
+        return [e.token_ids for e in manager._exact_cache.values()]
+
+    return engine, manager, insert, run, resident
+
+
+def test_apc_single_copy_right_padded_cohort_keeps_the_checkpoint(
+    mock_processor, monkeypatch
+):
+    """APC_SINGLE_COPY=1: rows of a right-padded cohort cannot defer their stores
+    to their own cache, so they restore copies. The checkpoint a row restored
+    stays resident, also when the row is removed before its next boundary."""
+    engine, manager, insert, run, resident = _single_copy_engine(
+        mock_processor, monkeypatch, completion_batch_size=2, prefill_batch_size=2
+    )
+    try:
+        first = list(range(1, 41))
+        run(insert([first]))
+        checkpoint = tuple(first[:-1])
+        assert resident() == [checkpoint]
+        # A follow-up and a shorter cold prompt are prefilled together.
+        follow_up = first + list(range(41, 61))
+        uids = insert([follow_up, list(range(20, 32))])
+        engine.next()
+        assert engine._prompt_batch is not None
+        assert any(engine._prompt_batch._right_pad_per_row)
+        assert checkpoint in resident() and not manager._moved
+        assert engine.remove(uids[0])
+        assert checkpoint in resident() and not manager._moved
+    finally:
+        engine.close()
+        manager.close()
+
+
+def test_apc_single_copy_rows_leaving_together_keep_their_checkpoints(
+    mock_processor, monkeypatch
+):
+    """APC_SINGLE_COPY=1: two rows that finish in the same step both store
+    their checkpoint; only the last one's buffers become its snapshot."""
+    engine, manager, insert, run, resident = _single_copy_engine(
+        mock_processor, monkeypatch, completion_batch_size=2, prefill_batch_size=2
+    )
+    try:
+        prompts = [list(range(1, 41)), list(range(20, 60))]
+        run(insert(prompts))
+        assert sorted(resident()) == sorted(tuple(p[:-1]) for p in prompts)
+        assert not manager._moved
+        extra_hash = next(iter(manager._exact_cache.values())).extra_hash
+        for prompt in prompts:
+            restored = manager.lookup_exact_cache(prompt + [7], extra_hash)
+            assert restored[1] == len(prompt) - 1
+    finally:
+        engine.close()
+        manager.close()
+
+
 def test_prefill_chunk_bounds_work_with_decoding_peers():
     gen = object.__new__(BatchGenerator)
     gen._wire_stack = None

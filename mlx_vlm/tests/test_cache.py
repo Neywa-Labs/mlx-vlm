@@ -2909,6 +2909,471 @@ def test_admission_before_allocation(operation, memory_manager, monkeypatch):
     assert manager.stats.memory_skips >= 1
 
 
+@parametrize("continues", [True, False])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_skips_prefill_reserve(
+    path, continues, managers, monkeypatch
+):
+    """A checkpoint that extends the resident one replaces it without also holding
+    the next prefill's reserve; any other store still holds it. (27B at ~100K:
+    7.8 GB needed with ~7 GB free, so every second turn re-read the prompt.)"""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+    old_tokens = list(range(64))
+    assert manager.store_exact_cache(old_tokens, [allocated(64)])
+    head = old_tokens if continues else list(range(5000, 5064))
+    new_tokens = head + list(range(1000, 1064))
+    if path == "store":
+        new = [allocated(128)]
+
+        def store():
+            return manager.store_exact_cache(new_tokens, new)
+
+    else:
+        new = [filled(batch_cache("dense"), length=128, heads=1, dim=4)]
+
+        def store():
+            return coordinate(manager, new).store_checkpoint(
+                new_tokens, new, batch_idx=0
+            )
+
+    # Room for the snapshot, not for a prefill reserve of the same size on top.
+    size = P._cache_nbytes(new)
+    monkeypatch.setattr(manager.memory_plan, "observe_cache", lambda *a, **k: size)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: size + size // 4)
+    assert store() == continues
+    if continues:
+        # The replacement is resident: the next request restores all of it.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        assert manager.lookup_exact_cache(new_tokens + [7])[1] == len(new_tokens)
+    else:
+        assert manager.stats.memory_skips >= 1
+
+
+@parametrize("buffers", ["full", "reserved", "unaligned"])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_active_prefill_reserve(
+    path, buffers, managers, monkeypatch
+):
+    """A continuation stored mid-prefill keeps what the rest of its prefill
+    allocates: the next token's K/V growth still fits after the store. Live
+    buffers that already hold the prompt (a restored prefix's capacity, or a
+    step grown past it from an unaligned offset) need none of the reserve."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+    assert manager.store_exact_cache(list(range(64)), [allocated(64)])
+    if buffers == "unaligned":
+        live = C.KVCache()
+        live.state = tuple(mx.ones((1, 1, 2000, 4)) for _ in range(2))
+        filled(live, length=48, heads=1, dim=4)  # 2000 + one 256-token step
+    else:
+        live = filled(C.KVCache(), length=2048, heads=1, dim=4)  # at capacity
+        if buffers == "reserved":
+            live.prefix_cache_reserve(2049)
+    state = C.ArraysCache(1)  # recurrent state: a checkpoint-restored layout
+    state[0] = mx.ones((1, 1))
+    caches = [live, state]
+    capacity = live.keys.shape[2]
+    fits = capacity > 2048
+    # The final token is still to prefill.
+    manager.memory_plan.prepare([2049], chunk_size=2048)
+    reserve = manager.memory_plan.observe_cache(caches, 2048)
+    manager._prefill_reserve_bytes = reserve
+    resident = manager.resident_bytes()
+    start = reserve + 4096
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(2048))
+    if path == "store":
+        stored = manager.store_exact_cache(tokens, caches)
+    else:
+        coordinator = coordinate(manager, caches)
+        assert coordinator.is_checkpoint
+        stored = coordinator.store_checkpoint(tokens, caches)
+    growth = live.memory_profile(2048).footprint(2049, 2048)
+    assert manager._memory_headroom() >= (0 if fits else growth)
+    assert stored == fits
+    # The prefill continues: the cache grows only if its buffers were full.
+    filled(live, length=1, heads=1, dim=4)
+    assert (live.keys.shape[2] == capacity) == fits
+    if fits:
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        assert manager.lookup_exact_cache(tokens + [7])[1] == len(tokens)
+
+
+@parametrize("prefilling", [True, False])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_window_replacement_reserve(
+    path, prefilling, managers, monkeypatch
+):
+    """A sliding window replaces its buffers on every multi-token update, so a
+    continuation stored mid-prefill keeps room for the next replacement; one
+    stored after the prefill (no update left) needs none of the reserve."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+
+    def window(tokens):
+        cache = C.RotatingKVCache(1024)
+        for start in range(0, tokens, 1024):
+            filled(cache, length=min(1024, tokens - start), heads=1, dim=4)
+        return cache
+
+    assert manager.store_exact_cache(list(range(64)), [window(64)])
+    live = window(2048)
+    manager.memory_plan.prepare([4097 if prefilling else 2048], chunk_size=1024)
+    reserve = manager.memory_plan.observe_cache([live], 2048)
+    manager._prefill_reserve_bytes = reserve
+    resident = manager.resident_bytes()
+    start = reserve + 4096
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(2048))
+    if path == "store":
+        stored = manager.store_exact_cache(tokens, [live])
+    else:
+        coordinator = coordinate(manager, [live])
+        assert coordinator.is_checkpoint
+        stored = coordinator.store_checkpoint(tokens, [live])
+    assert stored == (not prefilling)
+    if prefilling:
+        # The next chunk's concatenation: (window - 1 + chunk) tokens, K and V.
+        assert manager._memory_headroom() >= (1024 - 1 + 1024) * 32
+
+
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_compaction_reserve(path, managers, monkeypatch):
+    """A buffered window compacts into buffers of its allocated capacity,
+    which an earlier larger chunk can leave above the window-plus-chunk
+    footprint: a continuation stored mid-prefill keeps room for that."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    manager = managers(budget=1 << 30)
+
+    def buffered(tokens):
+        return filled(
+            C.BufferedRotatingKVCache(32, buffer_size=32),
+            length=tokens,
+            heads=1,
+            dim=4,
+        )
+
+    assert manager.store_exact_cache(list(range(16)), [buffered(16)])
+    live = buffered(256)  # one 256-token chunk; the rest uses 32-token chunks
+    manager.memory_plan.prepare([257], chunk_size=32)
+    manager._prefill_reserve_bytes = manager.memory_plan.observe_cache([live], 256)
+    resident = manager.resident_bytes()
+    start = P._cache_nbytes([live]) + 2048
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(256))
+    if path == "store":
+        manager.store_exact_cache(tokens, [live])
+    else:
+        coordinator = coordinate(manager, [live])
+        assert coordinator.is_checkpoint
+        coordinator.store_checkpoint(tokens, [live])
+    # The next compaction allocates K and V at the buffers' capacity.
+    assert live._planned_drop(1) > 0
+    assert manager._memory_headroom() >= live.keys.nbytes + live.values.nbytes
+
+
+@parametrize("evict", [True, False])
+def test_continuation_evicts_superseded_checkpoint_keeps_side_entry(
+    evict, managers, monkeypatch
+):
+    """APC_EVICT_SUPERSEDED=1, two entries: an agent's side request keeps its own
+    checkpoint while the conversation goes on, because the next turn's checkpoint
+    replaces the turn it extends instead of holding both (a whole cache each) and
+    pushing the side request's out. Off (the default) keeps the earlier turn for
+    an edited last message, and the side request's entry goes."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1" if evict else "0")
+    manager = managers(budget=1 << 30)
+    turn = list(range(64))
+    side = list(range(5000, 5032))
+    assert manager.store_exact_cache(turn, [allocated(64)])
+    assert manager.store_exact_cache(side, [allocated(32)])
+    assert manager.lookup_exact_cache(turn + [7])[1] == len(turn)
+    longer = turn + list(range(1000, 1064))
+    assert manager.store_exact_cache(longer, [allocated(128)])
+    resident = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+    kept = side if evict else turn
+    assert resident == sorted([len(kept), len(longer)])
+    assert manager.lookup_exact_cache(kept + [7])[1] == len(kept)
+    assert manager.lookup_exact_cache(longer + [7])[1] == len(longer)
+
+
+def checkpoint_caches(length):
+    """Dense K/V plus recurrent state: a checkpoint-strategy layout."""
+    state = C.ArraysCache(1)
+    state[0] = mx.ones((1, 1))
+    return [filled(C.KVCache(), length=length, heads=1, dim=4), state]
+
+
+def test_apc_single_copy_claims_a_checkpoint_once(managers, monkeypatch):
+    """APC_SINGLE_COPY: two lookups that select the same checkpoint cannot both
+    take it; the second to claim it looks again instead of sharing its cache."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    restore_bytes = manager.memory_plan.restore_bytes
+    racing = []
+
+    def race(*args, **kwargs):
+        # Another request selects and takes the same entry in between.
+        if not racing:
+            racing.append(None)
+            racing[0] = manager.lookup_exact_cache(tokens + [7], take=True)
+        return restore_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(manager.memory_plan, "restore_bytes", race)
+    cache, prefix_len = manager.lookup_exact_cache(tokens + [7], take=True)
+    ((taken, taken_len),) = racing
+    assert taken_len == len(tokens)
+    assert (cache, prefix_len) == (None, 0)
+    assert manager.is_taken(tokens) and not manager._exact_cache
+
+
+def test_apc_single_copy_clones_for_other_callers(managers, monkeypatch):
+    """APC_SINGLE_COPY moves a checkpoint only to a caller that hands it back
+    or replaces it (the batch generator, ``take=True``). Others (stream_generate,
+    diffusion) get a clone, so a repeated prompt still finds the checkpoint
+    after the request has used its cache."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    (stored,) = [e.prompt_cache for e in manager._exact_cache.values()]
+    coordinator = coordinate(manager, checkpoint_caches(1))
+
+    def lookup(**kwargs):
+        return coordinator.lookup(
+            tokens + [7],
+            extra_hash=0,
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda n: True,
+            prefix_has_media=lambda n: False,
+            **kwargs,
+        )
+
+    for _ in range(2):  # the same prompt twice
+        hit = lookup()
+        assert hit["prefix_len"] == len(tokens)
+        assert not any(c is s for c, s in zip(hit["warm_cache"], stored))
+        filled(hit["warm_cache"][0], length=1, heads=1, dim=4)  # the request runs
+        assert not manager._moved
+    hit = lookup(take=True)
+    assert hit["warm_cache"][0] is stored[0] and manager.is_taken(tokens)
+
+
+def test_apc_single_copy_falls_back_until_a_replacement_is_stored(
+    managers, monkeypatch
+):
+    """APC_SINGLE_COPY with APC_EVICT_SUPERSEDED: a leaving row whose longest
+    deferred checkpoint cannot be retained keeps a shorter one (here the one it
+    took) instead of releasing its buffers into a refused store."""
+    from mlx_vlm.apc_coordinator import finish_deferred_checkpoints
+
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens[:32], checkpoint_caches(32))
+    coordinator = coordinate(manager, checkpoint_caches(1))
+    live, prefix_len = manager.lookup_exact_cache(tokens + [7], take=True)
+    assert prefix_len == 32 and manager.is_taken(tokens[:32])
+    taken = coordinator.defer_checkpoint(tokens[:32], live)
+    taken.taken = live.lease
+    filled(live[0], length=32, heads=1, dim=4)  # the prefill continues
+    longest = coordinator.defer_checkpoint(tokens, live)
+    # The shorter fits the store, the longer does not (K/V: 32 bytes a token).
+    manager.memory_max_bytes = 48 * 32
+    finish_deferred_checkpoints([taken, longest], live, 0, release=True)
+    resident = [e.token_ids for e in manager._exact_cache.values()]
+    assert resident == [tuple(tokens[:32])]
+    assert not manager._moved
+    monkeypatch.setattr(manager, "memory_max_bytes", 1 << 30)
+    assert manager.lookup_exact_cache(tokens + [7])[1] == 32
+
+
+def single_copy_lookup(coordinator, token_ids, **kwargs):
+    return coordinator.lookup(
+        token_ids,
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda n: True,
+        prefix_has_media=lambda n: False,
+        **kwargs,
+    )
+
+
+def test_apc_single_copy_clone_does_not_race_a_take(managers, monkeypatch):
+    """APC_SINGLE_COPY: a cloning lookup that selected a checkpoint another
+    request then takes and advances does not clone the advanced state under
+    the old prefix length; it looks again."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    restore_bytes = manager.memory_plan.restore_bytes
+    racing = []
+
+    def race(*args, **kwargs):
+        if not racing:  # the taker prefills into the cache it took
+            racing.append(None)
+            racing[0], _ = manager.lookup_exact_cache(tokens + [7], take=True)
+            filled(racing[0][0], length=1, heads=1, dim=4)
+        return restore_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(manager.memory_plan, "restore_bytes", race)
+    assert manager.lookup_exact_cache(tokens + [7]) == (None, 0)
+    assert racing[0][0].offset == len(tokens) + 1
+
+
+def test_apc_single_copy_copy_keeps_the_active_prefill_reserve(managers, monkeypatch):
+    """APC_SINGLE_COPY: a row leaving a batch that keeps its other rows stores
+    a copy only if its new bytes fit on top of the reserve of a prefill still
+    running, not merely the larger of the two."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(32))
+    live = checkpoint_caches(32)
+    deferred = coordinate(manager, checkpoint_caches(1)).defer_checkpoint(tokens, live)
+    copy, reserve = 32 * 32, 8192  # the K/V prefix copied; another prefill's
+    for spare, stored in ((copy - 1, False), (copy, True)):
+        manager._prefill_reserve_bytes = reserve
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: reserve + spare)
+        assert deferred.finish(live, 0, release=False) == stored
+        assert bool(manager._exact_cache) == stored
+
+
+def test_apc_single_copy_copy_taken_stores_the_compact_checkpoint(
+    managers, monkeypatch
+):
+    """APC_SINGLE_COPY: a right-padded row copies instead. The compact copy
+    goes back to the store (within its byte budget) and the row keeps the
+    cache that lookup expanded to the follow-up's capacity."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    coordinator = coordinate(manager, checkpoint_caches(1))
+    hit = single_copy_lookup(coordinator, tokens + list(range(100, 300)), take=True)
+    assert hit["warm_cache"][0].keys.shape[2] >= 264 and manager._moved
+    manager.memory_max_bytes = 4096  # the compact 64 tokens fit, 264 do not
+    coordinator.copy_taken(hit)
+    assert [e.token_ids for e in manager._exact_cache.values()] == [tuple(tokens)]
+    assert not manager._moved
+    assert hit["warm_cache"][0].keys.shape[2] >= 264
+
+
+@parametrize("path", ["return", "finish"])
+def test_apc_single_copy_ending_a_take_keeps_a_later_take(path, managers, monkeypatch):
+    """APC_SINGLE_COPY: a request that hands back (or stores) the checkpoint it
+    took ends its own lease, not the one of a request that takes the entry as
+    soon as it is back in the store."""
+    from mlx_vlm.apc_coordinator import finish_deferred_checkpoints
+
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    taken, _ = manager.lookup_exact_cache(tokens + [7], take=True)
+    store, later = manager.store_exact_cache, []
+
+    def store_then_take(*args, **kwargs):
+        stored = store(*args, **kwargs)
+        if not later:
+            later.append(manager.lookup_exact_cache(tokens + [7], take=True))
+        return stored
+
+    monkeypatch.setattr(manager, "store_exact_cache", store_then_take)
+    if path == "return":
+        manager.return_taken(tokens, taken)
+    else:
+        deferred = coordinate(manager, checkpoint_caches(1)).defer_checkpoint(
+            tokens, taken
+        )
+        deferred.taken = taken.lease
+        finish_deferred_checkpoints([deferred], taken, 0, release=True)
+    ((_, prefix_len),) = later
+    assert prefix_len == len(tokens) and manager.is_taken(tokens)
+
+
+def test_apc_single_copy_takes_only_checkpoint_layouts(managers, monkeypatch):
+    """APC_SINGLE_COPY: only checkpoint layouts defer their stores and hand a
+    taken checkpoint back, so a dense (block-strategy) model copies instead."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers(budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens, [allocated(64)])
+    coordinator = coordinate(manager, [C.KVCache()])
+    assert not coordinator.is_checkpoint
+    single_copy_lookup(coordinator, tokens + [7], take=True)
+    assert not manager._moved and len(manager._exact_cache) == 1
+
+
+def test_apc_single_copy_never_takes_a_checkpoint_being_written(managers, monkeypatch):
+    """APC_SINGLE_COPY with a disk tier: a pending disk write still reads the
+    stored cache objects, so a lookup clones that entry instead of taking it
+    (and advancing what the writer will persist)."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers("disk", budget=1 << 30)
+    release = threading.Event()
+    write = manager.disk._write_payload
+
+    def blocked_write(*args, **kwargs):
+        release.wait(10)
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(manager.disk, "_write_payload", blocked_write)
+    tokens = list(range(64))
+    try:
+        assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+        (entry,) = manager._exact_cache.values()
+        cache, prefix_len = manager.lookup_exact_cache(tokens + [7], take=True)
+        assert prefix_len == len(tokens) and not manager._moved
+        assert cache[0] is not entry.prompt_cache[0]
+        assert list(manager._exact_cache.values()) == [entry]
+    finally:
+        release.set()
+        manager.disk.flush()
+
+
+@parametrize("take", [True, False])
+def test_apc_single_copy_keeps_the_memory_fallback_of_a_disk_restore(
+    take, managers, monkeypatch
+):
+    """APC_SINGLE_COPY: making room for a longer disk checkpoint evicts the
+    shorter resident one before the disk restore is abandoned (its expansion
+    does not fit). No request took it, so the lookup still restores (or takes)
+    it instead of missing."""
+    monkeypatch.setenv("APC_SINGLE_COPY", "1")
+    manager = managers("disk", budget=1 << 30)
+    tokens = list(range(64))
+    assert manager.store_exact_cache(tokens[:32], checkpoint_caches(32))
+    assert manager.store_exact_cache(tokens, checkpoint_caches(64))
+    manager.disk.flush()
+    longer = P._sequence_hash(tuple(tokens), 0, manager.block_size)
+    del manager._exact_cache[longer]  # only on disk now
+    # Room for the shorter restore (a 256-token buffer, K and V), not for the
+    # longer one's expansion twice over.
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 10_000)
+    cache, prefix_len = manager.lookup_exact_cache(tokens + [7], take=take)
+    assert manager.stats.memory_skips >= 1  # the disk restore was refused
+    assert prefix_len == 32 and cache[0].offset == 32
+    assert manager.is_taken(tokens[:32]) == take
+
+
 def test_accounting_and_eviction(memory_manager, monkeypatch):
     cache = NS(
         state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},
