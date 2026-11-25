@@ -28,12 +28,13 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
     int q_head_idx = batch_head_idx - batch_idx * NUM_Q_HEADS;
     int kv_head_idx = q_head_idx / GQA_FACTOR;
 
+    long q_row = long(batch_head_idx) * long(query_length) + long(query_idx);
     const device T* qptr =
-        queries + ((batch_head_idx * query_length + query_idx) * QK_DIM) +
-        int(simd_lid) * qk_per_thread;
+        queries + q_row * long(QK_DIM) +
+        long(simd_lid) * qk_per_thread;
     device T* optr =
-        out + ((batch_head_idx * query_length + query_idx) * V_DIM) +
-        int(simd_gid) * v_per_thread;
+        out + q_row * long(V_DIM) +
+        long(simd_gid) * v_per_thread;
 
     U s = U(scale[0]);
     for (int i = 0; i < qk_per_thread; i++) {
@@ -43,7 +44,10 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
         o[i] = 0;
     }
 
-    int indices_offset = (batch_idx * query_length + query_idx) * TOPK;
+    long indices_offset =
+        (long(batch_idx) * long(query_length) + long(query_idx)) * long(TOPK);
+    long kv_head_base =
+        long(batch_idx * NUM_KV_HEADS + kv_head_idx) * long(key_length);
     U max_score = -3.4028234663852886e38f;
     U sum_exp_score = 0;
 
@@ -55,10 +59,8 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
         U score = -3.4028234663852886e38f;
         if (valid) {
             const device T* kptr =
-                keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                         key_pos) *
-                        QK_DIM) +
-                int(simd_lid) * qk_per_thread;
+                keys + (kv_head_base + long(key_pos)) * long(QK_DIM) +
+                long(simd_lid) * qk_per_thread;
             score = 0;
             for (int j = 0; j < qk_per_thread; j++) {
                 score += q[j] * static_cast<U>(kptr[j]);
@@ -75,10 +77,8 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
 
         if (valid) {
             const device T* vptr =
-                values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                           key_pos) *
-                          V_DIM) +
-                int(simd_lid) * v_per_thread;
+                values + (kv_head_base + long(key_pos)) * long(V_DIM) +
+                long(simd_lid) * v_per_thread;
             for (int j = 0; j < v_per_thread; j++) {
                 o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
             }

@@ -3927,3 +3927,96 @@ def test_ernie55_hyper_connection_epsilon_and_sinkhorn_reference():
     )
     np.testing.assert_allclose(post, expected_post, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(comb, expected_comb, atol=2e-6, rtol=2e-6)
+
+
+def _reference_sparse_attention(q, k, v, indices, scale):
+    batch, q_heads, query_length, _ = q.shape
+    kv_heads = k.shape[1]
+    gqa = q_heads // kv_heads
+    v_dim = v.shape[-1]
+    outputs = []
+    for b in range(batch):
+        head_outs = []
+        for h in range(q_heads):
+            kv_h = h // gqa
+            row_outs = []
+            for qi in range(query_length):
+                idx = indices[b, qi]
+                valid = idx >= 0
+                safe_idx = mx.maximum(idx, 0)
+                kh = k[b, kv_h, safe_idx].astype(mx.float32)
+                vh = v[b, kv_h, safe_idx].astype(mx.float32)
+                scores = (q[b, h, qi : qi + 1].astype(mx.float32) @ kh.T) * scale
+                scores = mx.where(
+                    valid[None, :], scores, mx.array(-1e30, dtype=mx.float32)
+                )
+                weights = mx.softmax(scores, axis=-1)
+                row_outs.append((weights @ vh).astype(q.dtype))
+            head_outs.append(mx.concatenate(row_outs, axis=0))
+        outputs.append(mx.stack(head_outs, axis=0))
+    return mx.stack(outputs, axis=0).reshape(batch, q_heads, query_length, v_dim)
+
+
+@pytest.mark.skipif(
+    not (mx.default_device() == mx.gpu and mx.metal.is_available()),
+    reason="Metal GPU required",
+)
+def test_indexed_sparse_attention_matches_reference():
+    from mlx_vlm.models.sparse_attention import indexed_sparse_attention
+
+    mx.random.seed(0)
+    q = mx.random.normal((2, 8, 3, 64)).astype(mx.bfloat16)
+    k = mx.random.normal((2, 4, 64, 64)).astype(mx.bfloat16)
+    v = mx.random.normal((2, 4, 64, 64)).astype(mx.bfloat16)
+    idx = mx.array(
+        [
+            [[0, 5, 17, 63, -1, -1, 12, 31]] * 3,
+            [[1, 9, 24, 48, 62, -1, 3, 19]] * 3,
+        ],
+        dtype=mx.int32,
+    )
+    scale = 64**-0.5
+
+    out = indexed_sparse_attention(q, k, v, idx, scale=scale)
+    ref = _reference_sparse_attention(q, k, v, idx, scale=scale)
+    mx.eval(out, ref)
+
+    assert out is not None
+    assert mx.all(mx.isfinite(out)).item()
+    assert mx.max(mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))).item() < 2e-2
+
+
+@pytest.mark.skipif(
+    not (mx.default_device() == mx.gpu and mx.metal.is_available()),
+    reason="Metal GPU required",
+)
+def test_indexed_sparse_attention_offsets_past_int32_max():
+    from mlx_vlm.models.sparse_attention import indexed_sparse_attention
+
+    # Regression test for #2775: 64 * 133120 * 256 = 2,181,038,080 > 2^31 - 1.
+    # Reuse one KV buffer (~4.36 GB in bf16) to keep peak memory moderate.
+    info = mx.metal.device_info()
+    if info.get("max_recommended_working_set_size", 0) < 10 * 1024**3:
+        pytest.skip("Requires >=10 GiB Metal working set")
+
+    batch, heads, key_len, dim, topk = 1, 64, 133120, 256, 16
+    mx.random.seed(0)
+    q = mx.random.normal((batch, heads, 1, dim)).astype(mx.bfloat16)
+    kv = mx.random.normal((batch, heads, key_len, dim)).astype(mx.bfloat16)
+    idx = mx.array([[[key_len - 1 - i for i in range(topk)]]], dtype=mx.int32)
+    scale = dim**-0.5
+
+    out = indexed_sparse_attention(q, kv, kv, idx, scale=scale)
+    mx.eval(out)
+
+    assert out is not None
+    assert mx.all(mx.isfinite(out)).item()
+
+    for h in (0, heads - 2, heads - 1):
+        kh = kv[0, h, idx[0, 0]].astype(mx.float32)
+        scores = (q[0, h, 0:1].astype(mx.float32) @ kh.T) * scale
+        ref = (mx.softmax(scores, axis=-1) @ kh).astype(mx.bfloat16)
+        diff = mx.max(
+            mx.abs(out[0, h, 0].astype(mx.float32) - ref[0].astype(mx.float32))
+        ).item()
+        assert diff < 2e-2, f"head {h} max_abs_diff={diff}"
