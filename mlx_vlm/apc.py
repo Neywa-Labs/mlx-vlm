@@ -3127,6 +3127,11 @@ class APCManager:
         self.exact_cache_min_tokens = max(
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
+        # Opt-in: a checkpoint that extends resident ones (the same conversation's
+        # earlier turns) evicts them. With several entries the default keeps them
+        # for an edited or regenerated last message; an agent's conversation only
+        # grows, and they cost a whole cache each.
+        self.evict_superseded = os.environ.get("APC_EVICT_SUPERSEDED", "0") == "1"
         self.checkpoint_interval_tokens = max(
             0,
             int(
@@ -3296,12 +3301,25 @@ class APCManager:
             min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
         )
 
-    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
-        """Evict idle APC state before allocating; never alter leased blocks."""
+    def _make_room(
+        self,
+        allocation_bytes: int = 0,
+        *,
+        retain_bytes: int = 0,
+        prefill_reserve: Optional[int] = None,
+    ) -> bool:
+        """Evict idle APC state before allocating; never alter leased blocks.
+
+        ``prefill_reserve`` replaces the prefill reserve when given (see
+        ``store_prefill_reserve``).
+        """
+        prefill = (
+            self._prefill_reserve_bytes if prefill_reserve is None else prefill_reserve
+        )
         required = self.memory_reserve_bytes + (
-            self._prefill_reserve_bytes + allocation_bytes
+            prefill + allocation_bytes
             if retain_bytes
-            else max(self._prefill_reserve_bytes, allocation_bytes)
+            else max(prefill, allocation_bytes)
         )
         with self.lock:
             resident = self._resident_bytes_locked()
@@ -3341,6 +3359,37 @@ class APCManager:
             resident + retain_bytes <= self.memory_max_bytes
             and self._memory_headroom() >= required
         )
+
+    def extends_resident_checkpoint(
+        self, token_ids: Sequence[int], extra_hash: int = 0
+    ) -> bool:
+        """True if a resident exact checkpoint is a strict prefix of
+        ``token_ids``: a snapshot of them continues and replaces it."""
+        tokens = tuple(int(t) for t in token_ids)
+        with self.lock:
+            return any(
+                entry.extra_hash == extra_hash
+                and len(entry.token_ids) < len(tokens)
+                and tokens[: len(entry.token_ids)] == entry.token_ids
+                for entry in self._exact_cache.values()
+            )
+
+    def store_prefill_reserve(
+        self, token_ids: Sequence[int], prompt_cache: Sequence[Any], extra_hash: int = 0
+    ) -> Optional[int]:
+        """The prefill reserve a snapshot of ``prompt_cache`` must leave free,
+        or None for the whole of it.
+
+        A continuation (``extends_resident_checkpoint``) replaces the checkpoint
+        it extends, and the next request makes room for its own prefill before
+        allocating. It holds only what the active prefill still allocates
+        (``PrefillMemoryPlan.remaining_reserve_bytes``). Decide before making
+        room, which can evict the checkpoint being extended, and from the live
+        cache.
+        """
+        if not self.extends_resident_checkpoint(token_ids, extra_hash):
+            return None
+        return self.memory_plan.remaining_reserve_bytes(prompt_cache, len(token_ids))
 
     def prepare_prefill(self, reserve_bytes: int) -> bool:
         """Enforce the coordinator's byte budget before new allocations."""
@@ -3574,8 +3623,13 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        prefill_reserve: Optional[int] = None,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``prefill_reserve``: as decided by ``store_prefill_reserve`` before any
+        room-making; decided here when None.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3585,12 +3639,23 @@ class APCManager:
         self._prefill_reserve_bytes = self.memory_plan.observe_cache(
             prompt_cache, len(token_tuple), live_bytes=size
         )
+        if prefill_reserve is None:
+            prefill_reserve = self.store_prefill_reserve(
+                token_tuple, prompt_cache, extra_hash
+            )
         if self.disk is not None:
             self.disk.flush()
+        # A continuation whose live buffers already hold the rest of its prefill
+        # leaves out the reserve that prefill no longer needs. Otherwise
+        # room-making evicts the checkpoint being extended and the store then
+        # refuses itself for lack of that reserve, so every second turn
+        # re-reads the conversation.
         retain = (
             self._exact_cache_max > 0
             and size <= self.memory_max_bytes
-            and self._make_room(size, retain_bytes=size)
+            and self._make_room(
+                size, retain_bytes=size, prefill_reserve=prefill_reserve
+            )
         )
         if not retain:
             self._make_room()
@@ -3631,6 +3696,18 @@ class APCManager:
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
+                if self.evict_superseded:
+                    # The checkpoints this one extends are the same conversation's
+                    # earlier turns. Kept beside it, a whole cache each, they push
+                    # out what the other entries are for (an agent's side request).
+                    for old in [
+                        k
+                        for k, e in self._exact_cache.items()
+                        if e.extra_hash == int(extra_hash)
+                        and len(e.token_ids) < len(token_tuple)
+                        and token_tuple[: len(e.token_ids)] == e.token_ids
+                    ]:
+                        del self._exact_cache[old]
                 self._exact_cache[key] = APCExactCacheEntry(
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),

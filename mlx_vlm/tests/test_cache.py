@@ -2909,6 +2909,208 @@ def test_admission_before_allocation(operation, memory_manager, monkeypatch):
     assert manager.stats.memory_skips >= 1
 
 
+@parametrize("continues", [True, False])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_skips_prefill_reserve(
+    path, continues, managers, monkeypatch
+):
+    """A checkpoint that extends the resident one replaces it without also holding
+    the next prefill's reserve; any other store still holds it. (27B at ~100K:
+    7.8 GB needed with ~7 GB free, so every second turn re-read the prompt.)"""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+    old_tokens = list(range(64))
+    assert manager.store_exact_cache(old_tokens, [allocated(64)])
+    head = old_tokens if continues else list(range(5000, 5064))
+    new_tokens = head + list(range(1000, 1064))
+    if path == "store":
+        new = [allocated(128)]
+
+        def store():
+            return manager.store_exact_cache(new_tokens, new)
+
+    else:
+        new = [filled(batch_cache("dense"), length=128, heads=1, dim=4)]
+
+        def store():
+            return coordinate(manager, new).store_checkpoint(
+                new_tokens, new, batch_idx=0
+            )
+
+    # Room for the snapshot, not for a prefill reserve of the same size on top.
+    size = P._cache_nbytes(new)
+    monkeypatch.setattr(manager.memory_plan, "observe_cache", lambda *a, **k: size)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: size + size // 4)
+    assert store() == continues
+    if continues:
+        # The replacement is resident: the next request restores all of it.
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        assert manager.lookup_exact_cache(new_tokens + [7])[1] == len(new_tokens)
+    else:
+        assert manager.stats.memory_skips >= 1
+
+
+@parametrize("buffers", ["full", "reserved", "unaligned"])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_active_prefill_reserve(
+    path, buffers, managers, monkeypatch
+):
+    """A continuation stored mid-prefill keeps what the rest of its prefill
+    allocates: the next token's K/V growth still fits after the store. Live
+    buffers that already hold the prompt (a restored prefix's capacity, or a
+    step grown past it from an unaligned offset) need none of the reserve."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+    assert manager.store_exact_cache(list(range(64)), [allocated(64)])
+    if buffers == "unaligned":
+        live = C.KVCache()
+        live.state = tuple(mx.ones((1, 1, 2000, 4)) for _ in range(2))
+        filled(live, length=48, heads=1, dim=4)  # 2000 + one 256-token step
+    else:
+        live = filled(C.KVCache(), length=2048, heads=1, dim=4)  # at capacity
+        if buffers == "reserved":
+            live.prefix_cache_reserve(2049)
+    state = C.ArraysCache(1)  # recurrent state: a checkpoint-restored layout
+    state[0] = mx.ones((1, 1))
+    caches = [live, state]
+    capacity = live.keys.shape[2]
+    fits = capacity > 2048
+    # The final token is still to prefill.
+    manager.memory_plan.prepare([2049], chunk_size=2048)
+    reserve = manager.memory_plan.observe_cache(caches, 2048)
+    manager._prefill_reserve_bytes = reserve
+    resident = manager.resident_bytes()
+    start = reserve + 4096
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(2048))
+    if path == "store":
+        stored = manager.store_exact_cache(tokens, caches)
+    else:
+        coordinator = coordinate(manager, caches)
+        assert coordinator.is_checkpoint
+        stored = coordinator.store_checkpoint(tokens, caches)
+    growth = live.memory_profile(2048).footprint(2049, 2048)
+    assert manager._memory_headroom() >= (0 if fits else growth)
+    assert stored == fits
+    # The prefill continues: the cache grows only if its buffers were full.
+    filled(live, length=1, heads=1, dim=4)
+    assert (live.keys.shape[2] == capacity) == fits
+    if fits:
+        monkeypatch.setattr(manager, "_memory_headroom", lambda: 1 << 40)
+        assert manager.lookup_exact_cache(tokens + [7])[1] == len(tokens)
+
+
+@parametrize("prefilling", [True, False])
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_window_replacement_reserve(
+    path, prefilling, managers, monkeypatch
+):
+    """A sliding window replaces its buffers on every multi-token update, so a
+    continuation stored mid-prefill keeps room for the next replacement; one
+    stored after the prefill (no update left) needs none of the reserve."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "1")
+    manager = managers(budget=1 << 30)
+
+    def window(tokens):
+        cache = C.RotatingKVCache(1024)
+        for start in range(0, tokens, 1024):
+            filled(cache, length=min(1024, tokens - start), heads=1, dim=4)
+        return cache
+
+    assert manager.store_exact_cache(list(range(64)), [window(64)])
+    live = window(2048)
+    manager.memory_plan.prepare([4097 if prefilling else 2048], chunk_size=1024)
+    reserve = manager.memory_plan.observe_cache([live], 2048)
+    manager._prefill_reserve_bytes = reserve
+    resident = manager.resident_bytes()
+    start = reserve + 4096
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(2048))
+    if path == "store":
+        stored = manager.store_exact_cache(tokens, [live])
+    else:
+        coordinator = coordinate(manager, [live])
+        assert coordinator.is_checkpoint
+        stored = coordinator.store_checkpoint(tokens, [live])
+    assert stored == (not prefilling)
+    if prefilling:
+        # The next chunk's concatenation: (window - 1 + chunk) tokens, K and V.
+        assert manager._memory_headroom() >= (1024 - 1 + 1024) * 32
+
+
+@parametrize("path", ["store", "coordinator"])
+def test_continuation_checkpoint_keeps_compaction_reserve(path, managers, monkeypatch):
+    """A buffered window compacts into buffers of its allocated capacity,
+    which an earlier larger chunk can leave above the window-plus-chunk
+    footprint: a continuation stored mid-prefill keeps room for that."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    manager = managers(budget=1 << 30)
+
+    def buffered(tokens):
+        return filled(
+            C.BufferedRotatingKVCache(32, buffer_size=32),
+            length=tokens,
+            heads=1,
+            dim=4,
+        )
+
+    assert manager.store_exact_cache(list(range(16)), [buffered(16)])
+    live = buffered(256)  # one 256-token chunk; the rest uses 32-token chunks
+    manager.memory_plan.prepare([257], chunk_size=32)
+    manager._prefill_reserve_bytes = manager.memory_plan.observe_cache([live], 256)
+    resident = manager.resident_bytes()
+    start = P._cache_nbytes([live]) + 2048
+    monkeypatch.setattr(
+        manager,
+        "_memory_headroom",
+        lambda: start - (manager.resident_bytes() - resident),
+    )
+    tokens = list(range(256))
+    if path == "store":
+        manager.store_exact_cache(tokens, [live])
+    else:
+        coordinator = coordinate(manager, [live])
+        assert coordinator.is_checkpoint
+        coordinator.store_checkpoint(tokens, [live])
+    # The next compaction allocates K and V at the buffers' capacity.
+    assert live._planned_drop(1) > 0
+    assert manager._memory_headroom() >= live.keys.nbytes + live.values.nbytes
+
+
+@parametrize("evict", [True, False])
+def test_continuation_evicts_superseded_checkpoint_keeps_side_entry(
+    evict, managers, monkeypatch
+):
+    """APC_EVICT_SUPERSEDED=1, two entries: an agent's side request keeps its own
+    checkpoint while the conversation goes on, because the next turn's checkpoint
+    replaces the turn it extends instead of holding both (a whole cache each) and
+    pushing the side request's out. Off (the default) keeps the earlier turn for
+    an edited last message, and the side request's entry goes."""
+    monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
+    monkeypatch.setenv("APC_EVICT_SUPERSEDED", "1" if evict else "0")
+    manager = managers(budget=1 << 30)
+    turn = list(range(64))
+    side = list(range(5000, 5032))
+    assert manager.store_exact_cache(turn, [allocated(64)])
+    assert manager.store_exact_cache(side, [allocated(32)])
+    assert manager.lookup_exact_cache(turn + [7])[1] == len(turn)
+    longer = turn + list(range(1000, 1064))
+    assert manager.store_exact_cache(longer, [allocated(128)])
+    resident = sorted(len(e.token_ids) for e in manager._exact_cache.values())
+    kept = side if evict else turn
+    assert resident == sorted([len(kept), len(longer)])
+    assert manager.lookup_exact_cache(kept + [7])[1] == len(kept)
+    assert manager.lookup_exact_cache(longer + [7])[1] == len(longer)
+
+
 def test_accounting_and_eviction(memory_manager, monkeypatch):
     cache = NS(
         state={"kv": mx.ones((2, 3)), "nested": [mx.zeros((4,))]},
