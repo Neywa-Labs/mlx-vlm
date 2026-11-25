@@ -2945,6 +2945,33 @@ def test_accounting_and_eviction(memory_manager, monkeypatch):
         assert manager.resident_bytes() == 0 and not manager._make_room()
 
 
+def test_cache_nbytes_counts_transient_state_views():
+    class StateView:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        @property
+        def state(self):
+            return {"tensor": self.tensor[1:]}
+
+    tensors = [mx.arange(size, dtype=mx.float32) for size in range(4, 19)]
+    caches = [StateView(tensor) for tensor in tensors]
+    expected = sum((tensor.size - 1) * tensor.itemsize for tensor in tensors)
+    assert C.cache_nbytes(caches) == expected
+
+
+@parametrize("bits", [6, 8])
+def test_batch_quantized_cache_accounts_reserved_capacity(bits):
+    cache = C.BatchQuantizedKVCache([0], group_size=64, bits=bits)
+    cache.step = 256
+    keys = mx.arange(2 * 17 * 64).reshape(1, 2, 17, 64).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, keys + 1)
+    allocated_bytes = sum(array.nbytes for array in (*cache.keys, *cache.values))
+    assert C.cache_nbytes(cache) == allocated_bytes
+    cache.trim(16)
+    assert C.cache_nbytes(cache) == allocated_bytes
+
+
 def test_single_row_checkpoint(managers):
     tokens = list(range(32))
     arrays = C.ArraysCache(1)
