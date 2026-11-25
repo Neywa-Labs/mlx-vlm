@@ -19,6 +19,9 @@ class Model(Mistral3Model):
         self.language_model = LanguageModel(config.text_config)
         self.vision_feature_layer = config.vision_feature_layer
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
     def shard(self, group=None, *, weights=None):
         """Shard parameters and optionally select checkpoint weights before conversion."""
         args = self.language_model.args

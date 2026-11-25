@@ -55,6 +55,9 @@ class Model(Qwen3VLModel):
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,

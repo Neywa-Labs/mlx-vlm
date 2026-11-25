@@ -24,6 +24,9 @@ class Model(Qwen3_5Model):
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
     def sanitize(self, weights):
         # The MTP predictor is a separate speculative artifact and is not part
         # of the base conditional-generation model.

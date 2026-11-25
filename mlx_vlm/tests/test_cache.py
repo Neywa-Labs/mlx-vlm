@@ -4842,3 +4842,83 @@ def test_ernie55_cache_merge_extract_filter_and_reset():
         atol=2e-5,
         rtol=2e-5,
     )
+
+
+@parametrize(
+    "module_name",
+    [
+        "aya_vision",
+        "baichuan_m1",
+        "cohere_compass",
+        "gemma3",
+        "llama",
+        "llama4",
+        "mistral3",
+        "mistral_large4",
+        "nemotron_h_nano_omni",
+        "nemotron_nas",
+        "olmo3",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+        "step3p7",
+    ],
+)
+def test_vlm_wrapper_delegates_make_cache(module_name):
+    """Every VLM wrapper whose language model defines ``make_cache`` must
+    expose it on the top-level Model, or ``make_prompt_cache(model)`` falls
+    back to a per-layer ``KVCache`` and builds the wrong cache classes."""
+    module = importlib.import_module(f"mlx_vlm.models.{module_name}")
+    assert hasattr(module.Model, "make_cache")
+
+
+@parametrize(
+    "case_id",
+    [
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+        "mistral_large4",
+        "nemotron_super_vl",
+        "TestModels.aya_vision",
+        "TestModels.gemma3",
+        "TestModels.llama4",
+        "TestModels.ministral3",
+        "TestModels.mistral4",
+        "TestModels.granite_docling",
+        "TestGetInputEmbeddings.qwen3_omni_moe_input_embeddings",
+    ],
+)
+def test_prompt_cache_matches_language_model_cache(case_id):
+    """``make_prompt_cache(model)`` must produce the cache classes the model
+    declares, not a blanket ``KVCache`` per layer."""
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    mx.random.seed(7)
+    case = next(case for case in DATA["cases"] if case["id"] == case_id)
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    config = build_config(module, case["config"])
+    model = module.Model(config)
+    expected = [type(cache).__name__ for cache in model.language_model.make_cache()]
+    actual = [type(cache).__name__ for cache in make_prompt_cache(model)]
+    assert actual == expected
+
+
+def test_llama_prompt_cache_keeps_sliding_layers_rotating():
+    from mlx_vlm.models import llama
+    from mlx_vlm.models.cache import RotatingKVCache, make_prompt_cache
+
+    config = llama.ModelConfig(
+        model_type="llama",
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=4,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=8,
+    )
+    caches = make_prompt_cache(llama.Model(config))
+    assert isinstance(caches[0], RotatingKVCache)
+    assert not isinstance(caches[1], RotatingKVCache)

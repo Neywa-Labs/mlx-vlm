@@ -116,6 +116,9 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.layers
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
     def _merge_features(self, inputs_embeds, input_ids, token_id, features, name):
         if token_id is None:
             raise ValueError(f"{name} context token id is not configured.")

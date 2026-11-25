@@ -34,6 +34,9 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.layers
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
     def _process_image_features(self, image_features):
         b, p, c = image_features.shape
         hw = int(p**0.5)
