@@ -27,6 +27,7 @@ class DFlash2Config(DFlashConfig):
     selector_top_k: int = 0
     is_causal: bool = False
     no_rope_layers: list[int] = field(default_factory=list)
+    num_target_layers: int | None = None
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -44,7 +45,6 @@ class DFlash2Config(DFlashConfig):
             "vocab_size",
             "max_position_embeddings",
             "block_size",
-            "num_target_layers",
             "conv_kernel_size",
             "conv_group_size",
             "selector_rank",
@@ -54,6 +54,10 @@ class DFlash2Config(DFlashConfig):
             value = getattr(self, key)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"DFlash2 requires a positive integer {key}.")
+        if self.num_target_layers is not None and (
+            not isinstance(self.num_target_layers, int) or self.num_target_layers <= 0
+        ):
+            raise ValueError("DFlash2 requires a positive integer num_target_layers.")
         if self.model_type != "dflash2":
             raise ValueError(
                 f"DFlash2 requires normalized model_type='dflash2', got "
@@ -86,7 +90,11 @@ class DFlash2Config(DFlashConfig):
             not self.target_layer_ids
             or not _is_strictly_increasing_ints(self.target_layer_ids)
             or any(
-                layer_id < 0 or layer_id >= self.num_target_layers
+                layer_id < 0
+                or (
+                    self.num_target_layers is not None
+                    and layer_id >= self.num_target_layers
+                )
                 for layer_id in self.target_layer_ids
             )
         ):
@@ -117,6 +125,7 @@ class DFlash2Config(DFlashConfig):
             "block_size",
             "mask_token_id",
             "target_layer_ids",
+            "num_target_layers",
             "runtime_block_size",
             "draft_window_size",
             "final_logit_softcapping",

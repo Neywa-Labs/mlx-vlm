@@ -5055,6 +5055,27 @@ def test_official_dspark_config(layout, anchor):
         validate_dflash_target(cfg, target, "DSpark")
 
 
+@parametrize("depth", [None, 40])
+def test_dflash2_target_depth(depth):
+    arch = module("speculative.drafters.dflash2")
+    raw = dflash_config("dflash2")
+    del raw["num_target_layers"]
+    raw["dflash_config"]["target_layer_ids"] = [0, 37]
+    if depth is not None:
+        raw["dflash_config"]["num_target_layers"] = depth
+    cfg = arch.ModelConfig.from_dict(raw)
+    assert cfg.num_target_layers == depth
+    target = NS(
+        config=NS(hidden_size=16, vocab_size=32),
+        model=NS(layers=[None] * 40),
+        rollback_speculative_cache=Mock(),
+    )
+    validate_dflash_target(cfg, target, "DFlash2")
+    target.model.layers = [None] * 37
+    with pytest.raises(ValueError, match="layer"):
+        validate_dflash_target(cfg, target, "DFlash2")
+
+
 def test_dspark_keeps_checkpoint_output_head():
     arch = module("speculative.drafters.dspark")
     cfg = arch.ModelConfig.from_dict(official_dspark_config())
