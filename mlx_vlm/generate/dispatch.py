@@ -1572,11 +1572,13 @@ def main():
     if args.eos_tokens is not None:
         eos_tokens = []
         for token in args.eos_tokens:
-            try:
-                decoded_token = codecs.decode(token, "unicode_escape")
-                eos_tokens.append(decoded_token)
-            except (UnicodeDecodeError, UnicodeError):
-                eos_tokens.append(token)
+            decoded_token = token
+            if token.isascii() and "\\" in token:
+                try:
+                    decoded_token = codecs.decode(token, "unicode_escape")
+                except (UnicodeDecodeError, UnicodeError):
+                    pass
+            eos_tokens.append(decoded_token)
         kwargs["eos_tokens"] = eos_tokens
 
     if args.skip_special_tokens:

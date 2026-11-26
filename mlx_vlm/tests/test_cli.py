@@ -165,6 +165,39 @@ def test_vision_chat_preserves_thinking_default(value):
             assert called.call_args.kwargs["enable_thinking"] is value
 
 
+@pytest.mark.parametrize(
+    "token,expected",
+    [
+        ("中文", "中文"),
+        ("é", "é"),
+        ("<|end|>", "<|end|>"),
+        ("END中文", "END中文"),
+        (r"\n", "\n"),
+        ("\\u4e2d\\u6587", "中文"),
+    ],
+    ids=["cjk", "latin1", "special", "mixed", "newline-escape", "unicode-escape"],
+)
+def test_generate_cli_eos_tokens_preserve_non_ascii(token, expected):
+    args = _args("--eos-tokens", token)
+    with _text_cli(args) as mocks:
+        dispatch.main()
+    assert mocks.generate.call_args.kwargs["eos_tokens"] == [expected]
+
+
+@pytest.mark.parametrize(
+    "token,expected",
+    [("中文", "中文"), (r"\n", "\n")],
+    ids=["cjk", "newline-escape"],
+)
+def test_chat_cli_eos_tokens_preserve_non_ascii(token, expected):
+    with (
+        patch.object(sys, "argv", ["mlx_vlm.chat", "--eos-tokens", token]),
+        patch.object(chat, "MLXVisionChat") as session,
+    ):
+        chat.main()
+    assert session.call_args.kwargs["eos_tokens"] == [expected]
+
+
 def test_server_prefill_budget_respects_worker_environment(monkeypatch):
     from mlx_vlm.server.cli import main
 
