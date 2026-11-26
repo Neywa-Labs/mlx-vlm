@@ -16,20 +16,20 @@ def masked_scatter(
     image_mask_expanded: mx.array,
     scaled_image_features: mx.array,
 ):
-    # Reshape the tensors to 1D
+    # Scatter whole token rows. A 1-D view of a long-context embedding can
+    # exceed MLX's int32 shape dimensions even when the 3-D shape is valid.
     final_embedding_shape = final_embedding.shape
-    scaled_image_features_flattened = mx.flatten(scaled_image_features)
-    final_embedding_flattened = mx.flatten(final_embedding)
-    image_mask_expanded_flattened = mx.flatten(image_mask_expanded)
+    hidden_size = final_embedding_shape[-1]
+    final_embedding_rows = final_embedding.reshape(-1, hidden_size)
 
-    # Scatter the scaled image features into the special image token positions
-    image_positions = mx.array(np.where(image_mask_expanded_flattened)[0], mx.uint32)
-    final_embedding_flattened[image_positions] = scaled_image_features_flattened
+    # The mask is broadcast over the hidden axis, so one column marks the rows
+    image_token_mask = image_mask_expanded[..., 0].reshape(-1)
+    image_positions = mx.array(np.where(image_token_mask)[0], mx.uint32)
+    final_embedding_rows[image_positions] = scaled_image_features.reshape(
+        -1, hidden_size
+    )
 
-    # Reshape back to the original shape
-    final_embedding = mx.reshape(final_embedding_flattened, final_embedding_shape)
-
-    return final_embedding
+    return final_embedding_rows.reshape(final_embedding_shape)
 
 
 class Model(nn.Module):
