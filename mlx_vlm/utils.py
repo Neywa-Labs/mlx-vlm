@@ -1680,6 +1680,9 @@ def load_audio(
 class VideoSampling:
     """How many frames to take from a clip, and at what rate.
 
+    ``start_time`` and ``end_time`` are seconds into the source. A start of
+    0 is kept. Leaving both unset samples the whole file.
+
     Every field is optional so an unset one can be filled from a
     lower-precedence source via :meth:`merge`, with
     :data:`DEFAULT_VIDEO_SAMPLING` terminating the chain.
@@ -1690,6 +1693,8 @@ class VideoSampling:
     min_frames: Optional[int] = None
     max_frames: Optional[int] = None
     frame_factor: Optional[int] = None
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
 
     def merge(self, fallback: "VideoSampling") -> "VideoSampling":
         """Return a copy with every unset field taken from ``fallback``."""
@@ -1737,6 +1742,23 @@ class VideoMetadata:
         return len(self.frames_indices) / max(self.total_num_frames, 1e-6) * self.fps
 
 
+def _source_index_span(total_frames, video_fps, start_time, end_time):
+    """Inclusive source indexes for ``[start_time, end_time]`` seconds."""
+    if start_time is None and end_time is None:
+        return 0, total_frames - 1
+    if video_fps <= 0:
+        raise ValueError("video fps must be positive")
+    start = 0 if start_time is None else math.ceil(float(start_time) * video_fps)
+    end = total_frames - 1 if end_time is None else math.floor(float(end_time) * video_fps)
+    start = min(max(start, 0), total_frames - 1)
+    end = min(max(end, 0), total_frames - 1)
+    if start > end:
+        raise ValueError(
+            f"Empty video interval: frames {start}..{end} from {start_time}s to {end_time}s"
+        )
+    return start, end
+
+
 def load_video(
     video_path: str,
     sampling: Optional[VideoSampling] = None,
@@ -1777,6 +1799,10 @@ def load_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = total_frames / video_fps
+    span_start, span_end = _source_index_span(
+        total_frames, video_fps, resolved.start_time, resolved.end_time
+    )
+    span_count = span_end - span_start + 1
 
     def _round(n):
         return round(n / frame_factor) * frame_factor
@@ -1790,7 +1816,7 @@ def load_video(
     used_frame_sampler = False
     if nframes is not None:
         n = _round(nframes)
-        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+        indices = np.linspace(span_start, span_end, n).round().astype(int)
     elif frame_sampler is not None:
         used_frame_sampler = True
         source_metadata = VideoMetadata(
@@ -1804,18 +1830,20 @@ def load_video(
         indices = np.asarray(
             frame_sampler(source_metadata, fps=fps, max_frames=max_frames), dtype=int
         ).reshape(-1)
+        if resolved.start_time is not None or resolved.end_time is not None:
+            indices = indices[(indices >= span_start) & (indices <= span_end)]
         n = len(indices)
     else:
         lo = _ceil(min_frames)
-        hi = _floor(min(max_frames, total_frames))
-        n = total_frames / video_fps * fps
-        n = min(max(n, lo), hi, total_frames)
+        hi = _floor(min(max_frames, span_count))
+        n = span_count / video_fps * fps
+        n = min(max(n, lo), hi, span_count)
         n = _floor(n)
-        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
-    if not used_frame_sampler and not (frame_factor <= n <= total_frames):
+        indices = np.linspace(span_start, span_end, n).round().astype(int)
+    if not used_frame_sampler and not (frame_factor <= n <= span_count):
         cap.release()
         raise ValueError(
-            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+            f"nframes must be in [{frame_factor}, {span_count}], got {n}."
         )
     if n == 0 or np.any(indices < 0) or np.any(indices >= total_frames):
         cap.release()

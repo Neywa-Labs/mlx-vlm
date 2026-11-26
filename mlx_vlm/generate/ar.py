@@ -3946,7 +3946,15 @@ def _generate_batch(
 
     video_sampling_kwargs = {
         name: kwargs.pop(name)
-        for name in ("fps", "nframes", "min_frames", "max_frames", "frame_factor")
+        for name in (
+            "fps",
+            "nframes",
+            "min_frames",
+            "max_frames",
+            "frame_factor",
+            "start_time",
+            "end_time",
+        )
         if name in kwargs
     }
     fps = video_sampling_kwargs.setdefault("fps", 1)

@@ -62,6 +62,8 @@ def _video_sampling(args):
         nframes=getattr(args, "video_num_frames", None),
         min_frames=getattr(args, "video_min_frames", None),
         max_frames=getattr(args, "video_max_frames", None),
+        start_time=getattr(args, "video_start", None),
+        end_time=getattr(args, "video_end", None),
     )
 
 
@@ -253,6 +255,18 @@ def parse_arguments():
         type=int,
         default=None,
         help="Lower bound on the frames sampled from --video.",
+    )
+    parser.add_argument(
+        "--video-start",
+        type=float,
+        default=None,
+        help="Seconds into --video where sampling starts. 0 is kept.",
+    )
+    parser.add_argument(
+        "--video-end",
+        type=float,
+        default=None,
+        help="Seconds into --video where sampling stops, inclusive of that frame.",
     )
     parser.add_argument(
         "--video-max-frames",
