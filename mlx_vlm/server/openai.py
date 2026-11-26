@@ -190,6 +190,9 @@ def _content_has_effective_input(content: Any) -> bool:
                 input_audio = item.get("input_audio")
                 if isinstance(input_audio, dict) and input_audio.get("data"):
                     return True
+            elif item_type in ("input_video", "video_url", "video"):
+                if _extract_video_reference(item):
+                    return True
             elif _content_has_effective_input(item.get("content")):
                 return True
         return False
@@ -211,8 +214,12 @@ def _message_has_effective_input(message: Any) -> bool:
     )
 
 
-def _ensure_effective_input(messages, *, images=None, audio=None):
-    if any(image for image in (images or [])) or any(item for item in (audio or [])):
+def _ensure_effective_input(messages, *, images=None, audio=None, videos=None):
+    if (
+        any(image for image in (images or []))
+        or any(item for item in (audio or []))
+        or any(video for video in (videos or []))
+    ):
         return
     if any(_message_has_effective_input(message) for message in messages or []):
         return
@@ -2181,7 +2188,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         )
 
         _normalize_instruction_messages(processed_messages)
-        _ensure_effective_input(processed_messages, images=images, audio=audio)
+        _ensure_effective_input(
+            processed_messages, images=images, audio=audio, videos=videos
+        )
 
         processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
             processed_messages,

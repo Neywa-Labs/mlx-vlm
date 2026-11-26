@@ -1803,6 +1803,34 @@ def test_responses_endpoint_rejects_empty_effective_input(client, input_value):
     load.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "input_video", "video_url": {"url": "/tmp/clip.mp4"}},
+        {"type": "video_url", "video_url": {"url": "/tmp/clip.mp4"}},
+        {"type": "video", "video": "/tmp/clip.mp4"},
+    ],
+    ids=["input_video", "video_url", "video"],
+)
+def test_chat_completions_accepts_video_only_message(client, part):
+    resolution = NS(
+        images=[],
+        videos=["/tmp/clip.mp4"],
+        used_fallback=False,
+        sampled_count=0,
+        selected_count=0,
+        frame_fps=None,
+    )
+    with _endpoint() as fake:
+        with patch.object(
+            openai, "resolve_video_inputs", return_value=resolution
+        ) as resolve:
+            response = _post(client, messages=[_msg([part])])
+    assert response.status_code == 200
+    resolve.assert_called_once()
+    assert fake.generate.call_args.kwargs["video"] == ["/tmp/clip.mp4"]
+
+
 def test_chat_request_schema_requires_model():
     schema = server.ChatRequest.model_json_schema()
     assert "model" in schema["required"]
