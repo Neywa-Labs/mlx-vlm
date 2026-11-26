@@ -285,6 +285,21 @@ def _extract_video_reference(item):
     return video.get("url") if isinstance(video, dict) else video
 
 
+def _extract_image_reference(item):
+    item_type = item.get("type")
+    if item_type not in ("input_image", "image_url"):
+        return None
+    image = item.get("image_url")
+    if isinstance(image, dict):
+        image = image.get("url")
+    if not image:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{item_type} content part requires a non-empty image_url.",
+        )
+    return image
+
+
 def _final_chat_chunk(
     request_id: str,
     model: str,
@@ -2159,10 +2174,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         if not isinstance(item, dict):
                             continue
                         item_type = item.get("type")
-                        if item_type == "input_image":
-                            images.append(item["image_url"])
-                        elif item_type == "image_url":
-                            images.append(item["image_url"]["url"])
+                        if item_type in ("input_image", "image_url"):
+                            images.append(_extract_image_reference(item))
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
                         elif item_type in ("input_video", "video_url", "video"):

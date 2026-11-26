@@ -1803,6 +1803,51 @@ def test_responses_endpoint_rejects_empty_effective_input(client, input_value):
     load.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "input_image"},
+        {"type": "input_image", "image_url": None},
+        {"type": "input_image", "image_url": ""},
+        {"type": "input_image", "file_id": "file-abc"},
+        {"type": "image_url", "image_url": {"url": ""}},
+    ],
+    ids=[
+        "input_image-missing",
+        "input_image-null",
+        "input_image-empty",
+        "input_image-file-id-only",
+        "image_url-empty-url",
+    ],
+)
+def test_chat_completions_rejects_malformed_image_parts(client, part):
+    message = _msg([part, {"type": "text", "text": "Describe this."}])
+    with patch.object(
+        openai, "get_cached_model", return_value=(NS(), NS(), NS())
+    ) as load:
+        response = _post(client, messages=[message])
+    assert response.status_code == 400
+    assert "image_url" in response.json()["detail"]
+
+
+def test_chat_completions_accepts_valid_image_parts(client):
+    with _endpoint() as fake:
+        response = _post(
+            client,
+            messages=[
+                _msg(
+                    [
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                        _input_image("second.png"),
+                        {"type": "text", "text": "Compare these."},
+                    ]
+                )
+            ],
+        )
+    assert response.status_code == 200
+    assert fake.generate.call_args.kwargs["image"] == ["first.png", "second.png"]
+
+
 def test_chat_request_schema_requires_model():
     schema = server.ChatRequest.model_json_schema()
     assert "model" in schema["required"]
