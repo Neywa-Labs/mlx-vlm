@@ -11961,3 +11961,19 @@ def test_responses_emit_real_prefill_progress_before_first_token(client):
     progress = [e for e in events if e.get("type") == "response.generation_progress"]
     assert progress[-1]["output_tokens"] == 1
     assert events[-1]["response"]["usage"]["output_tokens"] == 1
+
+
+def test_chat_stream_failure_reports_an_openai_error_object(client):
+    def failing_tokens():
+        yield _token("Hel")
+        raise RuntimeError("generation exploded")
+
+    events = _data(_stream_response(client, failing_tokens()))
+
+    assert events[-1] == {
+        "error": {
+            "message": "generation exploded",
+            "type": "server_error",
+            "code": "server_error",
+        }
+    }

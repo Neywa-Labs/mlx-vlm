@@ -872,7 +872,7 @@ def _tool_call_error(exc):
     return {"type": "server_error", "code": exc.code, "message": str(exc)}
 
 
-def _response_stream_error(exc, response):
+def _stream_error_code(exc):
     status = exc.status_code if isinstance(exc, HTTPException) else 500
     code = (
         "context_length_exceeded"
@@ -885,6 +885,21 @@ def _response_stream_error(exc, response):
     )
     if isinstance(exc, ToolCallParseError):
         code = exc.code
+    return code
+
+
+def _chat_stream_error(exc):
+    if isinstance(exc, ToolCallParseError):
+        return _tool_call_error(exc)
+    return {
+        "message": str(exc.detail) if isinstance(exc, HTTPException) else str(exc),
+        "type": "server_error",
+        "code": _stream_error_code(exc),
+    }
+
+
+def _response_stream_error(exc, response):
+    code = _stream_error_code(exc)
     return _response_sse_event(
         "response.failed",
         {
@@ -2747,15 +2762,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         )
                         metrics_finalized = True
                     logger.exception("Chat completion stream generation failed: %s", e)
-                    error_data = json.dumps(
-                        {
-                            "error": (
-                                _tool_call_error(e)
-                                if isinstance(e, ToolCallParseError)
-                                else str(e)
-                            )
-                        }
-                    )
+                    error_data = json.dumps({"error": _chat_stream_error(e)})
                     yield f"data: {error_data}\n\n"
 
                 finally:
