@@ -21,8 +21,9 @@ import numpy as np
 
 PLE_MARKER = ".ple.ple_embedding.ngram_embedding.shards."
 _DTYPES = {"U32": np.dtype("<u4"), "BF16": np.dtype("<u2"), "U8": np.dtype("u1")}
+_AFFINE_TENSORS = (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16"))
 _QUANTIZATION_LAYOUTS = {
-    (4, 32, "affine"): (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16")),
+    **{(bits, 32, "affine"): _AFFINE_TENSORS for bits in (1, 2, 3, 4, 5, 6, 8)},
     (4, 16, "nvfp4"): (("weight", "U32"), ("scales", "U8")),
 }
 
@@ -55,7 +56,7 @@ def _bfloat16_to_float32(values):
 
 
 class QuantizedMMapNGramEmbedding:
-    """Read-only Q4 PLE table backed by safetensors byte ranges."""
+    """Read-only quantized PLE table backed by safetensors byte ranges."""
 
     MANIFEST_VERSION = 2
 
@@ -77,6 +78,7 @@ class QuantizedMMapNGramEmbedding:
         self._tensor_layout = _quantization_layout(self.quantization)
         self._tensor_names = tuple(name for name, _ in self._tensor_layout)
         self._group_size = int(self.quantization["group_size"])
+        self._bits = int(self.quantization["bits"])
 
         source_root = Path(manifest["source_root"])
         if not source_root.is_absolute():
@@ -84,9 +86,13 @@ class QuantizedMMapNGramEmbedding:
         self.row_width = int(manifest["row_width"])
         if self.row_width <= 0 or self.row_width % self._group_size:
             raise ValueError("row_width must be positive and divisible by group_size")
+        # MLX packs each row as a dense little-endian bit stream of uint32 words.
+        self._packed_bytes = self.row_width * self._bits // 8
 
         self._interleaved = None
         layout = manifest.get("layout", "safetensors_ranges")
+        # "interleaved_q4" predates other bit widths; the manifest quantization
+        # decides the packed row width.
         if layout == "interleaved_q4":
             data_name = Path(manifest["data_file"])
             if data_name.is_absolute() or data_name.name != str(data_name):
@@ -94,13 +100,13 @@ class QuantizedMMapNGramEmbedding:
             data_path = manifest_path.parent / data_name
             self.row_count = int(manifest["row_count"])
             row_stride = int(manifest["row_stride"])
-            expected_stride = self.row_width // 2 + sum(
+            expected_stride = self._packed_bytes + sum(
                 self.row_width // self._group_size * _DTYPES[dtype].itemsize
                 for name, dtype in self._tensor_layout
                 if name != "weight"
             )
             if row_stride != expected_stride:
-                raise ValueError("interleaved Q4 row stride does not match row width")
+                raise ValueError("interleaved PLE row stride does not match row width")
             expected_size = self.row_count * row_stride
             if data_path.stat().st_size != expected_size:
                 raise ValueError(
@@ -167,7 +173,7 @@ class QuantizedMMapNGramEmbedding:
                     offset=offset,
                     shape=shape,
                 )
-            if arrays["weight"].shape[1] * 8 != self.row_width:
+            if arrays["weight"].shape[1] * 4 != self._packed_bytes:
                 raise ValueError("packed weight width does not match row_width")
             groups = self.row_width // self._group_size
             expected_aux_shape = (groups,)
@@ -177,7 +183,7 @@ class QuantizedMMapNGramEmbedding:
                 if name != "weight"
             ):
                 raise ValueError(
-                    "auxiliary tensor shape does not match Q4 group layout"
+                    "auxiliary tensor shape does not match quantization group layout"
                 )
             self._shards.append((start, start + count, arrays))
             expected_start += count
@@ -191,7 +197,7 @@ class QuantizedMMapNGramEmbedding:
             return cached
         if self._interleaved is not None:
             raw = np.array(self._interleaved[row_id], copy=True)
-            packed_bytes = self.row_width // 2
+            packed_bytes = self._packed_bytes
             row = []
             offset = 0
             for name, dtype_name in self._tensor_layout:
@@ -237,7 +243,7 @@ class QuantizedMMapNGramEmbedding:
             groups = self.row_width // self._group_size
             return tuple(
                 np.empty(
-                    (0, self.row_width // 8 if name == "weight" else groups),
+                    (0, self._packed_bytes // 4 if name == "weight" else groups),
                     dtype=_DTYPES[dtype],
                 )
                 for name, dtype in self._tensor_layout
@@ -258,7 +264,7 @@ class QuantizedMMapNGramEmbedding:
 
         if missing_ids and self._interleaved is not None:
             raw = np.array(self._interleaved[np.asarray(missing_ids)], copy=True)
-            packed_bytes = self.row_width // 2
+            packed_bytes = self._packed_bytes
             columns = []
             offset = 0
             for name, dtype_name in self._tensor_layout:
@@ -333,7 +339,9 @@ class QuantizedMMapNGramEmbedding:
         else:
             scales = mx.array(_bfloat16_to_float32(row_tensors[1])).astype(mx.bfloat16)
             biases = mx.array(_bfloat16_to_float32(row_tensors[2])).astype(mx.bfloat16)
-            values = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
+            values = mx.dequantize(
+                packed, scales, biases, group_size=self._group_size, bits=self._bits
+            )
         # np.unique sorts even when every ID is distinct, so the inverse is
         # required to restore caller order in both the unique and duplicate
         # cases.
@@ -358,7 +366,7 @@ class QuantizedMMapNGramEmbedding:
 
 
 def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
-    """Index supported Q4 PLE tensors without copying their payload bytes."""
+    """Index supported quantized PLE tensors without copying their payload bytes."""
 
     model_path = Path(model_path).resolve()
     output_path = Path(output_path).resolve()
@@ -413,19 +421,23 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
             for name, _dtype in tensor_layout
         }
         if any(tensors[name]["dtype"] != dtype for name, dtype in tensor_layout):
-            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 dtype layout")
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid dtype layout")
         weight = tensors["weight"]
-        if len(weight["shape"]) != 2 or int(weight["shape"][1]) % 4:
-            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
+        bits = int(current_quantization["bits"])
+        group_size = int(current_quantization["group_size"])
+        if len(weight["shape"]) != 2 or int(weight["shape"][1]) * 32 % (
+            bits * group_size
+        ):
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid shape layout")
         row_count = int(weight["shape"][0])
-        row_width = int(weight["shape"][1]) * 8
-        groups = row_width // int(current_quantization["group_size"])
+        row_width = int(weight["shape"][1]) * 32 // bits
+        groups = row_width // group_size
         if any(
             tensors[name]["shape"] != [row_count, groups]
             for name, _dtype in tensor_layout
             if name != "weight"
         ):
-            raise ValueError(f"PLE tensor {prefix!r} has an invalid Q4 shape layout")
+            raise ValueError(f"PLE tensor {prefix!r} has an invalid shape layout")
         shards.append(
             {
                 "row_start": row_start,
@@ -434,11 +446,12 @@ def build_quantized_ple_manifest(model_path, output_path, *, cache_rows=0):
             }
         )
         row_start += row_count
+    packed_words = int(shards[0]["weight"]["shape"][1])
     manifest = {
         "version": QuantizedMMapNGramEmbedding.MANIFEST_VERSION,
         "source_root": os.path.relpath(model_path, output_path.parent),
         "layout": "safetensors_ranges",
-        "row_width": int(shards[0]["weight"]["shape"][1]) * 8,
+        "row_width": packed_words * 32 // int(manifest_quantization["bits"]),
         "row_count": row_start,
         "quantization": manifest_quantization,
         "cache_rows": int(cache_rows),
@@ -457,7 +470,7 @@ def materialize_interleaved_ple_store(
     cache_rows=0,
     chunk_rows=131_072,
 ):
-    """Rewrite scattered Q4 tensors as one mmap-friendly record per row."""
+    """Rewrite scattered quantized tensors as one mmap-friendly record per row."""
 
     manifest_path = Path(manifest_path).resolve()
     data_name = Path(data_file)
@@ -474,7 +487,7 @@ def materialize_interleaved_ple_store(
     row_width = int(range_manifest["row_width"])
     quantization = range_manifest["quantization"]
     tensor_layout = _quantization_layout(quantization)
-    packed_bytes = row_width // 2
+    packed_bytes = row_width * int(quantization["bits"]) // 8
     group_size = int(quantization["group_size"])
     row_stride = packed_bytes + sum(
         row_width // group_size * _DTYPES[dtype].itemsize

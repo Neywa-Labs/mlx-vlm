@@ -28,6 +28,12 @@ from mlx_vlm.models.mla import max_absorbed_queries
 from mlx_vlm.models.paddleocr_vl.config import VisionConfig
 from mlx_vlm.models.paddleocr_vl.vision import Attention, VisionModel
 from mlx_vlm.models.qwen3_5 import language as lang
+from mlx_vlm.models.qwen4_exp.ple_storage import (
+    QuantizedMMapNGramEmbedding,
+    build_quantized_ple_manifest,
+    materialize_interleaved_ple_store,
+    prepare_external_ple_model,
+)
 from mlx_vlm.models.rfdetr.config import DINOv2Config
 from mlx_vlm.models.rfdetr.vision import DINOv2Attention
 from mlx_vlm.models.rope_utils import (
@@ -1792,6 +1798,130 @@ def test_replace_one_bit_checkpoint_modules_only():
     assert isinstance(model.proj, OneBitLinear)
     assert isinstance(model.embedding, OneBitEmbedding)
     assert isinstance(model.unquantized, nn.Linear)
+
+
+# Qwen4-Exp external PLE storage
+
+_PLE_PREFIX = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards"
+
+
+def _write_ple_checkpoint(path, shard_rows, quantization, width=160):
+    path.mkdir()
+    tensors = {"language_model.model.embed_tokens.weight": mx.zeros((4, 8))}
+    config = {"text_config": {}, "quantization": {}}
+    resident = []
+    for shard, rows in enumerate(shard_rows):
+        prefix = f"{_PLE_PREFIX}.{shard}"
+        table = mx.random.normal((rows, width), key=mx.random.key(shard))
+        weight, scales, biases = mx.quantize(table, **quantization)
+        scales, biases = scales.astype(mx.bfloat16), biases.astype(mx.bfloat16)
+        tensors[f"{prefix}.weight"] = weight
+        tensors[f"{prefix}.scales"] = scales
+        tensors[f"{prefix}.biases"] = biases
+        config["quantization"][prefix] = quantization
+        resident.append(mx.dequantize(weight, scales, biases, **quantization))
+    mx.save_safetensors(str(path / "model.safetensors"), tensors)
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "model.safetensors" for key in tensors}})
+    )
+    (path / "config.json").write_text(json.dumps(config))
+    return mx.concatenate(resident)
+
+
+@pytest.mark.parametrize("layout", ["safetensors_ranges", "interleaved_q4"])
+@pytest.mark.parametrize("bits", [1, 2, 3, 4, 5, 6, 8])
+def test_qwen4_exp_external_ple_matches_resident_dequantization(tmp_path, bits, layout):
+    quantization = {"bits": bits, "group_size": 32, "mode": "affine"}
+    resident = _write_ple_checkpoint(tmp_path / "source", (5, 11), quantization)
+    if layout == "safetensors_ranges":
+        prepare_external_ple_model(tmp_path / "source", tmp_path / "view")
+        manifest_path = tmp_path / "view" / "ple-store.json"
+        view_config = json.loads((tmp_path / "view" / "config.json").read_text())
+        assert view_config["quantization"] == {}
+    else:
+        manifest_path = tmp_path / "store" / "ple-store.json"
+        materialize_interleaved_ple_store(tmp_path / "source", manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    row_bytes = 160 * bits // 8 + 2 * 5 * 2
+    assert manifest["layout"] == layout
+    assert manifest["quantization"] == quantization
+    assert manifest["row_width"] == 160
+    assert manifest.get("row_stride", row_bytes) == row_bytes
+
+    store = QuantizedMMapNGramEmbedding(manifest_path, cache_rows=8)
+    # Rows 4 and 5 straddle the shard boundary; repeated IDs hit the cache.
+    ids = np.array([[15, 4, 5, 4], [0, 10, 15, 7]])
+    expected = np.asarray(resident.astype(mx.float32))[ids]
+    for _ in range(2):
+        actual = store(ids)
+        mx.eval(actual)
+        np.testing.assert_array_equal(np.asarray(actual.astype(mx.float32)), expected)
+    assert store.stats.cache_misses == 6
+    assert store.stats.bytes_read == 6 * row_bytes
+
+
+def test_qwen4_exp_external_ple_rejects_unsupported_quantization(tmp_path):
+    quantization = {"bits": 4, "group_size": 64, "mode": "affine"}
+    _write_ple_checkpoint(tmp_path / "source", (4,), quantization, width=128)
+    manifest_path = tmp_path / "output" / "ple-store.json"
+
+    with pytest.raises(ValueError, match="unsupported PLE quantization"):
+        build_quantized_ple_manifest(tmp_path / "source", manifest_path)
+
+    assert not manifest_path.exists()
+
+
+@pytest.mark.parametrize(
+    "actual_bits, claimed_bits, width",
+    [(4, 5, 160), (8, 4, 160), (6, 5, 128)],
+)
+def test_qwen4_exp_external_ple_rejects_mislabeled_bits(
+    tmp_path, actual_bits, claimed_bits, width
+):
+    quantization = {"bits": actual_bits, "group_size": 32, "mode": "affine"}
+    _write_ple_checkpoint(tmp_path / "source", (4,), quantization, width=width)
+    config_path = tmp_path / "source" / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"][f"{_PLE_PREFIX}.0"]["bits"] = claimed_bits
+    config_path.write_text(json.dumps(config))
+    manifest_path = tmp_path / "output" / "ple-store.json"
+
+    with pytest.raises(ValueError, match="invalid shape layout"):
+        build_quantized_ple_manifest(tmp_path / "source", manifest_path)
+
+    assert not manifest_path.exists()
+
+
+def test_qwen4_exp_external_ple_rejects_mixed_shard_quantization(tmp_path):
+    quantization = {"bits": 5, "group_size": 32, "mode": "affine"}
+    _write_ple_checkpoint(tmp_path / "source", (4, 4), quantization)
+    config_path = tmp_path / "source" / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"][f"{_PLE_PREFIX}.1"]["bits"] = 4
+    config_path.write_text(json.dumps(config))
+    manifest_path = tmp_path / "output" / "ple-store.json"
+
+    with pytest.raises(ValueError, match="same quantization"):
+        build_quantized_ple_manifest(tmp_path / "source", manifest_path)
+
+    assert not manifest_path.exists()
+
+
+@pytest.mark.parametrize("layout", ["safetensors_ranges", "interleaved_q4"])
+def test_qwen4_exp_external_ple_reader_rejects_mismatched_bits(tmp_path, layout):
+    quantization = {"bits": 5, "group_size": 32, "mode": "affine"}
+    _write_ple_checkpoint(tmp_path / "source", (4,), quantization)
+    manifest_path = tmp_path / "store" / "ple-store.json"
+    if layout == "safetensors_ranges":
+        build_quantized_ple_manifest(tmp_path / "source", manifest_path)
+    else:
+        materialize_interleaved_ple_store(tmp_path / "source", manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["quantization"]["bits"] = 6
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="does not match row"):
+        QuantizedMMapNGramEmbedding(manifest_path)
 
 
 # Loading and utility contracts
