@@ -1,8 +1,70 @@
+from typing import List, NamedTuple, Optional, Union
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..gemma4.language import RMSNormNoScale
 from .config import TextConfig
+
+# Query block size for long sliding-window attention. Each block attends only to
+# the keys within ``sliding_window`` of it, so the cost grows linearly with the
+# input length instead of quadratically.
+SLIDING_BLOCK_SIZE = 1024
+
+
+class SlidingBlock(NamedTuple):
+    """Queries ``[start, end)`` attend to keys ``[key_start, key_end)``."""
+
+    start: int
+    end: int
+    key_start: int
+    key_end: int
+    mask: mx.array
+
+
+def sliding_window_blocks(
+    length: int,
+    window: int,
+    block_size: int,
+    key_mask: Optional[mx.array] = None,
+) -> List[SlidingBlock]:
+    """Split a symmetric ``|i - j| <= window`` mask into query blocks."""
+    positions = mx.arange(length)
+    blocks = []
+    for start in range(0, length, block_size):
+        end = min(start + block_size, length)
+        key_start, key_end = max(0, start - window), min(length, end + window)
+        mask = (
+            mx.abs(positions[start:end, None] - positions[None, key_start:key_end])
+            <= window
+        )
+        if key_mask is not None:
+            mask = mask & key_mask[..., key_start:key_end]
+        blocks.append(SlidingBlock(start, end, key_start, key_end, mask))
+    return blocks
+
+
+def attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    mask: Union[None, mx.array, List[SlidingBlock]],
+) -> mx.array:
+    if not isinstance(mask, list):
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
+    return mx.concatenate(
+        [
+            mx.fast.scaled_dot_product_attention(
+                q[:, :, b.start : b.end],
+                k[:, :, b.key_start : b.key_end],
+                v[:, :, b.key_start : b.key_end],
+                scale=1.0,
+                mask=b.mask,
+            )
+            for b in mask
+        ],
+        axis=2,
+    )
 
 
 class RotaryEmbedding(nn.Module):
@@ -71,7 +133,7 @@ class Attention(nn.Module):
         q = self.rope(q.transpose(0, 2, 1, 3), position_ids)
         k = self.rope(k.transpose(0, 2, 1, 3), position_ids)
         v = v.transpose(0, 2, 1, 3)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=mask)
+        out = attention(q, k, v, mask)
         return self.o_proj(out.transpose(0, 2, 1, 3).reshape(batch, length, -1))
 
 
@@ -173,16 +235,28 @@ class TextModel(nn.Module):
             config.hidden_size, config.embedding_dim, bias=False
         )
 
-    def __call__(self, inputs_embeds, attention_mask, position_ids=None):
+    def __call__(self, inputs_embeds, attention_mask=None, position_ids=None):
         length = inputs_embeds.shape[1]
-        full_mask = attention_mask[:, None, None, :].astype(mx.bool_)
-        positions = mx.arange(length)
-        if position_ids is None:
-            position_ids = positions[None]
-        sliding_mask = full_mask & (
-            mx.abs(positions[:, None] - positions[None, :])
-            <= self.config.sliding_window
+        # Without padding, attention needs no key mask at all.
+        full_mask = (
+            None
+            if attention_mask is None
+            else attention_mask[:, None, None, :].astype(mx.bool_)
         )
+        if position_ids is None:
+            position_ids = mx.arange(length)[None]
+        window = self.config.sliding_window
+        if length > 2 * SLIDING_BLOCK_SIZE:
+            sliding_mask = sliding_window_blocks(
+                length, window, SLIDING_BLOCK_SIZE, full_mask
+            )
+        elif length > window + 1:
+            positions = mx.arange(length)
+            sliding_mask = mx.abs(positions[:, None] - positions[None, :]) <= window
+            if full_mask is not None:
+                sliding_mask = sliding_mask & full_mask
+        else:
+            sliding_mask = full_mask
         per_layer_inputs = self.ple(inputs_embeds) if self.ple is not None else None
         h = inputs_embeds
         for i, layer in enumerate(self.layers):

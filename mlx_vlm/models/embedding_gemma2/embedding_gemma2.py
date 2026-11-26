@@ -89,9 +89,7 @@ class Model(nn.Module):
     ) -> EmbeddingOutput:
         if attention_mask is None:
             attention_mask = kwargs.get("mask")
-        if attention_mask is None:
-            attention_mask = mx.ones_like(input_ids)
-        if attention_mask.shape != input_ids.shape:
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids")
         media_mask = (
             (input_ids == self.config.image_token_id)
@@ -124,7 +122,10 @@ class Model(nn.Module):
                 self.config.audio_token_id,
                 self.get_audio_features(input_features, input_features_mask),
             )
+        # A missing mask means no padding: attention then runs unmasked.
         hidden_states = self.language_model(embeddings, attention_mask, position_ids)
+        if attention_mask is None:
+            attention_mask = mx.ones_like(input_ids)
         pooled = mean_pooling(hidden_states, attention_mask)
         return EmbeddingOutput(
             last_hidden_state=hidden_states,
