@@ -1278,6 +1278,66 @@ def test_mrope_rope_index_handles_fully_masked_rows(module_name):
     assert rope_deltas.tolist()[0] == [0]
 
 
+QWEN3_VL_MERGE_MODULES = [
+    "mlx_vlm.models.qwen3_vl.qwen3_vl",
+    "mlx_vlm.models.qwen3_vl_moe.qwen3_vl_moe",
+    "mlx_vlm.models.qwen3_5.qwen3_5",
+]
+
+
+@pytest.mark.parametrize("module_name", QWEN3_VL_MERGE_MODULES)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_qwen3_vl_merge_image_features_matches_flat_scatter(module_name, dtype):
+    module = importlib.import_module(module_name)
+    image_token, video_token = 7, 8
+    input_ids = np.array(
+        [[1, 7, 7, 2, 8, 8, 8, 3], [7, 2, 2, 2, 2, 2, 7, 7]], dtype=np.int32
+    )
+    rng = np.random.default_rng(0)
+    embeds = rng.normal(size=(*input_ids.shape, 5)).astype(np.float32)
+    features = rng.normal(size=(8, 5)).astype(np.float32)
+
+    mask = np.isin(input_ids, [image_token, video_token])[..., None]
+    mask = np.broadcast_to(mask, embeds.shape)
+    expected = embeds.reshape(-1).copy()
+    expected[np.flatnonzero(mask)] = features.reshape(-1)
+    expected = expected.reshape(embeds.shape)
+
+    merged, _ = module.Model.merge_input_ids_with_image_features(
+        mx.array(features, dtype=dtype),
+        mx.array(embeds, dtype=dtype),
+        mx.array(input_ids),
+        image_token,
+        video_token,
+    )
+
+    assert merged.shape == embeds.shape
+    assert merged.dtype == dtype
+    np.testing.assert_array_equal(
+        np.array(merged.astype(mx.float32)),
+        np.array(mx.array(expected, dtype=dtype).astype(mx.float32)),
+    )
+
+
+def test_qwen3_vl_masked_scatter_accepts_more_than_int32_elements():
+    from mlx_vlm.models.qwen3_vl.qwen3_vl import masked_scatter
+
+    # One past floor((2**31 - 1) / 2560) tokens: the 1-D view of this
+    # embedding no longer fits MLX's int32 shape dimensions.
+    length, hidden = 838_861, 2_560
+    assert length * hidden > np.iinfo(np.int32).max
+
+    embeds = mx.zeros((1, length, hidden), dtype=mx.bfloat16)
+    token_mask = (mx.arange(length) >= length - 4)[None, :, None]
+    mask = mx.broadcast_to(token_mask, embeds.shape)
+    features = mx.ones((4, hidden), dtype=mx.bfloat16)
+
+    merged = masked_scatter(embeds, mask, features)
+
+    assert merged.shape == embeds.shape
+    assert merged.dtype == embeds.dtype
+
+
 def _qwen2_5_vl_rope_model(tokens_per_second=2):
     module = importlib.import_module("mlx_vlm.models.qwen2_5_vl.language")
     lm = module.LanguageModel.__new__(module.LanguageModel)
