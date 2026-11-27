@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from itertools import accumulate
+from typing import Optional, Union
 
 import numpy as np
 from PIL import Image
@@ -31,7 +32,18 @@ class GraniteDoclingImageKwargs(ImagesKwargs, total=False):
     dense_max_scale: float
     dense_min_aspect: float
     dense_max_aspect: float
-    fine_route: bool
+    fine_route: Union[bool, str]
+
+
+def _fine_route_key(fine_route) -> Optional[str]:
+    """The model input that carries fine_route: tile_fine_mask, auto_fine_route or none."""
+    if isinstance(fine_route, str):
+        if fine_route != "auto":
+            raise ValueError(
+                f'fine_route must be True, False or "auto", got {fine_route!r}.'
+            )
+        return "auto_fine_route"
+    return "tile_fine_mask" if fine_route else None
 
 
 @lru_cache(maxsize=32)
@@ -201,8 +213,10 @@ class GraniteDoclingImageProcessor(PilBackend):
             "rows": [[r for r, c in sample] for sample in grids],
             "cols": [[c for r, c in sample] for sample in grids],
         }
-        if fine_route:
-            data["tile_fine_mask"] = np.ones(len(images), dtype=bool)
+        # "auto": the model's density router chooses the path during generation.
+        route_key = _fine_route_key(fine_route)
+        if route_key is not None:
+            data[route_key] = np.ones(len(images), dtype=bool)
         return BatchFeature(
             data, tensor_type=return_tensors, skip_tensor_conversion=["rows", "cols"]
         )
@@ -295,7 +309,11 @@ class GraniteDoclingProcessor(ProcessorMixin):
     def _get_num_multimodal_tokens(self, image_sizes=None, **kwargs):
         if image_sizes is None:
             return MultiModalData()
-        fine = kwargs.get("fine_route", self.image_processor.fine_route)
+        # With "auto" the prompt has the image tokens of the coarse path.
+        fine = (
+            _fine_route_key(kwargs.get("fine_route", self.image_processor.fine_route))
+            == "tile_fine_mask"
+        )
         counts, patches = [], []
         for height, width in image_sizes:
             rows, cols = self.image_processor.get_tile_grid(height, width, kwargs)

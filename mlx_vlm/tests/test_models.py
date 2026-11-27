@@ -8338,6 +8338,68 @@ class TestGraniteDocling:
         )
         assert route.shape == (2,) and route.dtype == mx.bool_
 
+    @pytest.mark.parametrize("fine", [False, True])
+    def test_auto_fine_route_encodes_once_and_fits_the_prompt(self, fine):
+        model = self._model(use_fine_route=True, router=True)
+        pixel_values = mx.random.normal((1, 2, 3, 16, 16))
+        options = {"pixel_attention_mask": mx.array([[True, True]])}
+        ids = self._prompt(4, 2)
+        mask = mx.ones(ids.shape, dtype=mx.int32)
+        encode = type(model.vision_model).encode
+        logit = mx.array([8.0 if fine else -8.0])
+        with (
+            patch.object(type(model.density_router), "__call__", return_value=logit),
+            patch.object(
+                type(model.vision_model), "encode", autospec=True, side_effect=encode
+            ) as encoder,
+        ):
+            kwargs = {**options, "auto_fine_route": mx.array([True])}
+            routed_ids, routed_mask = model.resolve_generation_inputs(
+                ids, pixel_values, mask, kwargs
+            )
+            routed = model.get_input_embeddings(
+                routed_ids, pixel_values=pixel_values, **kwargs
+            )
+            # The router decision and the image tokens come from one encoder pass.
+            assert encoder.call_count == 1
+
+        # The inputs are those of the path the router chose.
+        tokens_per_tile = 16 if fine else 4
+        expected_ids = self._prompt(tokens_per_tile, 2)
+        assert routed_ids.tolist() == expected_ids.tolist()
+        assert routed_mask.shape == expected_ids.shape
+        assert "auto_fine_route" not in kwargs
+        assert ("tile_fine_mask" in kwargs) == fine
+        fixed = {**options, "tile_fine_mask": mx.array([True])} if fine else options
+        expected = model.get_input_embeddings(
+            expected_ids, pixel_values=pixel_values, **fixed
+        )
+        for key in ("inputs_embeds", "deepstack_visual_embeds"):
+            assert mx.allclose(getattr(routed, key), getattr(expected, key), atol=1e-6)
+
+    def test_auto_fine_route_is_resolved_before_the_embeddings(self):
+        model = self._model(use_fine_route=True, router=True)
+        pixel_values = mx.random.normal((1, 1, 3, 16, 16))
+        with pytest.raises(ValueError, match="generate and stream_generate"):
+            model.get_input_embeddings(
+                self._prompt(4, 1),
+                pixel_values=pixel_values,
+                auto_fine_route=mx.array([True]),
+            )
+        with pytest.raises(ValueError, match="no density router"):
+            self._model(use_fine_route=True).resolve_generation_inputs(
+                self._prompt(4, 1),
+                pixel_values,
+                None,
+                {"auto_fine_route": mx.array([True])},
+            )
+        # Without the setting, the prompt and the options stay as they are.
+        ids, kwargs = self._prompt(4, 1), {}
+        same_ids, mask = model.resolve_generation_inputs(
+            ids, pixel_values, None, kwargs
+        )
+        assert same_ids is ids and mask is None and kwargs == {}
+
     def test_router_needs_the_fine_route(self):
         with pytest.raises(ValueError, match="use_fine_route"):
             self._config(router=True)

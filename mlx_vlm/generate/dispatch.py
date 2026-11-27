@@ -935,6 +935,12 @@ def stream_generate(
             vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
+    # A model may fit the prompt to its encoded images: the density router of
+    # Granite Docling chooses how many image tokens a page gets.
+    resolve_inputs = getattr(model, "resolve_generation_inputs", None)
+    if callable(resolve_inputs) and pixel_values is not None:
+        input_ids, mask = resolve_inputs(input_ids, pixel_values, mask, kwargs)
+
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
