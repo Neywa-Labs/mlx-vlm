@@ -47,9 +47,14 @@ python -m mlx_vlm.generate --model ./granite-for-docling-500m-mlx \
 In Python, pass `fine_route=True` to `generate`. For `batch_generate`, set
 `processor.image_processor.fine_route = True` before the call.
 
-`Model.predict_fine_route(pixel_values, pixel_attention_mask)` uses the density
-router to tell which pages need the fine path. The 2B checkpoint has no fine
-path.
+The 500M checkpoint also has a density router, which tells from the vision
+encoder output if a page needs the fine path. Pass `fine_route="auto"`
+(`--processor-kwargs '{"fine_route": "auto"}'`) to let it choose for each page:
+`generate` and `stream_generate` run the vision encoder once, ask the router
+and use the image tokens of the path it chooses. `batch_generate` does not
+support `"auto"`; there, `Model.predict_fine_route(pixel_values,
+pixel_attention_mask)` returns the router's choice for each page. The 2B
+checkpoint has no fine path and no router.
 
 ## Speculative decoding
 

@@ -3897,6 +3897,26 @@ def test_granite_docling_processor_load_and_route(tmp_path, granite_docling_proc
         assert ("tile_fine_mask" in outputs) == (tokens == 48)
 
 
+def test_granite_docling_auto_fine_route(granite_docling_processor):
+    processor = granite_docling_processor
+    image = Image.new("RGB", (64, 32))
+    outputs = prepare_inputs(
+        processor, images=[image], prompts="<image>", fine_route="auto"
+    )
+    # The prompt has the image tokens of the coarse path; generation adds
+    # those of the fine path when the router chooses it.
+    assert int((outputs["input_ids"] == processor.image_token_id).sum()) == 12
+    assert outputs["auto_fine_route"].tolist() == [True]
+    assert "tile_fine_mask" not in outputs
+    counts = [
+        processor._get_num_multimodal_tokens([(32, 64)], fine_route=route)
+        for route in ("auto", False)
+    ]
+    assert counts[0].num_image_tokens == counts[1].num_image_tokens
+    with pytest.raises(ValueError, match="fine_route must be"):
+        processor(images=[image], text="<image>", fine_route="always")
+
+
 def test_granite_docling_tile_limits_and_transparency(granite_docling_processor):
     processor = granite_docling_processor.image_processor
     assert processor.get_tile_grid(19, 800) == (1, 16)

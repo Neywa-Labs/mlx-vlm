@@ -65,11 +65,57 @@ class Model(nn.Module):
 
     def encode_images(self, pixel_values: mx.array, **kwargs) -> list:
         """Image tokens, stacked DeepStack features and route, for the vision cache."""
-        tiles, _ = self._real_tiles(pixel_values, kwargs.get("pixel_attention_mask"))
+        tiles, tiles_per_sample = self._real_tiles(
+            pixel_values, kwargs.get("pixel_attention_mask")
+        )
         # The processor returns tile_fine_mask only when it was called with fine_route=True.
         fine = kwargs.get("tile_fine_mask") is not None
-        image_features, deepstack_features = self.vision_model(tiles, fine=fine)
+        if kwargs.get("auto_fine_route") is None:
+            image_features, deepstack_features = self.vision_model(tiles, fine=fine)
+        else:
+            # fine_route="auto": one pass of the vision encoder gives the router
+            # decision and the image tokens of the path it chooses.
+            if fine:
+                raise ValueError("Pass either tile_fine_mask or auto_fine_route.")
+            if len(tiles_per_sample) != 1:
+                raise ValueError(
+                    'fine_route="auto" takes one sample; route a batch with '
+                    "predict_fine_route."
+                )
+            hidden_states, deepstack_hidden_states = self.vision_model.encode(
+                tiles.astype(self.vision_model.embeddings.patch_embedding.weight.dtype)
+            )
+            fine = bool(self._route(hidden_states, tiles_per_sample)[0].item())
+            image_features, deepstack_features = self.vision_model.connector(
+                hidden_states, deepstack_hidden_states, fine=fine
+            )
         return [image_features, mx.stack(deepstack_features, axis=1), mx.array(fine)]
+
+    def resolve_generation_inputs(self, input_ids, pixel_values, mask, kwargs: dict):
+        """Resolve fine_route="auto" before the prompt is processed.
+
+        The density router chooses the connector path from the vision encoder
+        output, which is computed once and kept as cached_image_features. A page
+        on the fine path gets four image tokens for each image token of the prompt.
+        Returns the prompt token ids and the attention mask; updates kwargs.
+        """
+        if kwargs.get("auto_fine_route") is None or pixel_values is None:
+            return input_ids, mask
+        cached = kwargs.get("cached_image_features")
+        if cached is None:
+            cached = self.encode_images(pixel_values, **kwargs)
+            mx.eval(cached)
+            kwargs["cached_image_features"] = cached
+        del kwargs["auto_fine_route"]
+        if not bool(cached[2].item()):
+            return input_ids, mask
+        kwargs["tile_fine_mask"] = mx.array([True])
+        ids = np.array(input_ids)
+        repeats = np.where(ids[0] == self.config.image_token_id, 4, 1)
+        input_ids = mx.array(np.repeat(ids, repeats, axis=1))
+        if mask is not None:
+            mask = mx.array(np.repeat(np.array(mask), repeats, axis=1))
+        return input_ids, mask
 
     def get_input_embeddings(
         self,
@@ -81,6 +127,12 @@ class Model(nn.Module):
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
+        if kwargs.get("auto_fine_route") is not None:
+            raise ValueError(
+                'fine_route="auto" changes the number of image tokens in the prompt; '
+                "generate and stream_generate resolve it. Elsewhere, choose the path "
+                "with predict_fine_route and pass fine_route=True for the fine path."
+            )
         fine = kwargs.get("tile_fine_mask") is not None
         vision_cache, image_key = kwargs.get("vision_cache"), kwargs.get("_image_key")
         cached = kwargs.get("cached_image_features")
@@ -128,12 +180,15 @@ class Model(nn.Module):
 
         Route them by calling the processor again with fine_route=True.
         """
-        if "density_router" not in self:
-            raise ValueError("This checkpoint has no density router.")
         tiles, tiles_per_sample = self._real_tiles(pixel_values, pixel_attention_mask)
         hidden_states, _ = self.vision_model.encode(
             tiles.astype(self.vision_model.embeddings.patch_embedding.weight.dtype)
         )
+        return self._route(hidden_states, tiles_per_sample)
+
+    def _route(self, hidden_states: mx.array, tiles_per_sample: list) -> mx.array:
+        if "density_router" not in self:
+            raise ValueError("This checkpoint has no density router.")
         logits = self.density_router(hidden_states, tiles_per_sample)
         return mx.sigmoid(logits) >= self.config.density_router_threshold
 
