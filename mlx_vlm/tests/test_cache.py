@@ -3683,6 +3683,66 @@ def test_warm_cache_quantization_policy(scheme, merge, managers):
         assert isinstance(extended[-1], C.BatchKVCache)
 
 
+@parametrize("source", ["matched_blocks", "warm_cache"])
+@parametrize(
+    "prefixes",
+    [(6, 4), (6, 0), (0, 4, 6)],
+    ids=["mixed-lengths", "warm-cold", "cold-first"],
+)
+def test_warm_blocks_pad_each_tensor_with_its_own_shape(source, prefixes, managers):
+    # (heads, width, dtype) of K and of V per layer. MLA caches a wide latent
+    # as K and a narrow RoPE part as V, and layers need not match each other.
+    layers = [
+        ((1, 12, mx.float32), (1, 4, mx.float32)),
+        ((2, 6, mx.float16), (2, 10, mx.float32)),
+    ]
+
+    def tensor(length, heads, width, dtype, batch=1):
+        return mx.random.normal((batch, heads, length, width)).astype(dtype)
+
+    manager = managers(block=2)
+    picks, expected, blocks = [], [], []
+    for row, length in enumerate(prefixes):  # 0 is a cold row
+        if not length:
+            picks.append(None)
+            expected.append(None)
+            continue
+        keys = [tensor(length, *k) for k, _ in layers]
+        values = [tensor(length, *v) for _, v in layers]
+        expected.append((keys, values))
+        if source == "matched_blocks":
+            tokens = [100 * row + i for i in range(length)]
+            warm = manager.store_kv_blocks(tokens, keys, values)
+            assert len(warm) == length // 2
+            blocks += warm
+        else:
+            warm = [NS(keys=k, values=v) for k, v in zip(keys, values)]
+        picks.append({"prefix_len": length, source: warm})
+
+    caches, max_prefix = warm_blocks(picks, num_layers=len(layers))
+    assert max_prefix == max(prefixes) and len(caches) == len(layers)
+    for layer, cache in enumerate(caches):
+        *merged, offset, left_padding = cache.state
+        assert offset.tolist() == list(prefixes)
+        assert left_padding.tolist() == [max_prefix - n for n in prefixes]
+        for kind, (heads, width, dtype) in enumerate(layers[layer]):
+            assert merged[kind].shape == (len(prefixes), heads, max_prefix, width)
+            assert merged[kind].dtype == dtype
+            for row, length in enumerate(prefixes):
+                pad = max_prefix - length
+                assert not mx.any(merged[kind][row, :, :pad]).item()
+                if length:
+                    same_arrays(
+                        merged[kind][row : row + 1, :, pad:],
+                        expected[row][kind][layer],
+                    )
+        # Every row, cold ones included, can take the suffix prefill.
+        step = [tensor(3, *spec, batch=len(prefixes)) for spec in layers[layer]]
+        grown = cache.update_and_fetch(*step)
+        assert [x.shape[2] for x in grown] == [max_prefix + 3] * 2
+    manager.release(blocks)
+
+
 @parametrize("length, expected", [(16, 0), (32, 16), (33, 32)])
 def test_block_lookup_leaves_a_generation_suffix(managers, length, expected):
     manager = managers()
