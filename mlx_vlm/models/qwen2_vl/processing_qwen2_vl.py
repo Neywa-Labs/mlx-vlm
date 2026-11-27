@@ -163,6 +163,7 @@ class Qwen2VLProcessor(ProcessorMixin):
         vp_cfg = _qwen_vl_video_kwargs(
             pretrained_model_name_or_path,
             default_patch_size=14,
+            per_frame_budget=True,
         )
 
         image_processor = Qwen3VLImageProcessor(**ip_cfg)
