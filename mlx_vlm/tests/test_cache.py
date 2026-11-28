@@ -4703,6 +4703,33 @@ def test_inkling2_padded_batch_decode_and_extract(family):
     )
 
 
+@parametrize("max_size", [None, 4])
+def test_attention_sink_cache_safetensors_metadata_roundtrip(tmp_path, max_size):
+    cache = C.AttentionSinkKVCache(max_size=max_size)
+    keys = mx.arange(7).reshape(1, 1, 7, 1)
+    cache.update_and_fetch(keys, -keys)
+    path = str(tmp_path / "cache.safetensors")
+    mx.save_safetensors(
+        path,
+        dict(zip(("keys", "values"), cache.state)),
+        dict(tree_flatten(cache.meta_state)),
+    )
+    tensors, metadata = mx.load(path, return_metadata=True)
+    state = (tensors["keys"], tensors["values"])
+    restored = C.AttentionSinkKVCache.from_state(state, (metadata["0"], metadata["1"]))
+    legacy = C.AttentionSinkKVCache.from_state(state, (max_size, 7))
+    for candidate in (restored, legacy):
+        assert candidate.max_size == max_size
+        assert candidate.offset == 7
+        for actual, expected in zip(candidate.state, cache.state):
+            np.testing.assert_array_equal(actual, expected)
+
+    new_key = mx.array([[[[7]]]])
+    expected = cache.update_and_fetch(new_key, -new_key)
+    for actual, output in zip(restored.update_and_fetch(new_key, -new_key), expected):
+        np.testing.assert_array_equal(actual, output)
+
+
 @parametrize("prefix_len", [3, 4, 5, 11])
 @parametrize("keep", [0, 2, 5])
 def test_inkling2_sink_cache_window_rollback(prefix_len, keep):

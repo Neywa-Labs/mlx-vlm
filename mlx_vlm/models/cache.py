@@ -727,11 +727,13 @@ class AttentionSinkKVCache(KVCache):
 
     @property
     def meta_state(self):
-        return self.max_size, self.offset
+        return str(self.max_size), str(self.offset)
 
     @meta_state.setter
     def meta_state(self, metadata):
-        self.max_size, self.offset = metadata
+        max_size, offset = metadata
+        self.max_size = None if max_size in (None, "None") else int(max_size)
+        self.offset = int(offset)
 
     def prefix_cache_reserve(self, min_capacity_tokens):
         if self.max_size is not None:
