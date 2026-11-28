@@ -7955,6 +7955,46 @@ def test_tool_parse_failure_without_response_template(client, api, stream, batch
     assert "{broken}" not in response.text and "<tool_call>" not in response.text
 
 
+@pytest.mark.parametrize("separator", ["", "\n", " / "])
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+@pytest.mark.parametrize("prefilled", [False, True])
+def test_response_template_legacy_join(separator, chunk_size, prefilled):
+    template = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            name: {
+                "open": opening,
+                "close": "</part>",
+                "content": "text",
+                "content_args": {"strip": False},
+                "repeats": True,
+                "join": separator,
+            }
+            for name, opening in (
+                ("reasoning_content", "<thought>"),
+                ("content", "<answer>"),
+            )
+        },
+    }
+    processor = NS(tokenizer=_ResponseTemplateTokenizer(template))
+    text = (
+        "<thought>First.</part><thought>Second.</part>"
+        "<answer>Hello.</part><answer></part><answer>Again.</part>"
+    )
+    prompt = "<assistant><thought>" if prefilled else ""
+    if prefilled:
+        text = text.removeprefix("<thought>")
+    expected = (
+        separator.join(["First.", "Second."]),
+        separator.join(["Hello.", "", "Again."]),
+    )
+    state = server.make_response_stream_state(processor, prompt=prompt)
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    assert _thoughts(_feed_thinking(state, chunks, last=True)) == expected
+    assert server._split_thinking(text, processor=processor, prompt=prompt) == expected
+    assert processor.tokenizer.response_template == template
+
+
 def test_response_template_thinking_stream():
     state = server.make_response_stream_state(
         NS(tokenizer=_ResponseTemplateTokenizer(_MUSE_RESPONSE_TEMPLATE)),

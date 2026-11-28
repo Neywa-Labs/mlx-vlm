@@ -188,8 +188,14 @@ class ThinkingStreamState:
 class ResponseTemplateStreamState:
     """Adapt a Transformers response-template parser to server stream deltas."""
 
-    def __init__(self, parser):
+    def __init__(self, parser, joiners=None):
         self.parser = parser
+        self.joiners = joiners or {}
+        self.opened_fields = {
+            event.get("field")
+            for event in getattr(parser, "initial_events", ())
+            if event.get("type") == "region_open"
+        }
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         reasoning = []
@@ -203,6 +209,14 @@ class ResponseTemplateStreamState:
         for event in events:
             event_type = event.get("type")
             field = event.get("field")
+            if event_type == "region_open":
+                separator = self.joiners.get(field, "")
+                if field in self.opened_fields and separator:
+                    if field in ("reasoning", "reasoning_content"):
+                        reasoning.append(separator)
+                    elif field == "content":
+                        content.append(separator)
+                self.opened_fields.add(field)
             if event_type == "region_close" and field in (
                 "reasoning",
                 "reasoning_content",
@@ -236,7 +250,9 @@ def _response_template_tokenizer(processor):
 def _response_template_prefix(tokenizer, prompt: str) -> str:
     if not prompt:
         return ""
-    template = load_response_template(tokenizer.response_template)
+    template = load_response_template(
+        _reasoning_content_template(tokenizer.response_template)
+    )
     # Without an assistant anchor, the parser includes the entire prompt as output.
     return prompt if template.start_anchor_re.search(prompt) else ""
 
@@ -245,13 +261,31 @@ _SPLIT_FIELDS = ("content", "reasoning", "reasoning_content")
 _REGION_KEYS = ("open", "open_pattern", "close", "close_pattern", "repeats")
 
 
+def _response_template_joiners(template: Any) -> Dict[str, str]:
+    """Retain legacy repeated-text joins removed from Transformers' schema."""
+    if not isinstance(template, dict):
+        return {}
+    return {
+        name: field["join"]
+        for name, field in template.get("fields", {}).items()
+        if name in _SPLIT_FIELDS
+        and field.get("repeats")
+        and isinstance(field.get("join"), str)
+    }
+
+
 def _reasoning_content_template(template: Any) -> Any:
     """Keep malformed tool fields from breaking reasoning and content parsing."""
     if not isinstance(template, dict):
         return template
     fields = {}
     for name, field in template.get("fields", {}).items():
-        if name not in _SPLIT_FIELDS:
+        if name in _SPLIT_FIELDS:
+            # New Transformers versions reject this checkpoint option. Apply
+            # its separator ourselves, without changing tokenizer metadata.
+            if isinstance(field.get("join"), str):
+                field = {key: value for key, value in field.items() if key != "join"}
+        else:
             field = {key: field[key] for key in _REGION_KEYS if key in field}
             # Named capture groups require a transform.
             field["transform"] = "{content}"
@@ -274,7 +308,8 @@ def make_response_stream_state(
                 tokenizer.get_response_parser(
                     _reasoning_content_template(tokenizer.response_template),
                     prefix=_response_template_prefix(tokenizer, prompt),
-                )
+                ),
+                _response_template_joiners(tokenizer.response_template),
             )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
@@ -516,6 +551,16 @@ def _parse_response_template(
                 _reasoning_content_template(tokenizer.response_template),
                 prefix=_response_template_prefix(tokenizer, prompt),
             )
+            if isinstance(parsed, dict):
+                parsed = dict(parsed)
+                for name, separator in _response_template_joiners(
+                    tokenizer.response_template
+                ).items():
+                    value = parsed.get(name)
+                    if isinstance(value, list) and all(
+                        isinstance(part, str) for part in value
+                    ):
+                        parsed[name] = separator.join(value)
             # A turn of tool calls alone is a decoded turn with no content.
             if isinstance(parsed, dict) and (
                 "content" in parsed
